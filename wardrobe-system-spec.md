@@ -4,6 +4,8 @@ Tài liệu này gộp nội dung của 4 tài liệu trước đó (pipeline gu
 
 Quy ước đánh số: các mục lớn dùng số thập phân (1.1, 2.3.2...) để điều hướng tài liệu. Các mã **A0–A5, B1–B2, C1, D0–D4, E1–E2** là mã giai đoạn của pipeline gốc (Giai đoạn A đến E), chỉ xuất hiện như nhãn mô tả bước xử lý bên trong nội dung — không phải số mục của tài liệu này, để tránh nhầm lẫn thứ tự.
 
+Lưu ý về hai thay đổi so với thiết kế gốc, đã phản ánh trong tài liệu này: (1) **thứ tự chạy thực tế trên mobile không theo thứ tự mã giai đoạn** — B1 chạy trước A2/A3/A4 (xem [1.1](#11-pipeline-xử-lý-on-device)); (2) **B2 và C1 không còn chạy trên mobile** — B2 bị bỏ hẳn, C1 chuyển sang server thành bước D0b (xem [2.1](#21-kiến-trúc-chung)).
+
 ## Mục lục
 
 - [0. Mục tiêu và nguyên tắc thiết kế](#0-mục-tiêu-và-nguyên-tắc-thiết-kế)
@@ -11,6 +13,7 @@ Quy ước đánh số: các mục lớn dùng số thập phân (1.1, 2.3.2...)
   - [1.1 Pipeline xử lý on-device](#11-pipeline-xử-lý-on-device)
   - [1.2 Tương tác với Server](#12-tương-tác-với-server)
   - [1.3 Cấu hình theo môi trường](#13-cấu-hình-theo-môi-trường)
+  - [1.4 Công cụ kiểm thử pipeline trên desktop](#14-công-cụ-kiểm-thử-pipeline-trên-desktop)
 - [Phần 2 — Server](#phần-2--server)
   - [2.1 Kiến trúc chung](#21-kiến-trúc-chung)
   - [2.2 Triển khai Production](#22-triển-khai-production)
@@ -39,34 +42,81 @@ Ba nguyên tắc xuyên suốt:
 
 ### 1.1 Pipeline xử lý on-device
 
-Gồm giai đoạn A, B, C của pipeline gốc. Các giai đoạn này không phụ thuộc Production hay Test — logic xử lý giống nhau ở mọi môi trường vì chạy hoàn toàn trên thiết bị, không gọi server.
+Gồm giai đoạn A và B của pipeline gốc. Các giai đoạn này không phụ thuộc Production hay Test — logic xử lý giống nhau ở mọi môi trường vì chạy hoàn toàn trên thiết bị, không gọi server.
+
+#### Thứ tự thực thi thực tế
+
+Thứ tự chạy **không** theo đúng thứ tự mã giai đoạn (A0→A5→B1). Áp dụng nguyên tắc "lọc rẻ trước, xử lý đắt sau" ở [mục 0](#0-mục-tiêu-và-nguyên-tắc-thiết-kế), **B1 được đưa lên trước A2/A3/A4**:
+
+```
+A1 (quét theo thời gian) → A0 (loại ảnh đã quét)
+  → B1 (gom cụm trùng lặp)
+  → [mỗi cụm] A2 (chất lượng) + cổng lọc "có mặt người" giá rẻ
+  → A3/A4 (đếm người + đối chiếu khuôn mặt, bản chính xác)
+  → A5 (lọc theo chế độ đơn/nhóm)
+```
+
+Lý do: B1 là CV cổ điển (perceptual hash, không dùng model) nên rất rẻ; chạy trước nghĩa là các bước ML nặng phía sau chỉ chạy **một lần cho mỗi cụm** thay vì một lần cho mỗi ảnh — một loạt 8 ảnh burst gần giống nhau tốn chi phí bằng đúng 1 ảnh.
+
+#### Nguyên tắc chung: xử lý trên thumbnail, không dùng ảnh gốc
+
+Mọi bước phân tích ảnh (A2, B1, A3/A4) đều chạy trên **thumbnail do hệ điều hành sinh ra** (~1280px cạnh dài; riêng B1 dùng thumbnail nhỏ hơn ~240px vì dHash chỉ cần lưới 9x8), **không giải mã ảnh gốc**. Một ảnh gốc từ camera điện thoại có thể 10+ MB / 12+ MP — giải mã bằng decoder thuần Dart tốn hàng giây CPU mỗi ảnh và từng gây treo ANR trên thiết bị thật. Chỉ bước upload (D0) mới đọc file gốc.
+
+Hệ quả cần lưu ý: mọi toạ độ (bounding box khuôn mặt) sinh ra ở các bước này nằm trong **hệ toạ độ của thumbnail**, không phải ảnh gốc — bên tiêu thụ phải tự quy đổi nếu cần dùng trên ảnh gốc.
 
 **Giai đoạn A — Sàng lọc sơ bộ**
 
 - *A0. Loại ảnh đã quét ở lần trước*: Mobile duy trì một index cục bộ (ví dụ SQLite/local storage trên thiết bị) lưu định danh ảnh (asset ID do hệ điều hành cấp, ổn định qua các lần quét) đã từng được xử lý thành công ở các lần quét trước. Ngay sau khi lấy danh sách ảnh theo khoảng thời gian ở A1, các ảnh đã có trong index này bị loại ngay, không đưa vào các bước lọc AI phía sau — tránh xử lý lại ảnh cũ, giảm đáng kể số ảnh cần xử lý ở các lần quét sau lần đầu tiên. Cách index này được cập nhật xem ở [1.2](#12-tương-tác-với-server) (bước E2).
 - *A1. Quét ảnh theo khoảng thời gian*: truy vấn metadata thư viện ảnh của hệ điều hành (ngày chụp), thao tác dữ liệu thuần túy, không cần AI.
-- *A2. Lọc ảnh không đủ điều kiện (tối, mờ, nhòe)*: dùng CV cổ điển — phương sai Laplacian để phát hiện mờ/nhòe, độ sáng trung bình/histogram để phát hiện ảnh quá tối. Không cần model, chạy hàng loạt rất nhanh.
-- *A3. Phát hiện người và đếm số người*: chạy model object detection nhẹ (Google ML Kit Object Detection & Tracking — on-device, miễn phí, license thương mại rõ ràng). Kết quả (số người + bounding box) được tái sử dụng ở A5, không chạy detection lần hai.
-- *A4. Phát hiện khuôn mặt và đối chiếu với khuôn mặt người dùng*: face detection bằng Google ML Kit Face Detection; face recognition/matching bằng model trích embedding nhẹ như MobileFaceNet (kiểm tra kỹ giấy phép Apache/MIT của bản build cụ thể), chạy qua TensorFlow Lite hoặc ONNX Runtime Mobile, so khớp bằng cosine similarity với embedding đã lưu.
-- *A5. Lọc theo chế độ ảnh đơn/nhóm*: dùng lại số người đã đếm ở A3 — "ảnh đơn" chỉ giữ ảnh đúng 1 người là chính chủ; "ảnh nhóm" giữ toàn bộ ảnh đã qua lọc.
+- *A2. Lọc ảnh không đủ điều kiện (tối, mờ, nhòe)*: dùng CV cổ điển — phương sai Laplacian để phát hiện mờ/nhòe, độ sáng trung bình để phát hiện ảnh quá tối. Không cần model. Chạy trên bản thu nhỏ tiếp (cạnh dài tối đa 256px) của thumbnail, dùng nội suy `nearest` — cả `average` lẫn thao tác grayscale đều có chi phí O(số pixel *nguồn*), nên nếu thumbnail vì lý do nào đó trả về full-resolution thì hai thao tác này đủ để treo UI isolate và kích hoạt ANR.
+- *A3. Đếm số người*: **dùng ML Kit Face Detection, không dùng Object Detection**. Object Detector mặc định của ML Kit không có nhãn "person", nên số khuôn mặt phát hiện được đóng vai trò tín hiệu đếm người — chấp nhận được vì ảnh không có khuôn mặt nhìn thấy được thì cũng không thể đối chiếu với người dùng ở A4. Chạy chung một lần gọi detector với A4.
+- *A4. Phát hiện khuôn mặt và đối chiếu với khuôn mặt người dùng*: face detection bằng Google ML Kit Face Detection (bật `enableLandmarks`); face recognition bằng **MobileFaceNet (InsightFace `w600k_mbf`)** chạy qua ONNX Runtime Mobile, so khớp bằng cosine similarity với embedding đã đăng ký ở màn hình đăng ký khuôn mặt (ngưỡng khớp **0.45**). Chi tiết tiền xử lý bắt buộc xem [Căn chỉnh khuôn mặt](#căn-chỉnh-khuôn-mặt-bắt-buộc-cho-mobilefacenet) bên dưới.
+- *A5. Lọc theo chế độ ảnh đơn/nhóm*: dùng lại số người đã đếm ở A3 — "ảnh đơn" chỉ giữ ảnh đúng 1 người là chính chủ; "ảnh nhóm" giữ toàn bộ ảnh có mặt chính chủ.
+
+**Cổng lọc hai tầng cho A3/A4**: A3/A4 bản chính xác là bước đắt nhất pipeline (detect + crop + embed cho từng khuôn mặt). Trước nó có một cổng lọc rẻ: chạy detector ở chế độ `fast` trên chính thumbnail mà A2 vừa dùng, chỉ cần biết "ảnh này có khả năng có mặt người không". Ảnh không qua cổng bị loại mà không tốn lần chạy embedding nào. Trong mỗi cụm B1, các thành viên được thử lần lượt và **giữ lại ảnh đầu tiên qua được cả A2 lẫn cổng lọc này** làm đại diện; cụm không có thành viên nào đạt sẽ bị loại hoàn toàn.
 
 **Giai đoạn B — Khử trùng lặp**
 
-- *B1. Gom cụm ảnh giống nhau bằng perceptual hashing*: pHash/dHash/aHash để nhóm ảnh burst, thuật toán cổ điển chi phí thấp, chạy trước để giảm số ảnh cần chấm điểm ở B2.
-- *B2. Chọn ảnh đại diện theo độ phủ trang phục*: dùng model pose estimation nhẹ (BlazePose, Apache-2.0) lấy keypoints, ước lượng vùng thân thể hiển thị rõ/không bị che, giữ ảnh điểm cao nhất mỗi cụm.
+- *B1. Gom cụm ảnh giống nhau bằng perceptual hashing*: dHash 64-bit (thu nhỏ về lưới xám 9x8, so sánh gradient ngang từng hàng), gom cụm theo khoảng cách Hamming với ngưỡng **`hammingThreshold = 30`** (trên tổng 64 bit).
+  - Trước khi hash, ảnh được **chia nhóm theo thời gian chụp** (`burstTimeWindowSeconds = 240`, chỉ dùng metadata `createdAt`, miễn phí): ảnh trùng lặp/burst thật luôn được chụp gần nhau về thời gian, nên ảnh không có "hàng xóm thời gian" nào trong cửa sổ này chắc chắn không thể trùng với ảnh nào khác — bỏ qua hoàn toàn việc fetch + hash cho nó. Chỉ nhóm có từ 2 ảnh trở lên mới thực sự phải hash.
+  - Hai hằng số trên là điểm điều chỉnh chính giữa tốc độ và độ chính xác: ngưỡng cao/cửa sổ rộng → gom mạnh hơn, ít ảnh phải qua A3/A4 hơn, nhưng tăng rủi ro gộp nhầm hai ảnh thực sự khác nhau (ảnh bị gộp nhầm sẽ **biến mất khỏi kết quả cuối** vì mỗi cụm chỉ giữ 1 đại diện).
+  - **Cảnh báo triển khai**: dHash sinh ra bằng 64 lần dịch trái không mask nên bit dấu bật ngẫu nhiên ~50% số lần → giá trị hash là số âm rất thường xuyên. Khi đếm bit khác nhau phải dùng **dịch phải logic** (`>>>`), không dùng dịch phải số học (`>>`) — với số âm, dịch số học không bao giờ về 0 và gây vòng lặp vô hạn chiếm 100% CPU (đã từng gây ANR trên thiết bị thật, rất khó chẩn đoán vì không ném exception).
+- *B2. Chọn ảnh đại diện theo độ phủ trang phục* — **đã gỡ khỏi mobile.** Sau khi B1 chuyển lên trước, mỗi cụm chỉ còn đúng một ứng viên đi tiếp (chọn theo A2 + cổng lọc rẻ), nên không còn gì để "chấm điểm và so sánh giữa nhiều ảnh trong cụm" nữa. Việc chọn đại diện bằng pose estimation (BlazePose) không còn được dùng.
 
-**Giai đoạn C — Phân tích ảnh nhóm** (chỉ áp dụng khi chọn chế độ ảnh nhóm)
+**Giai đoạn C — Phân tích ảnh nhóm: đã chuyển sang server**
 
-- *C1. Tách người dùng khỏi ảnh nhóm, bôi xám phần còn lại*: dùng bounding box + vị trí khuôn mặt từ A4 làm prompt cho model segmentation theo instance (gợi ý MobileSAM, Apache-2.0, đủ nhẹ on-device). Sau khi có mask, các vùng còn lại bị bôi xám trước khi gửi lên server, để không lộ thông tin/khuôn mặt người khác trong ảnh.
+- *C1. Tách người dùng khỏi ảnh nhóm, bôi xám phần còn lại* — **không còn chạy trên mobile.** Đã thử triển khai on-device bằng MobileSAM rồi EdgeSAM (prompt bằng box thân người từ pose landmark), nhưng **chất lượng mask không đạt yêu cầu** trên ảnh thật. Trách nhiệm tách người trong ảnh nhóm được chuyển sang server, nơi có thể dùng model mạnh hơn không bị giới hạn tài nguyên thiết bị (xem [2.1](#21-kiến-trúc-chung)).
+- Hệ quả: ảnh nhóm được **upload nguyên bản, chưa bôi xám**. Đây là một đánh đổi có ý thức so với thiết kế ban đầu — dữ liệu khuôn mặt người khác trong ảnh nhóm sẽ rời khỏi thiết bị, nên chính sách vòng đời dữ liệu và phạm vi truy cập ở phía server (xem [Bảo mật và vòng đời dữ liệu](#bảo-mật-và-vòng-đời-dữ-liệu)) trở thành lớp bảo vệ chính thay vì việc bôi xám tại nguồn.
+
+#### Căn chỉnh khuôn mặt (bắt buộc cho MobileFaceNet)
+
+MobileFaceNet thuộc dòng ArcFace/InsightFace, **được huấn luyện trên ảnh khuôn mặt đã căn chỉnh theo 5 điểm mốc**, không phải trên ảnh cắt thô theo bounding box. Trước khi đưa vào model, cả lúc đăng ký khuôn mặt lẫn lúc đối chiếu ở A4 đều phải:
+
+1. Lấy 5 landmark từ ML Kit: mắt trái, mắt phải, chân mũi, khoé miệng trái, khoé miệng phải.
+2. Ước lượng phép biến đổi similarity (xoay + tỉ lệ + tịnh tiến) đưa 5 điểm đó về đúng template chuẩn ArcFace 112x112.
+3. Warp ảnh theo phép biến đổi đó để ra ảnh 112x112 đã căn chỉnh, rồi mới trích embedding.
+
+Nếu bỏ qua bước này và chỉ cắt theo bounding box + padding, độ tương đồng cosine của **cùng một người** bị kéo tụt xuống dưới ngưỡng khớp một cách hệ thống (đo được: mọi cặp đúng đều dưới 0.45, tức là tỉ lệ nhận diện đúng gần như bằng 0). Phép biến đổi similarity có thể giải bằng công thức đóng dạng bình phương tối thiểu trên số phức, không cần thư viện SVD.
+
+Hai điểm cần lưu ý khi triển khai:
+
+- **Cả hai đầu so sánh phải dùng cùng một cách căn chỉnh**: embedding tham chiếu (lúc đăng ký) và embedding ứng viên (lúc quét) phải qua đúng cùng một pipeline căn chỉnh, nếu không sẽ lệch hệ thống dù thuật toán đúng.
+- **Độ phân giải đầu vào của detector ảnh hưởng độ chính xác landmark**: chạy detector thẳng trên ảnh gốc rất lớn cho landmark kém chính xác hơn so với chạy trên bản đã thu nhỏ (~1280px) — nên đăng ký khuôn mặt cũng nên detect ở cùng cỡ thumbnail như lúc quét.
+
+#### Ràng buộc triển khai đã kiểm chứng
+
+- **Không dùng ONNX quantize INT8 động** cho các model chạy on-device: `quantize_dynamic` sinh ra toán tử `ConvInteger`, mà **ONNX Runtime Mobile không có kernel cho toán tử này** — model tải được nhưng ném lỗi ngay khi tạo session (`Could not find an implementation for ConvInteger(10)`). Kiểm định độ chính xác bằng Python trên máy desktop **không phát hiện được** lỗi này vì bản ONNX Runtime desktop có đầy đủ kernel. Nếu vẫn muốn giảm kích thước model, phải kiểm chứng trực tiếp trên thiết bị/emulator trước khi tin tưởng.
+- **Cẩn thận với hàm lọc ảnh sửa đổi tại chỗ**: một số hàm của thư viện xử lý ảnh (ví dụ `grayscale()` của `package:image`) **sửa trực tiếp lên object truyền vào và trả về chính reference đó**, không tạo bản sao. Gọi một hàm như vậy trên ảnh mà phía gọi còn dùng lại về sau (để lưu, upload, hoặc xử lý tiếp) sẽ âm thầm làm hỏng ảnh đó — đã từng khiến ảnh khuôn mặt lưu lên server bị đen trắng trong khi embedding vẫn đúng (vì embedding tính từ object khác). Luôn clone trước khi gọi nếu ảnh gốc còn cần dùng.
 
 ### 1.2 Tương tác với Server
 
-Gồm giai đoạn D (góc nhìn từ Mobile, ký hiệu D0) và giai đoạn E (E1, E2) của pipeline gốc. Sau khi hoàn tất A–C, Mobile chuyển sang giao tiếp với Data server để đẩy ảnh lên xử lý và theo dõi kết quả. Toàn bộ tương tác này đi qua các API public của Data server (chi tiết input/output ở [Phần 3](#phần-3--api-spec)); Mobile không bao giờ gọi trực tiếp AI server.
+Gồm giai đoạn D (góc nhìn từ Mobile, ký hiệu D0) và giai đoạn E (E1, E2) của pipeline gốc. Sau khi hoàn tất giai đoạn A–B, Mobile chuyển sang giao tiếp với Data server để đẩy ảnh lên xử lý và theo dõi kết quả. Toàn bộ tương tác này đi qua các API public của Data server (chi tiết input/output ở [Phần 3](#phần-3--api-spec)); Mobile không bao giờ gọi trực tiếp AI server.
 
 **D0. Upload ảnh và tạo job xử lý**
-1. Mobile gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn cho từng ảnh (đã bôi xám ở giai đoạn C). Data server tự xác định `user_id`/`account_id` từ session hiện tại (token đăng nhập) để biết wardrobe kết quả thuộc về ai — Mobile không cần tự truyền hai giá trị này.
-2. Mobile upload ảnh thẳng lên Object Storage bằng đường dẫn đó — không đi qua Data server hay AI server, tránh biến hai server thành nút nghẽn băng thông.
-3. Sau khi upload xong, Mobile gọi `POST /v1/jobs` để Data server tạo batch job (gắn với user/account của session hiện tại) và đẩy vé việc vào hàng đợi cho AI server xử lý (chi tiết xử lý phía server xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4) ở mục 2.1).
+1. Mobile gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn cho từng ảnh. Data server tự xác định `user_id`/`account_id` từ session hiện tại (token đăng nhập) để biết wardrobe kết quả thuộc về ai — Mobile không cần tự truyền hai giá trị này.
+2. Mobile upload ảnh thẳng lên Object Storage bằng đường dẫn đó — không đi qua Data server hay AI server, tránh biến hai server thành nút nghẽn băng thông. Ảnh gửi lên là **ảnh gốc chưa qua bôi xám** (xem giai đoạn C ở [1.1](#11-pipeline-xử-lý-on-device): việc tách người trong ảnh nhóm đã chuyển sang server). Đây là bước duy nhất trong pipeline đọc file ảnh gốc.
+3. Vì mỗi lần upload chủ yếu là chờ độ trễ mạng chứ không tốn CPU, Mobile upload **nhiều ảnh song song theo lô** (mặc định 4 ảnh cùng lúc) thay vì tuần tự từng ảnh, để chồng lấn độ trễ thay vì cộng dồn.
+4. Sau khi upload xong, Mobile gọi `POST /v1/jobs` để Data server tạo batch job (gắn với user/account của session hiện tại) và đẩy vé việc vào hàng đợi cho AI server xử lý (chi tiết xử lý phía server xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4) ở mục 2.1).
 
 **E1. Theo dõi tiến độ và hiển thị wardrobe**
 Việc ghi wardrobe vào database đã do Data server thực hiện ở cuối giai đoạn D (không phải Mobile). Mobile chỉ cần:
@@ -90,6 +140,19 @@ Toàn bộ API và luồng gọi ở trên giống hệt nhau giữa Production 
 
 Base URL nên đặt trong cấu hình build/môi trường của app, không hard-code, để chuyển giữa Test và Production chỉ cần đổi 1 giá trị.
 
+### 1.4 Công cụ kiểm thử pipeline trên desktop
+
+Chạy thử pipeline trên thiết bị/emulator rất chậm (một lượt quét ~900 ảnh mất khoảng 15 phút, cộng thêm thời gian build/cài mỗi lần đổi tham số), khiến việc tinh chỉnh các ngưỡng ở [1.1](#11-pipeline-xử-lý-on-device) trở nên tốn kém. Vì vậy có thêm một script Python (`StylistAI_App/test_assets/test_pipeline.py`) **mô phỏng lại đúng các bước A1 → A0 → B1 → A2+cổng lọc → A3/A4 → A5** với cùng các hằng số ngưỡng, chạy trên máy desktop với một thư mục ảnh bất kỳ và một ảnh khuôn mặt tham chiếu. Script in ra số ảnh còn lại sau từng giai đoạn kèm thời gian, copy các ảnh được chọn ra một thư mục để xem trực tiếp, và ghi báo cáo JSON kèm điểm similarity từng ảnh.
+
+Dùng để: kiểm chứng nhanh tác động của việc đổi ngưỡng (`hammingThreshold`, `burstTimeWindowSeconds`, ngưỡng similarity), và đối chiếu xem một ảnh cụ thể bị loại ở bước nào.
+
+**Giới hạn cần biết khi đọc kết quả** — script không thay thế được test trên thiết bị thật:
+
+- Dùng **OpenCV YuNet** thay cho ML Kit Face Detection (ML Kit chỉ có trên Android/iOS), nên độ nhạy phát hiện khuôn mặt khác với app thật.
+- "Thumbnail" là ảnh resize bằng thư viện Python, không phải thumbnail do hệ điều hành sinh ra.
+- Không mô phỏng A0 (index đã quét) và giới hạn khoảng thời gian của A1 — mọi ảnh trong thư mục đều là ứng viên.
+- Dùng chung file model MobileFaceNet mà app đóng gói, và **cùng cách căn chỉnh 5 điểm mốc** như mô tả ở [1.1](#11-pipeline-xử-lý-on-device), nên phần embedding/so khớp là sát với app thật nhất.
+
 ---
 
 ## Phần 2 — Server
@@ -111,10 +174,11 @@ Nguyên tắc xuyên suốt: **hai server không gọi thẳng vào nhau**, ch�
 #### Luồng xử lý D0→D4
 
 1. **D0 — Upload & tạo job** (Mobile khởi tạo, xem [1.2](#12-tương-tác-với-server)): Data server cấp đường dẫn upload qua `POST /v1/uploads/presign`, Mobile upload thẳng lên Object Storage, rồi Data server tạo job qua `POST /v1/jobs` và đẩy một vé việc/ảnh vào job queue (chỉ chứa đường dẫn ảnh, không chứa nội dung ảnh).
-2. **D1 — Tách trang phục**: model fashion parsing/clothes segmentation chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục.
-3. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng (CLIP, MIT license) tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1.
-4. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa.
-5. **D4 — Ghi wardrobe vào database (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage rồi đặt kết quả (đường dẫn ảnh + tag) vào result queue — không ghi thẳng database. Data server tiêu thụ result queue để ghi wardrobe vào database và cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`).
+2. **D0b — Tách người dùng khỏi ảnh nhóm** (trách nhiệm mới, trước đây là C1 trên mobile): với ảnh chụp ở chế độ ảnh nhóm, AI server phải cô lập đúng người dùng trước khi tách trang phục, nếu không sẽ tạo ra item từ quần áo của người khác trong ảnh. Bước này chuyển từ mobile sang server vì các model segmentation đủ nhẹ để chạy on-device (MobileSAM, EdgeSAM) cho chất lượng mask không đạt yêu cầu trên ảnh thật; ở server có thể dùng model mạnh hơn không bị giới hạn tài nguyên thiết bị. Do ảnh gửi lên **chưa được bôi xám**, server cần tự xác định đâu là người dùng — cách khả dĩ là đối chiếu khuôn mặt với embedding tham chiếu đã lưu của account (cùng loại embedding mà mobile dùng ở A4), rồi dùng vị trí đó làm prompt cho model segmentation.
+3. **D1 — Tách trang phục**: model fashion parsing/clothes segmentation chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục.
+4. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng (CLIP, MIT license) tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1. Bước này càng quan trọng hơn sau khi B1 trên mobile được nới ngưỡng gom cụm (xem [1.1](#11-pipeline-xử-lý-on-device)) — mobile ưu tiên gom mạnh để giảm tải, phần trùng lặp còn sót lại do server bắt.
+5. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa.
+6. **D4 — Ghi wardrobe vào database (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage rồi đặt kết quả (đường dẫn ảnh + tag) vào result queue — không ghi thẳng database. Data server tiêu thụ result queue để ghi wardrobe vào database và cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`).
 
 Cấu trúc bản tin của job queue và result queue được định nghĩa chi tiết ở [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue).
 
@@ -129,6 +193,8 @@ Mỗi vé việc trong hàng đợi được thử lại độc lập nếu xử
 #### Bảo mật và vòng đời dữ liệu
 
 Đường dẫn upload và đọc ảnh đều có thời hạn, giới hạn theo từng user, không dùng đường dẫn công khai vĩnh viễn. Ảnh gốc chờ xử lý trong Object Storage nên có chính sách tự động xóa sau một khoảng thời gian ngắn kể từ khi xử lý xong, để giảm thiểu dữ liệu riêng tư lưu trữ ngoài thiết bị của user.
+
+**Mức độ quan trọng đã tăng lên** kể từ khi bước bôi xám (C1) chuyển từ mobile sang server: trước đây ảnh nhóm rời khỏi thiết bị đã được che khuôn mặt/thân người khác, nay **ảnh nhóm nguyên bản** được upload. Nghĩa là lớp bảo vệ dữ liệu của người thứ ba trong ảnh giờ nằm hoàn toàn ở phía server, không còn được bảo vệ "tại nguồn" nữa. Hai yêu cầu tối thiểu: (1) ảnh gốc phải bị xóa ngay sau khi tách trang phục xong, không giữ lại quá thời gian cần thiết cho retry; (2) chỉ ảnh trang phục đã tách (không còn khuôn mặt) mới được lưu dài hạn trong wardrobe.
 
 #### Hủy xử lý và sự cố thiết bị giữa chừng
 
@@ -212,6 +278,21 @@ Nhiều model thời trang chất lượng cao trên các nền tảng nghiên c
 - Giấy phép của kiến trúc/mã nguồn model.
 - Giấy phép của bộ trọng số (weights) đã huấn luyện sẵn — thường bị ràng buộc bởi giấy phép của dữ liệu huấn luyện, khác với giấy phép của code.
 - Nếu không chắc chắn, ưu tiên dùng các API thương mại đã có hợp đồng/điều khoản sử dụng rõ ràng, hoặc tự huấn luyện lại trên dữ liệu do mình sở hữu/license hợp lệ.
+
+#### Kết quả rà soát các model segmentation đã khảo sát (cho bước tách người trong ảnh nhóm)
+
+Các model dưới đây đã được rà soát khi còn triển khai C1 trên mobile; kết luận vẫn dùng được khi chọn model cho bước tương ứng ở server:
+
+| Model | Giấy phép | Kết luận |
+|---|---|---|
+| MobileSAM | MIT (bản export ONNX của `Acly/MobileSAM`) | Dùng thương mại tự do. Đã tích hợp thử on-device rồi gỡ vì chất lượng mask không đạt. |
+| **EdgeSAM** | **NTU S-Lab License 1.0 — chỉ phi thương mại** | **Không dùng được cho sản phẩm thương mại nếu chưa xin phép tác giả.** Giấy phép ghi rõ muốn dùng thương mại phải liên hệ trực tiếp nhóm tác giả (S-Lab, NTU). Mọi bản weights/ONNX cộng đồng đều kế thừa giấy phép này — người upload lại không có quyền cấp phép lại. |
+| RepViT-SAM | Apache-2.0 (repo gốc THU-MIG/RepViT) | Giấy phép ổn, nhưng repo chính thức **không cung cấp bản ONNX nào** (chỉ có checkpoint PyTorch + notebook export CoreML); các file ONNX trên HuggingFace đều là bản convert cá nhân, không có model card/tài liệu. |
+
+Hai bài học rút ra khi chọn model:
+
+- **Kiểm tra file LICENSE thật, không tin nhãn trên trang model**: đã gặp trường hợp một bản upload lại trên HuggingFace gắn nhãn "MIT" cho model mà repo gốc cấp phép phi thương mại.
+- **Con số hiệu năng trong paper thường gắn với một runtime cụ thể**: RepViT-SAM công bố "nhanh hơn MobileSAM ~10x", nhưng đó là đo bằng Core ML trên phần cứng Apple; đo lại trên ONNX Runtime CPU (đúng runtime mà app dùng) thì encoder của nó **chậm hơn MobileSAM ~3.2 lần** và file nặng gấp 3. Luôn đo lại trên đúng runtime/phần cứng đích trước khi chọn model theo benchmark của paper.
 
 ---
 
