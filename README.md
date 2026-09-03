@@ -19,9 +19,30 @@ Place these in the corresponding `ComfyUI/models/` subfolders:
 
 Also required: the [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom node (only needed if using the GGUF unet variant).
 
-`test_extract_outfit.py`'s auto-prompt path also needs `transformers` + a CPU build of
-`torch` (already pulled in by ComfyUI's own requirements) to run the CLIP classifier —
-see [Auto-detected prompt](#auto-detected-prompt-no-hardcoded-items) below.
+`test_extract_outfit.py`'s auto-prompt path additionally needs `transformers`,
+`torchvision` and `scipy` (mostly pulled in by ComfyUI's own requirements) for the
+worn-item detector, plus `insightface` + `onnxruntime` for face matching:
+
+```bash
+pip install transformers torchvision scipy
+pip install insightface onnxruntime      # only needed for --selfie
+```
+
+The detector models (`yainage90/fashion-object-detection`, `facebook/sam-vit-base`,
+`insightface/buffalo_l`) download themselves on first use into `HF_HOME` /
+`~/.insightface` — nothing to place by hand.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `test_extract_outfit.py` | Terminal client: detects the worn items, builds the prompt, runs the ComfyUI workflow. |
+| `outfit_items.py` | The worn-item detector used by the auto-prompt path. Wraps the two scripts below. |
+| `item_detector_service.py` | Keeps those models warm behind `127.0.0.1:18189` so repeat runs skip the load cost. |
+| `detect_clothing_yolo.py` | Standalone garment detector (multi-scale + person-crop TTA, hue dress arbitration). |
+| `detect_clothing_by_face.py` | Standalone: picks one person out of a group photo by face, isolates them with SAM, then detects their clothes. |
+
+`outfit_items.py` imports the last two, so all five files must sit in the same folder.
 
 ## Service setup (Vast.ai / supervisor)
 
@@ -32,16 +53,33 @@ Two supervisor services:
   Expose via the instance's Caddy auth edge by adding a `ComfyUI` entry to
   `/etc/portal.yaml` (`external_port: 10100`, `internal_port: 18188`), then
   `supervisorctl reread && supervisorctl update`.
-- **CLIP item classifier** — `scripts/clip_classifier.sh`
-  (`/opt/supervisor-scripts/clip_classifier.sh`), runs `clip_classifier_service.py` on
-  `127.0.0.1:18189`. CPU-only, no portal entry needed (internal use only by
-  `test_extract_outfit.py`). Config: `scripts/clip_classifier.conf`.
+- **Worn-item detector** — `scripts/item_detector.sh`
+  (`/opt/supervisor-scripts/item_detector.sh`), runs `item_detector_service.py` on
+  `127.0.0.1:18189`. No portal entry needed (internal use only by
+  `test_extract_outfit.py`). Config: `scripts/item_detector.conf`. It uses the GPU by
+  default and therefore holds VRAM while running — on a single-GPU box that is also
+  serving ComfyUI, add `export OUTFIT_ITEMS_DEVICE=cpu` to `scripts/item_detector.sh`
+  before installing it (see [the timing table](#auto-detected-prompt-no-hardcoded-items)
+  for what that costs).
 
 Install both the same way:
 ```bash
-cp scripts/comfyui.sh scripts/clip_classifier.sh /opt/supervisor-scripts/
-chmod +x /opt/supervisor-scripts/comfyui.sh /opt/supervisor-scripts/clip_classifier.sh
-cp scripts/comfyui.conf scripts/clip_classifier.conf /etc/supervisor/conf.d/
+cp scripts/comfyui.sh scripts/item_detector.sh /opt/supervisor-scripts/
+chmod +x /opt/supervisor-scripts/comfyui.sh /opt/supervisor-scripts/item_detector.sh
+cp scripts/comfyui.conf scripts/item_detector.conf /etc/supervisor/conf.d/
+supervisorctl reread && supervisorctl update
+```
+
+Check the detector came up (it reports which device it loaded on):
+```bash
+curl -s http://127.0.0.1:18189/health      # {"status": "ok", "device": "cuda"}
+```
+
+If an older install still has the `clip_classifier` service (it used the same port),
+remove it first:
+```bash
+supervisorctl stop clip_classifier
+rm /etc/supervisor/conf.d/clip_classifier.conf /opt/supervisor-scripts/clip_classifier.sh
 supervisorctl reread && supervisorctl update
 ```
 
@@ -49,7 +87,8 @@ supervisorctl reread && supervisorctl update
 
 ```bash
 source /venv/main/bin/activate
-python3 test_extract_outfit.py --lightning4 --fp8 [--seed N] <input_image> ["<custom prompt>"]
+python3 test_extract_outfit.py --lightning4 --fp8 [--seed N] [--selfie ref.jpg] \
+    [--detect-threshold F] [--face-threshold F] <input_image> ["<custom prompt>"]
 ```
 
 Flags:
@@ -59,20 +98,70 @@ Flags:
 - `--seed N` — sampler seed (default 42). The LoRA doesn't follow layout/presence
   instructions with 100% reliability on every seed (see below) — re-run with a
   different seed if one result comes out with an overlap or a missed item.
+- `--selfie ref.jpg` — reference photo of the person whose outfit should be extracted.
+  Only useful when the input contains several people and the subject isn't the largest
+  one in frame; the subject is picked by ArcFace face similarity instead.
+- `--detect-threshold F` — detector confidence floor (default 0.5). Lower it to ~0.35 if
+  a garment that is clearly in the photo is missing from the item list.
+- `--face-threshold F` — minimum ArcFace cosine similarity for `--selfie` (default 0.35).
 
 ### Auto-detected prompt (no hardcoded items)
 
-If you don't pass a custom prompt, the script runs a lightweight CLIP (ViT-B/32,
-~350MB, CPU-only) zero-shot classifier against the input photo *before* calling
-ComfyUI, and builds the prompt from what it actually finds — nothing is assumed
+If you don't pass a custom prompt, the script detects what the person is actually
+wearing *before* calling ComfyUI, and builds the prompt from that — nothing is assumed
 present:
 
 | Detected | Effect |
 |---|---|
-| `headwear` | `hat` included in the item list only if a hat is actually visible |
-| `footwear` | `shoes` included only if feet/shoes are actually visible (crops to the bottom 25% of the frame — whole-image classification is unreliable here, confused by background) |
-| `one_piece` | `dress` (single item) if the outfit is a genuine one-piece; otherwise `top/shirt` + `bottom (skirt/pants)` as two items. Without this check the LoRA defaults to always splitting into top+skirt even for a real one-piece dress. |
-| `bag` | `bag` included only if a bag/purse is actually visible |
+| `hat` | `hat` included in the item list only if a hat is actually detected |
+| `shoes` | `shoes` included only if footwear is actually detected |
+| `dress` vs `top`+`bottom` | `dress` as a single item if the outfit is a genuine one-piece, `top/shirt` and `bottom (skirt/pants)` as two items if it isn't. Which one wins is decided by hue (below). Without this check the LoRA defaults to always splitting into top+skirt even for a real one-piece dress. |
+| `bag` | `bag` included only if a bag/purse is actually detected |
+| `outer` | `jacket/outerwear` included as its own item if a jacket/coat is detected over the top |
+
+Detection (`outfit_items.py`) reuses the stack from `detect_clothing_by_face.py`
+instead of the CLIP ViT-B/32 zero-shot classifier this used to run:
+
+- **`yainage90/fashion-object-detection`** (Conditional DETR) — a real fashion object
+  detector whose label set (`bag, bottom, dress, hat, outer, shoes, top`) matches what
+  the prompt needs 1:1, rather than CLIP's whole-image caption similarity. That removed
+  all the hand-tuned positive/negative caption pairs, including the bottom-25%-crop
+  hack that footwear needed because whole-image CLIP confused sand/ocean/fabric with
+  shoes — a detector localises shoes by itself.
+- **multi-scale (800/1200px) + person-crop TTA** — candidates from the full frame and
+  from a padded crop around the detected person are pooled and NMS'd together, which is
+  what makes small items (hat, bag strap) survive on a phone-resolution photo.
+- **hue-based dress-vs-top+bottom arbitration** — when a `dress` box overlaps the union
+  of `top`+`bottom`, the mean hue of the top region and the bottom region decides it
+  (clearly different colours ⇒ two garments), instead of a caption comparison.
+- **SAM person isolation** — if more than one person is in the frame, the subject's
+  pixel mask is cut out with `facebook/sam-vit-base` and everyone else is painted
+  neutral grey before detection, so another person's clothes can't enter the item list.
+  The subject is the largest person in frame, or the ArcFace (`insightface/buffalo_l`)
+  match for `--selfie` when given.
+- The item list is **exactly what the detector localises** — nothing is assumed present,
+  and nothing missing is invented either. The earlier CLIP path hardcoded `top` +
+  `bottom` whenever the outfit wasn't a one-piece; a real detector is the better
+  authority, so if a garment is being dropped, lower `--detect-threshold` instead
+  (measured: a skirt at 0.40 reappears at `--detect-threshold 0.35`). The one remaining
+  assumption is the empty-list fallback: if the detector finds *nothing at all*, the
+  prompt falls back to `top` + `bottom` rather than being malformed.
+
+Like `detect_clothing_by_face.py`, this runs on the **GPU when one is available**
+(`OUTFIT_ITEMS_DEVICE=cpu` forces CPU back). Measured warm, per photo:
+
+| | GPU (GTX 1660 SUPER) | CPU |
+|---|---|---|
+| single person | ~1.4s | ~7-9s |
+| group shot (SAM isolation) | ~6.6s | ~27s |
+| service startup (`warm_up`) | ~7s | ~36s |
+
+Scores come out identical either way. The catch is that the service then holds VRAM for
+as long as it runs — on a card where ComfyUI is already paging a ~30GB fp8 unet + text
+encoder, start it with `OUTFIT_ITEMS_DEVICE=cpu` so the two don't fight over it. Setting
+`MULTI_SCALE = False` in `outfit_items.py` is roughly 3x faster again, but costs real
+detections (measured on a test photo: `top` went from 0.60 to not detected at all), so
+it's off by default.
 
 The resulting item list is placed into an explicit numbered grid (`row 1 left, row 1
 right, row 2 left, ...`) so every item lands in its own cell with a wide white gap —
@@ -80,10 +169,64 @@ naming positions `top/middle/bottom` instead of `row N` caused occasional duplic
 items (the LoRA doesn't reliably tell "middle" from "bottom" apart in a 2-column
 layout).
 
-Classification talks to the `clip_classifier` supervisor service (model loaded once,
-kept warm — see `clip_classifier_service.py`), so repeat runs cost ~0.5-1s instead of
-the ~8s process-startup + model-load penalty of loading CLIP fresh each time. Falls
-back to loading CLIP in-process automatically if that service isn't running.
+Detection talks to the `item_detector` supervisor service (models loaded once, kept
+warm — see `item_detector_service.py`), so repeat runs pay only inference time instead
+of reloading the detectors every run. Falls back to running the detector in-process
+automatically if that service isn't running (SAM and insightface are loaded lazily,
+only when a multi-person input or `--selfie` actually needs them).
+
+### Running the detectors on their own
+
+Useful for checking what the detector sees before spending a generation on it, or for
+tuning `--detect-threshold`.
+
+**Through the service** (fastest — models already warm):
+```bash
+curl -s -X POST http://127.0.0.1:18189/detect \
+    -H 'Content-Type: application/json' \
+    -d '{"image_path": "images/photo.jpg"}'
+
+# with overrides
+curl -s -X POST http://127.0.0.1:18189/detect \
+    -H 'Content-Type: application/json' \
+    -d '{"image_path": "group.jpg", "selfie_path": "selfie.jpg",
+         "threshold": 0.35, "save_isolated_to": "isolated.png"}'
+```
+
+**In Python:**
+```bash
+python -c "import outfit_items, json; print(json.dumps(outfit_items.detect_worn_items('images/photo.jpg'), indent=2))"
+```
+
+**`detect_clothing_by_face.py`** — the standalone version, and the reference this
+pipeline follows. Requires `--selfie` plus one of `--group-photo` / `--images-dir`:
+```bash
+# one photo
+python detect_clothing_by_face.py --selfie selfie.jpg --group-photo group.jpg
+
+# a whole folder, saving the SAM-isolated images so the mask can be checked by eye
+python detect_clothing_by_face.py --selfie selfie.jpg --images-dir group-images \
+    --save-isolated --isolated-dir isolated_output
+
+# loosen both thresholds
+python detect_clothing_by_face.py --selfie selfie.jpg --images-dir group-images \
+    --threshold 0.35 --face-match-threshold 0.30
+```
+| Flag | Default | Meaning |
+|---|---|---|
+| `--selfie` | *(required)* | reference photo of the person to find |
+| `--group-photo` / `--images-dir` | — | one image, or a folder (scanned recursively) |
+| `--threshold` | 0.5 | garment-detector confidence floor |
+| `--face-match-threshold` | 0.35 | minimum ArcFace cosine similarity to accept a face |
+| `--save-isolated` | off | write the background-removed image out (only produced for photos with more than one person — with a single person SAM is skipped) |
+| `--isolated-dir` | `isolated_output` | where those go |
+
+**`detect_clothing_yolo.py`** — garment detection only, no face matching, over a folder;
+writes `results_yolo.json` + `results_yolo.csv`:
+```bash
+python detect_clothing_yolo.py --images-dir images --threshold 0.5 --resolve-dress-conflict
+python detect_clothing_yolo.py --images-dir images --single-scale --no-person-crop   # faster, less accurate
+```
 
 ### Prompt-tuning notes (what worked / what didn't)
 

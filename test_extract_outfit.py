@@ -2,7 +2,7 @@
 """Terminal test client for the QIE-2511-Extract-Outfit ComfyUI server.
 
 Usage:
-    python3 test_extract_outfit.py <input_image> [prompt]
+    python3 test_extract_outfit.py [--selfie ref.jpg] <input_image> [prompt]
 
 Uploads the image to ComfyUI, runs it through the Qwen-Image-Edit-2511 (GGUF Q5_K_S)
 + QIE-2511-Extract-Outfit LoRA pipeline, and saves the result next to the input.
@@ -10,6 +10,7 @@ Uploads the image to ComfyUI, runs it through the Qwen-Image-Edit-2511 (GGUF Q5_
 import json
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -23,79 +24,70 @@ LIGHTNING_LORAS = {
     4: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
     8: "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
 }
-CLIP_CLASSIFIER_MODEL = "openai/clip-vit-base-patch32"
-CLIP_SERVICE_URL = "http://127.0.0.1:18189"
+ITEM_SERVICE_URL = "http://127.0.0.1:18189"
+
+# Prompt wording for each item flag detect_worn_items() returns, in the order the
+# items are laid into the grid.
+ITEM_PHRASES = [
+    ("headwear", "hat"),
+    ("outer", "jacket/outerwear"),
+    ("one_piece", "dress"),
+    ("top", "top/shirt"),
+    ("bottom", "bottom (skirt/pants)"),
+    ("bag", "bag"),
+    ("footwear", "shoes"),
+]
 
 
-def _detect_worn_items_inprocess(image_path):
-    """Fallback path: loads CLIP fresh in this process (~8s). Only used if the
-    clip_classifier supervisor service isn't reachable."""
-    import torch
-    from PIL import Image
-    from transformers import CLIPModel, CLIPProcessor
+def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None):
+    """Presence check for every item category the outfit-extraction LoRA is unreliable
+    at inferring from pixels alone: headwear, footwear, bag, outerwear, and whether the
+    worn outfit is a single one-piece dress vs a separate top+bottom (the LoRA defaults
+    to always splitting into "top" + "skirt" even for a genuine one-piece dress unless
+    told otherwise). Nothing in the item list build_prompt() constructs is
+    hardcoded/assumed present - every category is classified up front so the prompt can
+    state a fact ("this person is/isn't wearing X") instead of asking the diffusion
+    model to guess presence from the image, which it does inconsistently (see project
+    history).
 
-    model = CLIPModel.from_pretrained(CLIP_CLASSIFIER_MODEL)
-    processor = CLIPProcessor.from_pretrained(CLIP_CLASSIFIER_MODEL)
-    model.eval()
+    The detection itself is outfit_items.detect_worn_items(): a real fashion object
+    detector (yainage90/fashion-object-detection) with multi-scale + person-crop TTA,
+    hue-based dress-vs-top+bottom arbitration, and SAM person isolation for photos with
+    more than one person in them - the same stack detect_clothing_by_face.py uses, and
+    a replacement for the earlier CLIP ViT-B/32 zero-shot check. It uses the GPU when
+    there is one, like detect_clothing_by_face.py does; start the service (or this
+    script) with OUTFIT_ITEMS_DEVICE=cpu if that VRAM is needed by ComfyUI instead.
 
-    def classify(img, pos, neg):
-        inputs = processor(text=[pos, neg], images=img, return_tensors="pt", padding=True)
-        with torch.no_grad():
-            out = model(**inputs)
-        probs = out.logits_per_image.softmax(dim=1)[0]
-        return probs[0].item() > probs[1].item()
+    The item list is whatever the detector actually localises - nothing is assumed
+    present, and nothing missing is invented either. Pass --detect-threshold below the
+    0.5 default if real garments are being dropped.
 
-    img = Image.open(image_path).convert("RGB")
-    w, h = img.size
-    bottom_crop = img.crop((0, int(h * 0.75), w, h))
-
-    headwear = classify(img, "a person with a hat on their head", "a person with no hat, bare head")
-    footwear = classify(
-        bottom_crop,
-        "a close-up of feet wearing shoes or sandals on the ground",
-        "a close-up of the ground, ocean, or fabric with no feet or shoes",
-    )
-    one_piece = classify(
-        img,
-        "a one-piece dress with no separation at the waist",
-        "a separate top and bottom, two different garments worn together",
-    )
-    bag = classify(
-        img,
-        "a person with a shoulder bag or handbag",
-        "a person with nothing extra, just clothing",
-    )
-    return {"headwear": headwear, "footwear": footwear, "one_piece": one_piece, "bag": bag}
-
-
-def detect_worn_items(image_path):
-    """Lightweight zero-shot presence check (CLIP ViT-B/32, ~350MB, CPU-only — never
-    competes with the GPU/VRAM the main fp8 pipeline needs) for every item category the
-    outfit-extraction LoRA is unreliable at inferring from pixels alone: headwear,
-    footwear, bag, and whether the worn outfit is a single one-piece dress vs a
-    separate top+bottom (the LoRA defaults to always splitting into "top" + "skirt"
-    even for a genuine one-piece dress unless told otherwise). Nothing in the item
-    list build_prompt() constructs is hardcoded/assumed present — every category is
-    classified up front so the prompt can state a fact ("this person is/isn't wearing
-    X") instead of asking the diffusion model to guess presence from the image, which
-    it does inconsistently (see project history). Whole-image classification works
-    well for headwear, bag, and one-piece-vs-separates; footwear needs the bottom crop
-    of the frame or beach/background content confuses it.
-
-    Talks to the clip_classifier supervisor service (model loaded once, kept warm —
-    see clip_classifier_service.py) so repeated runs pay only the ~0.5-1s inference
-    cost instead of the ~8s process-startup + model-load cost every time. Falls back
-    to loading CLIP in this process if that service isn't running."""
+    Talks to the item_detector supervisor service (models loaded once, kept warm - see
+    item_detector_service.py) so repeated runs pay only the inference cost instead of
+    the model-load cost every time. Falls back to running the detector in this process
+    if that service isn't running."""
     try:
-        payload = json.dumps({"image_path": image_path}).encode()
+        payload = json.dumps({
+            "image_path": image_path, "selfie_path": selfie,
+            "threshold": threshold, "face_match_threshold": face_threshold,
+        }).encode()
         req = urllib.request.Request(
-            f"{CLIP_SERVICE_URL}/detect", data=payload, headers={"Content-Type": "application/json"},
+            f"{ITEM_SERVICE_URL}/detect", data=payload, headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # The service is up and rejected the request (e.g. no face in the image matches
+        # the selfie) - retrying the same work in-process would fail identically.
+        print("Item detection failed:", e.read().decode())
+        sys.exit(1)
     except (urllib.error.URLError, ConnectionError, OSError):
-        print("  (clip_classifier service unreachable, loading CLIP in-process instead)")
-        return _detect_worn_items_inprocess(image_path)
+        print("  (item_detector service unreachable, loading the detector in-process instead)")
+        import outfit_items
+        return outfit_items.detect_worn_items(
+            image_path, selfie_path=selfie,
+            threshold=threshold, face_match_threshold=face_threshold,
+        )
 
 
 def _grid_positions(n):
@@ -108,9 +100,13 @@ def _grid_positions(n):
 
 
 def build_prompt(detected):
-    body = ["dress"] if detected["one_piece"] else ["top/shirt", "bottom (skirt/pants)"]
-    items = (["hat"] if detected["headwear"] else []) + body + \
-            (["bag"] if detected["bag"] else []) + (["shoes"] if detected["footwear"] else [])
+    items = [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
+    if not items:
+        # The detector localised nothing at all (bad crop, heavy occlusion, threshold
+        # too high). Emitting a prompt with an empty item list would be malformed, so
+        # fall back to the two garments any clothed person is wearing - this is the one
+        # place presence is assumed rather than detected.
+        items = ["top/shirt", "bottom (skirt/pants)"]
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(len(items))))
     return (
         f"Arrange in a grid, one item per cell: {placements}. Plain white background, each "
@@ -212,18 +208,41 @@ def main():
         i = args.index("--seed")
         seed = int(args[i + 1])
         del args[i:i + 2]
+    selfie = None
+    if "--selfie" in args:
+        i = args.index("--selfie")
+        selfie = args[i + 1]
+        del args[i:i + 2]
+    threshold = face_threshold = None
+    if "--detect-threshold" in args:
+        i = args.index("--detect-threshold")
+        threshold = float(args[i + 1])
+        del args[i:i + 2]
+    if "--face-threshold" in args:
+        i = args.index("--face-threshold")
+        face_threshold = float(args[i + 1])
+        del args[i:i + 2]
 
     if len(args) < 1:
-        print(f"Usage: {sys.argv[0]} [--lightning4|--lightning8] [--fp8] [--seed N] <input_image> [prompt]")
+        print(f"Usage: {sys.argv[0]} [--lightning4|--lightning8] [--fp8] [--seed N] "
+              f"[--selfie ref.jpg] [--detect-threshold F] [--face-threshold F] "
+              f"<input_image> [prompt]")
         sys.exit(1)
     image_path = args[0]
     if len(args) > 1:
         prompt = args[1]
     else:
-        print("Detecting headwear/footwear presence (CLIP ViT-B/32, CPU)...")
+        print("Detecting worn items (fashion-object-detection + SAM)...")
         t_det = time.time()
-        detected = detect_worn_items(image_path)
-        print(f"  headwear={detected['headwear']}, footwear={detected['footwear']}, one_piece={detected['one_piece']}, bag={detected['bag']} ({time.time() - t_det:.1f}s)")
+        detected = detect_worn_items(
+            image_path, selfie=selfie, threshold=threshold, face_threshold=face_threshold,
+        )
+        flags = ", ".join(f"{key}={detected.get(key)}" for key, _ in ITEM_PHRASES)
+        print(f"  {flags} ({time.time() - t_det:.1f}s on {detected.get('device', '?')})")
+        scores = detected.get("scores") or {}
+        print(f"  detector: {scores}, persons={detected.get('persons')}"
+              + (", isolated with SAM" if detected.get("isolated_by_sam") else "")
+              + (f", face similarity={detected['face_similarity']}" if "face_similarity" in detected else ""))
         prompt = build_prompt(detected)
 
     print(f"Uploading {image_path} ...")
