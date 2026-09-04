@@ -123,6 +123,22 @@ AMBIGUOUS_OVERLAP_THRESHOLD = 0.5
 # và outer đều chỉ lởn vởn ở mức rất thấp do model "cố đoán" trên da/tay).
 AMBIGUOUS_FLOOR = 0.35
 
+# "bag" thường đạt điểm RẤT THẤP khi đè lên vùng đã được gọi là "top" (túi đeo
+# chéo/bao tử ôm sát áo) - vì đó là 2 VẬT THỂ THẬT SỰ cùng tồn tại trên người,
+# khác với các cặp trong AMBIGUOUS_LABEL_PAIRS (vd top/outer) là 2 TÊN GỌI loại
+# trừ nhau cho CÙNG 1 vùng. Vì vậy KHÔNG dùng cơ chế winner-takes-all của
+# resolve_ambiguous_pairs cho cặp này - đã thử và xác nhận thực tế nó luôn loại
+# bỏ "bag" vì điểm thua hẳn "top" (vd top=0.78 vs bag=0.19), không bao giờ để
+# bag lọt qua. Thay vào đó (xem resolve_bag_worn_over_top): bag đè lên vùng top
+# đã xác nhận thì được CỘNG THÊM vào kết quả (giữ nguyên top, không loại bỏ),
+# miễn vượt BAG_OVERLAP_FLOOR - thấp hơn hẳn --threshold chính.
+# Dùng _box_containment (giao/box NHỎ HƠN), KHÔNG dùng _box_iou (giao/hợp) - túi
+# thường nhỏ hơn hẳn áo và nằm gần trọn bên trong vùng áo, nên IoU chuẩn bị pha
+# loãng bởi diện tích áo lớn hơn nhiều, cho kết quả thấp giả tạo (đã đo được thực
+# tế: 1 box bag nằm 100% trong box top nhưng IoU chỉ ra 0.447, dưới ngưỡng 0.5).
+BAG_OVERLAP_THRESHOLD = 0.5
+BAG_OVERLAP_FLOOR = 0.15
+
 
 def _box_iou(a, b):
     x0, y0 = max(a[0], b[0]), max(a[1], b[1])
@@ -132,6 +148,22 @@ def _box_iou(a, b):
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
+
+
+def _box_containment(a, b):
+    """Tỷ lệ diện tích giao nhau TRÊN DIỆN TÍCH BOX NHỎ HƠN trong 2 box - khác
+    _box_iou (Jaccard, chia cho HỢP của 2 box). Dùng khi 1 box thường nhỏ hơn
+    hẳn và nằm gần trọn bên trong box kia (vd túi đeo chéo nhỏ nằm trong vùng
+    áo lớn hơn nhiều) - IoU chuẩn bị pha loãng bởi diện tích box lớn nên cho
+    kết quả thấp giả tạo dù box nhỏ nằm trọn bên trong box lớn (đã đo được
+    thực tế: 1 box bag nằm 100% trong box top nhưng IoU chỉ ra 0.447)."""
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
 
 
 def _region_hue(image: Image.Image, box):
@@ -278,8 +310,13 @@ def run_scales(model, processors, image: Image.Image, device: str, offset=(0, 0)
     for processor in processors:
         inputs = processor(images=image, return_tensors="pt").to(device)
         outputs = model(**inputs)
+        # Thu thập xuống tới min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR) - thấp hơn
+        # COLLECT_THRESHOLD bình thường - để không bỏ lỡ box "bag" điểm thấp ngay ở
+        # bước này. predict_image() sẽ lọc lại: chỉ "bag" được giữ dưới COLLECT_THRESHOLD,
+        # mọi nhãn khác vẫn phải đạt COLLECT_THRESHOLD như cũ (xem comment ở đó - hạ
+        # chung cho mọi nhãn từng gây hồi quy ở resolve_dress_conflict).
         res = processor.post_process_object_detection(
-            outputs, threshold=COLLECT_THRESHOLD, target_sizes=target_sizes
+            outputs, threshold=min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR), target_sizes=target_sizes
         )[0]
         boxes = res["boxes"].cpu()
         boxes[:, [0, 2]] += offset[0]
@@ -349,6 +386,39 @@ def resolve_ambiguous_pairs(candidates: dict, threshold: float):
     return resolved
 
 
+def resolve_bag_worn_over_top(candidates: dict, threshold: float):
+    """'bag' thường đạt điểm rất thấp khi đè lên vùng đã được gọi là 'top' (túi đeo
+    chéo/bao tử ôm sát áo) - đó là 2 VẬT THỂ THẬT SỰ cùng tồn tại trên người, khác
+    hẳn các cặp trong AMBIGUOUS_LABEL_PAIRS (vd top/outer) vốn là 2 TÊN GỌI loại
+    trừ nhau cho CÙNG 1 vùng. Vì vậy không dùng resolve_ambiguous_pairs (winner-
+    takes-all) cho cặp này - đã kiểm chứng nó luôn loại bỏ "bag" vì điểm thua hẳn
+    "top" (vd top=0.78 vs bag=0.19), không bao giờ để bag lọt qua.
+
+    Ở đây: bag đè lên vùng top đã xác nhận (containment >= BAG_OVERLAP_THRESHOLD,
+    dùng _box_containment chứ không phải _box_iou - xem comment ở BAG_OVERLAP_THRESHOLD)
+    thì được CỘNG THÊM vào kết quả - giữ nguyên top, không loại bỏ - miễn vượt
+    BAG_OVERLAP_FLOOR thay vì --threshold chính. Bag đã đủ điểm qua --threshold
+    chính thì bỏ qua ở đây (đã được resolve_ambiguous_pairs thêm vào rồi, tránh
+    trùng lặp)."""
+    bag_list = candidates.get("bag", [])
+    top_list = candidates.get("top", [])
+    if not bag_list or not top_list:
+        return []
+
+    extra = []
+    for bag in bag_list:
+        if bag["score"] < BAG_OVERLAP_FLOOR or bag["score"] >= threshold:
+            continue
+        if any(_box_containment(bag["box"], top["box"]) >= BAG_OVERLAP_THRESHOLD for top in top_list):
+            extra.append({
+                "label": "bag",
+                "score": round(bag["score"], 4),
+                "box": bag["box"],
+                "worn_over_top": True,  # chấp nhận ở BAG_OVERLAP_FLOOR, không phải --threshold chính
+            })
+    return extra
+
+
 @torch.no_grad()
 def predict_image(model, processors_full, processors_crop, person_model, person_pre,
                    image_path: Path, device: str, threshold: float, resolve_dress: bool):
@@ -365,6 +435,19 @@ def predict_image(model, processors_full, processors_crop, person_model, person_
             scores = torch.cat([scores, cs])
             labels = torch.cat([labels, cl])
 
+    # run_scales() thu thập chung xuống tới BAG_OVERLAP_FLOOR (thấp hơn COLLECT_THRESHOLD
+    # bình thường) để không bỏ lỡ "bag" điểm thấp. Nhưng hạ ngưỡng thu thập CHUNG cho
+    # MỌI nhãn từng gây hồi quy thực tế: 1 box "dress" điểm 0.20 bất ngờ lọt vào, kích
+    # hoạt nhầm resolve_dress_conflict() và làm mất trắng cả top+bottom (thua cuộc so
+    # hue với màu đen của quần). Nên ở đây lọc lại: chỉ "bag" được giữ dưới
+    # COLLECT_THRESHOLD, mọi nhãn khác phải đạt COLLECT_THRESHOLD như cũ - y hệt hành vi
+    # gốc cho tất cả các nhãn ngoài "bag".
+    bag_id = model.config.label2id.get("bag")
+    keep = (scores >= COLLECT_THRESHOLD)
+    if bag_id is not None:
+        keep |= (labels == bag_id)
+    boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
     # NMS theo từng class trước, CHƯA áp --threshold vội - để resolve_ambiguous_pairs
     # có đủ ứng viên (kể cả điểm thấp) mà xét các cặp nhãn cạnh tranh cùng vùng.
     candidates = {}  # label -> list[{"score":..., "box":...}]
@@ -380,6 +463,7 @@ def predict_image(model, processors_full, processors_crop, person_model, person_
 
     forced_dress, candidates = resolve_dress_conflict(candidates, image, resolve_dress)
     detections = resolve_ambiguous_pairs(candidates, threshold)
+    detections += resolve_bag_worn_over_top(candidates, threshold)
     detections = forced_dress + detections
     detections.sort(key=lambda d: -d["score"])
     return detections

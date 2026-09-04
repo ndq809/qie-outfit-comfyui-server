@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 COMFY_URL = "http://127.0.0.1:18188"
 UNET_NAME = "qwen-image-edit-2511-Q4_K_M.gguf"
@@ -39,7 +40,7 @@ ITEM_PHRASES = [
 ]
 
 
-def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None):
+def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None, save_isolated_to=None):
     """Presence check for every item category the outfit-extraction LoRA is unreliable
     at inferring from pixels alone: headwear, footwear, bag, outerwear, and whether the
     worn outfit is a single one-piece dress vs a separate top+bottom (the LoRA defaults
@@ -60,7 +61,7 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
 
     The item list is whatever the detector actually localises - nothing is assumed
     present, and nothing missing is invented either. Pass --detect-threshold below the
-    0.5 default if real garments are being dropped.
+    0.4 default if real garments are still being dropped.
 
     Talks to the item_detector supervisor service (models loaded once, kept warm - see
     item_detector_service.py) so repeated runs pay only the inference cost instead of
@@ -70,6 +71,7 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
         payload = json.dumps({
             "image_path": image_path, "selfie_path": selfie,
             "threshold": threshold, "face_match_threshold": face_threshold,
+            "save_isolated_to": save_isolated_to,
         }).encode()
         req = urllib.request.Request(
             f"{ITEM_SERVICE_URL}/detect", data=payload, headers={"Content-Type": "application/json"},
@@ -87,16 +89,52 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
         return outfit_items.detect_worn_items(
             image_path, selfie_path=selfie,
             threshold=threshold, face_match_threshold=face_threshold,
+            save_isolated_to=save_isolated_to,
         )
 
 
 def _grid_positions(n):
-    rows = (n + 1) // 2
+    """Exactly n position labels - never more. A previous version always emitted full
+    2-column rows (e.g. 4 labels for n=3 items), and callers zip()-truncated the extra
+    one away, but the prompt text still read "row 1 left, row 1 right, row 2 left" -
+    which implies a 2x2 grid with one cell left unmentioned rather than a 3-item layout.
+    The model tended to fill that implied-but-unlabeled cell with whatever else it saw
+    in the reference photo (e.g. a bag the detector hadn't flagged as present), instead
+    of leaving it empty. Labelling a lone trailing item "center" instead of "left"
+    avoids implying an unlabeled partner cell exists."""
+    full_rows, remainder = divmod(n, 2)
     labels = []
-    for row in range(1, rows + 1):
+    for row in range(1, full_rows + 1):
         labels.append(f"row {row} left")
         labels.append(f"row {row} right")
+    if remainder:
+        labels.append(f"row {full_rows + 1} center")
     return labels
+
+
+def _grid_shape_desc(n):
+    """State the grid's actual size up front (e.g. "a 2x2 grid") instead of leaving the
+    model to infer it purely from the per-item position labels. Tried a "do not repeat
+    any item" instruction first (measured: zero effect on a real regression - a 1-item
+    result still came back with 2 extra hallucinated copies of a bag visible in the
+    reference photo) - the model was filling a grid shape it assumed by itself rather
+    than disobeying an explicit "don't repeat" instruction, so telling it the shape
+    directly should remove the assumption instead of fighting its output after the fact.
+
+    An EVEN item count fills an n/2 x 2 grid exactly (no partial row), so a plain "RxC
+    grid" statement is accurate on its own.
+    An ODD item count has no rectangle that fits exactly - stating a fixed RxC here would
+    require either padding an existing cell or leaving one unlabeled (the exact bug
+    _grid_positions() above already fixes for the per-item labels). So the shape is
+    spelled out row by row instead: full rows of 2 side by side, then one final row of
+    exactly 1 item - the stated cell count always matches len(items), never more."""
+    if n == 1:
+        return "a single centered item (no grid)"
+    rows, remainder = divmod(n, 2)
+    if not remainder:
+        return f"a {rows}x2 grid"
+    row_word = "row" if rows == 1 else "rows"
+    return f"a grid: {rows} {row_word} of 2 items side by side, then 1 final row with exactly 1 item centered"
 
 
 def build_prompt(detected):
@@ -107,14 +145,27 @@ def build_prompt(detected):
         # fall back to the two garments any clothed person is wearing - this is the one
         # place presence is assumed rather than detected.
         items = ["top/shirt", "bottom (skirt/pants)"]
-    placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(len(items))))
-    return (
-        f"Arrange in a grid, one item per cell: {placements}. Plain white background, each "
-        "item placed separately with a wide gap of clear white space between them, no "
-        "touching, no overlapping. The bag lies flat on its own with its strap coiled "
-        "neatly beside it, not worn or draped over any other item. Professional flat "
-        "mockup photography."
-    )
+    n = len(items)
+    placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))
+    item_word = "item" if n == 1 else "items"
+    parts = [
+        f"Arrange in {_grid_shape_desc(n)}, exactly {n} {item_word} total, one item per "
+        f"cell: {placements}. Plain white background, each item placed separately with a "
+        "wide gap of clear white space between them, no touching, no overlapping, nothing "
+        "else in the frame."
+    ]
+    # Only describe how the bag should be laid out when a bag was actually detected -
+    # naming/describing a category that isn't confirmed present (even to say how it
+    # should look) measurably increases the chance the model draws one anyway (see
+    # README "Prompt-tuning notes"). This line used to be unconditional, which is why
+    # a bag kept appearing in results even when detected["bag"] was False.
+    if detected.get("bag"):
+        parts.append(
+            "The bag lies flat on its own with its strap coiled neatly beside it, not "
+            "worn or draped over any other item."
+        )
+    parts.append("Professional flat mockup photography.")
+    return " ".join(parts)
 
 
 def upload_image(path):
@@ -229,13 +280,20 @@ def main():
               f"<input_image> [prompt]")
         sys.exit(1)
     image_path = args[0]
+    # Where to save the SAM-isolated subject if the photo has more than one person -
+    # next to the input image, so it's easy to find and inspect by eye.
+    src = Path(image_path)
+    isolated_path = src.with_name(f"{src.stem}_isolated.png")
+
     if len(args) > 1:
         prompt = args[1]
+        generation_image_path = image_path
     else:
         print("Detecting worn items (fashion-object-detection + SAM)...")
         t_det = time.time()
         detected = detect_worn_items(
             image_path, selfie=selfie, threshold=threshold, face_threshold=face_threshold,
+            save_isolated_to=str(isolated_path),
         )
         flags = ", ".join(f"{key}={detected.get(key)}" for key, _ in ITEM_PHRASES)
         print(f"  {flags} ({time.time() - t_det:.1f}s on {detected.get('device', '?')})")
@@ -245,8 +303,21 @@ def main():
               + (f", face similarity={detected['face_similarity']}" if "face_similarity" in detected else ""))
         prompt = build_prompt(detected)
 
-    print(f"Uploading {image_path} ...")
-    image_name = upload_image(image_path)
+        # More than one person in the photo: the extraction model would otherwise see
+        # everyone in the reference image and can pull a garment from the wrong
+        # person when the prompt only names a category ("bottom (skirt/pants)")
+        # without saying whose. Generate from the SAM-isolated single-subject image
+        # instead - same one detect_worn_items() just used to decide what's present -
+        # so there's no other person's clothes left for it to draw from.
+        if detected.get("isolated_by_sam") and isolated_path.exists():
+            generation_image_path = str(isolated_path)
+            print(f"  {detected['persons']} people in frame - generating from the "
+                  f"SAM-isolated subject instead of the original: {generation_image_path}")
+        else:
+            generation_image_path = image_path
+
+    print(f"Uploading {generation_image_path} ...")
+    image_name = upload_image(generation_image_path)
     print(f"Uploaded as {image_name}")
 
     client_id = uuid.uuid4().hex

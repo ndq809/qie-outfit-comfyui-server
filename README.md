@@ -101,8 +101,11 @@ Flags:
 - `--selfie ref.jpg` — reference photo of the person whose outfit should be extracted.
   Only useful when the input contains several people and the subject isn't the largest
   one in frame; the subject is picked by ArcFace face similarity instead.
-- `--detect-threshold F` — detector confidence floor (default 0.5). Lower it to ~0.35 if
-  a garment that is clearly in the photo is missing from the item list.
+- `--detect-threshold F` — detector confidence floor (default 0.4). Lower it to ~0.35 if
+  a garment that is clearly in the photo is still missing from the item list. The default
+  used to be 0.5, which measurably dropped real garments (trousers at 0.4218 on
+  `2026_02_18_16_30_05_IMG_0876.JPG` were missing from the item list entirely, and the
+  generation duplicated the bag to fill the layout).
 - `--face-threshold F` — minimum ArcFace cosine similarity for `--selfie` (default 0.35).
 
 ### Auto-detected prompt (no hardcoded items)
@@ -139,11 +142,37 @@ instead of the CLIP ViT-B/32 zero-shot classifier this used to run:
   neutral grey before detection, so another person's clothes can't enter the item list.
   The subject is the largest person in frame, or the ArcFace (`insightface/buffalo_l`)
   match for `--selfie` when given.
+
+  **The mask includes what the subject carries.** SAM prompted with a person box
+  returns only the *person* — anything carried is a separate object to it, so the bag
+  used to get painted out with the background: measured on
+  `2026_02_18_16_30_05_IMG_0876.JPG`, 99.1% of the subject's crossbody bag (150,960 of
+  152,391 px) was greyed, and `binary_fill_holes` could not recover it because the bag
+  sits on the silhouette edge, so the gap connects to the background rather than being
+  an enclosed hole (it recovered 0.17% of the mask). The detector then scored that bag
+  0.2106 against 0.6758 on the original, surviving only via `BAG_OVERLAP_FLOOR`.
+  So the garment detector now runs on the **original** image first, purely to locate
+  the items; every box at least `ITEM_INSIDE_PERSON_FRAC` (0.8) inside the subject's
+  person box is segmented too and unioned into the person's mask before the background
+  is painted. Detection proper still runs on the isolated image afterwards. Measured
+  effect: the bag on that photo goes 0.2097 → **0.8134**, and
+  `2025_12_24_19_50_57_IMG_0485.JPG` gains a pair of trousers (0.6837) the old mask was
+  clipping away. Cost is one extra detector pass, ~5.3s per photo on CPU.
+
+  That 0.8 is deliberately at the top of the measured gap (own items 0.833–1.000,
+  other people's 0.431 and below) rather than mid-gap: 0.65 was tried and regressed
+  `2025_07_25_12_43_28_IMG_9653.JPG` from `{shoes, top, bottom, bag}` to
+  `{shoes, outer}`. The one extra box it admitted grew the mask by 4,535 px (1.1%),
+  which is enough to flip the winner-take-all `resolve_*` arbitration downstream.
+
+  Known limitation: ownership is decided from box geometry, so an item another person
+  holds *in front of* the subject counts as the subject's.
 - The item list is **exactly what the detector localises** — nothing is assumed present,
   and nothing missing is invented either. The earlier CLIP path hardcoded `top` +
   `bottom` whenever the outfit wasn't a one-piece; a real detector is the better
   authority, so if a garment is being dropped, lower `--detect-threshold` instead
-  (measured: a skirt at 0.40 reappears at `--detect-threshold 0.35`). The one remaining
+  (measured: a skirt at 0.40 reappears at `--detect-threshold 0.35`; this is also why the
+  default floor is 0.4 rather than 0.5). The one remaining
   assumption is the empty-list fallback: if the detector finds *nothing at all*, the
   prompt falls back to `top` + `bottom` rather than being malformed.
 

@@ -51,6 +51,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 
 import detect_clothing_by_face as byface
 import detect_clothing_yolo as clothing
@@ -68,12 +69,35 @@ def _resolve_device():
 # torchvision build in this environment is CPU-only (see its comment).
 DEVICE = _resolve_device()
 # Same knobs detect_clothing_by_face.py runs with: multi-scale + person-crop TTA
-# on, dress conflict auto-resolved by hue, threshold 0.5 and face-match
-# threshold 0.35 - the latter taken straight from that module so the two can't
-# drift apart.
+# on, dress conflict auto-resolved by hue, and face-match threshold 0.35 - the
+# latter taken straight from that module so the two can't drift apart.
+#
+# The detector floor is deliberately 0.4 rather than the 0.5 that
+# detect_clothing_by_face.py still defaults to: 0.5 measurably drops real
+# garments off the item list (measured on IMG_0876 - a plainly visible pair of
+# trousers scores 0.4218, so at 0.5 the prompt asked for jacket+bag only and the
+# generation duplicated the bag to fill the layout). 0.4 keeps those, while
+# staying above the ~0.35 range where the standalone script's own floors
+# (AMBIGUOUS_FLOOR / DRESS_PAIR_FLOOR) already handle the contested cases.
 MULTI_SCALE = True
-THRESHOLD = 0.5
+THRESHOLD = 0.4
 FACE_MATCH_THRESHOLD = byface.FACE_MATCH_THRESHOLD
+# How much of a garment box must lie inside the subject's person box for the item
+# to count as theirs and be added to the isolation mask (see _subject_mask()).
+#
+# Measured over images/, the subject's own items land at 0.833 / 0.947 / 1.000
+# (the 0.833 is a crossbody bag whose box is loose and spills past his
+# silhouette) and other people's at 0.431 / 0.160 / 0.000, so the usable gap is
+# 0.431-0.833. This sits hard against the TOP of that gap on purpose, not at the
+# midpoint: 0.65 was tried and regressed IMG_9653 from
+# {shoes, top, bottom, bag} to {shoes, outer}. The single extra box it admitted
+# was that subject's own top at 0.754, and its mask only grew the union by 4,535
+# px (1.1%) - but the resolve_* steps downstream are winner-take-all, so a
+# perturbation that small is enough to flip the top/outer arbitration and take
+# bottom and bag down with it. Only union a box that is unambiguously inside the
+# subject; a marginal one costs more than it adds.
+ITEM_INSIDE_PERSON_FRAC = 0.8
+
 
 _clothing_models = None
 _sam = None
@@ -128,6 +152,45 @@ def _flags_from_detections(detections):
     }
 
 
+def _box_inside_frac(box, person_box):
+    """Fraction of `box`'s own area that lies inside `person_box`."""
+    x0, y0 = max(box[0], person_box[0]), max(box[1], person_box[1])
+    x1, y1 = min(box[2], person_box[2]), min(box[3], person_box[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    return inter / area if area > 0 else 0.0
+
+
+def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes):
+    """Pixel mask of the subject INCLUDING the things they are wearing/carrying.
+
+    SAM prompted with a person box returns only the PERSON. Anything carried is a
+    separate object to it, so isolate_person() used to paint it out: measured on
+    2026_02_18_16_30_05_IMG_0876.JPG, 99.1% of the subject's crossbody bag
+    (150,960 of 152,391 px) was painted grey, and binary_fill_holes() could not
+    bring it back - the bag sits on the silhouette edge, so the gap it leaves
+    connects to the background instead of being an enclosed hole (fill_holes
+    recovered 0.17% of the mask). The detector then scored that bag 0.2106 on the
+    isolated image against 0.6758 on the original.
+
+    Fix: the caller runs the garment detector on the ORIGINAL image first and
+    passes its boxes in here. Every box that lies inside the subject's person box
+    is segmented too, and those masks are unioned into the person's - so the bag
+    survives the background paint. Boxes belonging to someone else fail the
+    containment test and are left out.
+
+    All the prompts go in a single batched SAM call: the expensive part is the ViT
+    image encoder over the whole frame, and the mask decoder per extra box is
+    cheap. Measured (CPU, 3024x4032): 1 box 2.46s, 5 boxes batched 2.78s, but 5
+    boxes as separate calls 12.25s."""
+    inside = [b for b in item_boxes if _box_inside_frac(b, target_box) >= ITEM_INSIDE_PERSON_FRAC]
+    masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE)
+    mask = binary_fill_holes(masks[0])
+    for item_mask in masks[1:]:
+        mask |= item_mask
+    return mask
+
+
 def detect_worn_items(image_path, selfie_path=None, threshold=None,
                       face_match_threshold=None, save_isolated_to=None):
     """Return the item flags build_prompt() needs, plus the raw per-label scores.
@@ -172,7 +235,16 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         # is nobody to filter out, and painting the background grey measurably
         # shifts the detector's scores, so SAM only runs when it can actually help.
         sam_model, sam_processor = _load_sam()
-        mask = byface.segment_person(sam_model, sam_processor, image, target_box, DEVICE)
+        # First pass on the ORIGINAL image, only to locate the subject's items so
+        # the isolation mask can keep them - see _subject_mask(). Detection proper
+        # still runs on the isolated image below, because a clean grey background
+        # scores better than a crowded one.
+        pre = clothing.predict_image(
+            cloth_model, procs_full, procs_crop, person_model, person_pre,
+            Path(image_path), DEVICE, threshold, resolve_dress=True,
+        )
+        mask = _subject_mask(sam_model, sam_processor, image, target_box,
+                             [d["box"] for d in pre])
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
             isolated.save(save_isolated_to)
