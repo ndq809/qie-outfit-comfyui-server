@@ -115,31 +115,46 @@ def match_face_to_person_box(face_bbox, person_boxes):
     return min(person_boxes, key=dist) if person_boxes else None
 
 
+def _pick_mask(masks, scores, box):
+    """Chọn 1 trong 3 mask SAM trả về cho 1 box prompt.
+
+    SAM trả về 3 mask (toàn bộ/1 phần/mảnh nhỏ) kèm điểm iou_score riêng của
+    nó, nhưng điểm này thỉnh thoảng bị lệch: đã gặp thực tế 1 ảnh 2 người ngồi
+    sát ôm nhau, SAM chấm mask "vài mảnh da rời rạc" (chỉ phủ 9.8% diện tích
+    box người) cao hơn 0.01 so với mask body đầy đủ (phủ 38.3%) -> chọn nhầm
+    mask gần như trống. Vì vật thể luôn chiếm phần lớn diện tích box của CHÍNH
+    NÓ (đúng với cả box người lẫn box món đồ), loại các mask quá nhỏ so với box
+    trước khi chọn theo score, để tránh lặp lại lỗi này."""
+    box_area = (box[2] - box[0]) * (box[3] - box[1])
+    area_fracs = [masks[i].numpy().sum() / box_area for i in range(masks.shape[0])]
+    candidates = [i for i, frac in enumerate(area_fracs) if frac >= MIN_MASK_AREA_FRAC]
+    if not candidates:
+        candidates = range(masks.shape[0])  # không mask nào đủ lớn -> đành lấy hết, chọn theo score
+    best = max(candidates, key=lambda i: scores[i].item())
+    return masks[best].numpy()  # (H, W) bool
+
+
 @torch.no_grad()
-def segment_person(sam_model, sam_processor, image: Image.Image, person_box, device: str):
-    inputs = sam_processor(image, input_boxes=[[person_box]], return_tensors="pt").to(device)
+def segment_boxes(sam_model, sam_processor, image: Image.Image, boxes, device: str):
+    """Mask SAM cho NHIỀU box trong MỘT lần gọi -> list[np.ndarray] cùng thứ tự.
+
+    Phải gộp chung 1 lần gọi chứ không lặp từng box: phần đắt nhất của SAM là
+    ViT image encoder chạy trên toàn ảnh, còn mask decoder cho thêm 1 box thì
+    rất rẻ. Đo trên ảnh 3024x4032 (CPU): 1 box = 2.46s, 5 box gộp 1 lần gọi =
+    2.78s, nhưng 5 box gọi riêng từng cái = 12.25s (encoder chạy lại 5 lần)."""
+    inputs = sam_processor(image, input_boxes=[list(boxes)], return_tensors="pt").to(device)
     outputs = sam_model(**inputs)
     masks = sam_processor.image_processor.post_process_masks(
         outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
-    )[0]
-    scores = outputs.iou_scores.cpu()[0, 0]
+    )[0]  # (num_boxes, 3, H, W)
+    scores = outputs.iou_scores.cpu()[0]  # (num_boxes, 3)
+    return [_pick_mask(masks[i], scores[i], box) for i, box in enumerate(boxes)]
 
-    # SAM trả về 3 mask (toàn thân/1 phần/mảnh nhỏ) kèm điểm iou_score riêng
-    # của nó, nhưng điểm này thỉnh thoảng bị lệch: đã gặp thực tế 1 ảnh 2
-    # người ngồi sát ôm nhau, SAM chấm mask "vài mảnh da rời rạc" (chỉ phủ
-    # 9.8% diện tích box người) cao hơn 0.01 so với mask body đầy đủ (phủ
-    # 38.3%) -> chọn nhầm mask gần như trống. Vì 1 người luôn chiếm phần lớn
-    # diện tích box của chính họ, loại các mask quá nhỏ so với box trước khi
-    # chọn theo score, để tránh lặp lại lỗi này.
-    box_area = (person_box[2] - person_box[0]) * (person_box[3] - person_box[1])
-    area_fracs = [masks[0, i].numpy().sum() / box_area for i in range(masks.shape[1])]
-    candidates = [i for i, frac in enumerate(area_fracs) if frac >= MIN_MASK_AREA_FRAC]
-    if not candidates:
-        candidates = range(masks.shape[1])  # không mask nào đủ lớn -> đành lấy hết, chọn theo score
 
-    best = max(candidates, key=lambda i: scores[i].item())
-    mask = masks[0, best].numpy()  # (H, W) bool
-    return binary_fill_holes(mask)
+def segment_person(sam_model, sam_processor, image: Image.Image, person_box, device: str):
+    return binary_fill_holes(
+        segment_boxes(sam_model, sam_processor, image, [person_box], device)[0]
+    )
 
 
 def isolate_person(image: Image.Image, mask: np.ndarray) -> Image.Image:
