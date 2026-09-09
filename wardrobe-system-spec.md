@@ -4,7 +4,7 @@ Tài liệu này gộp nội dung của 4 tài liệu trước đó (pipeline gu
 
 Quy ước đánh số: các mục lớn dùng số thập phân (1.1, 2.3.2...) để điều hướng tài liệu. Các mã **A0–A5, B1–B2, C1, D0–D4, E1–E2** là mã giai đoạn của pipeline gốc (Giai đoạn A đến E), chỉ xuất hiện như nhãn mô tả bước xử lý bên trong nội dung — không phải số mục của tài liệu này, để tránh nhầm lẫn thứ tự.
 
-Lưu ý về hai thay đổi so với thiết kế gốc, đã phản ánh trong tài liệu này: (1) **thứ tự chạy thực tế trên mobile không theo thứ tự mã giai đoạn** — B1 chạy trước A2/A3/A4 (xem [1.1](#11-pipeline-xử-lý-on-device)); (2) **B2 và C1 không còn chạy trên mobile** — B2 bị bỏ hẳn, C1 chuyển sang server thành bước D0b (xem [2.1](#21-kiến-trúc-chung)).
+Lưu ý về ba thay đổi so với thiết kế gốc, đã phản ánh trong tài liệu này: (1) **thứ tự chạy thực tế trên mobile không theo thứ tự mã giai đoạn** — B1 chạy trước A2/A3/A4 (xem [1.1](#11-pipeline-xử-lý-on-device)); (2) **B2 và C1 không còn chạy trên mobile** — B2 bị bỏ hẳn, C1 chuyển sang server thành bước D0b (xem [2.1](#21-kiến-trúc-chung)); (3) **thứ tự chạy trên server cũng không theo thứ tự mã giai đoạn** — D2 chạy sau D3 vì dùng lại embedding do D3 sinh ra, thay vì thêm một model riêng (xem [2.1](#21-kiến-trúc-chung)).
 
 ## Mục lục
 
@@ -164,7 +164,7 @@ Dùng để: kiểm chứng nhanh tác động của việc đổi ngưỡng (`h
 #### Thành phần chính
 
 - **Data server**: cấp quyền upload, tạo và theo dõi job, là chủ sở hữu duy nhất của database. Hiện thực toàn bộ API public.
-- **AI server (worker pool)**: liên tục lấy việc từ job queue, xử lý D1–D3 nối tiếp trên cùng một ảnh, rồi báo kết quả qua result queue. Không có API nghiệp vụ, không đụng trực tiếp vào database.
+- **AI server (worker pool)**: liên tục lấy việc từ job queue, xử lý D0b→D1→D3→D2 nối tiếp trên cùng một ảnh (thứ tự thực tế, xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4)), rồi báo kết quả qua result queue. Không có API nghiệp vụ, không đụng trực tiếp vào database.
 - **Object Storage**: kho lưu ảnh gốc chờ xử lý và ảnh trang phục đã tách. Mobile và AI server đọc/ghi trực tiếp bằng đường dẫn có giới hạn quyền và thời hạn.
 - **Message Queue (job queue)**: nơi Data server đặt vé việc cho AI server lấy về làm.
 - **Result Queue**: nơi AI server đặt kết quả xử lý để Data server tiêu thụ và ghi vào database.
@@ -174,13 +174,91 @@ Nguyên tắc xuyên suốt: **hai server không gọi thẳng vào nhau**, ch�
 #### Luồng xử lý D0→D4
 
 1. **D0 — Upload & tạo job** (Mobile khởi tạo, xem [1.2](#12-tương-tác-với-server)): Data server cấp đường dẫn upload qua `POST /v1/uploads/presign`, Mobile upload thẳng lên Object Storage, rồi Data server tạo job qua `POST /v1/jobs` và đẩy một vé việc/ảnh vào job queue (chỉ chứa đường dẫn ảnh, không chứa nội dung ảnh).
-2. **D0b — Tách người dùng khỏi ảnh nhóm** (trách nhiệm mới, trước đây là C1 trên mobile): với ảnh chụp ở chế độ ảnh nhóm, AI server phải cô lập đúng người dùng trước khi tách trang phục, nếu không sẽ tạo ra item từ quần áo của người khác trong ảnh. Bước này chuyển từ mobile sang server vì các model segmentation đủ nhẹ để chạy on-device (MobileSAM, EdgeSAM) cho chất lượng mask không đạt yêu cầu trên ảnh thật; ở server có thể dùng model mạnh hơn không bị giới hạn tài nguyên thiết bị. Do ảnh gửi lên **chưa được bôi xám**, server cần tự xác định đâu là người dùng — cách khả dĩ là đối chiếu khuôn mặt với embedding tham chiếu đã lưu của account (cùng loại embedding mà mobile dùng ở A4), rồi dùng vị trí đó làm prompt cho model segmentation.
-3. **D1 — Tách trang phục**: model fashion parsing/clothes segmentation chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục.
-4. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng (CLIP, MIT license) tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1. Bước này càng quan trọng hơn sau khi B1 trên mobile được nới ngưỡng gom cụm (xem [1.1](#11-pipeline-xử-lý-on-device)) — mobile ưu tiên gom mạnh để giảm tải, phần trùng lặp còn sót lại do server bắt.
-5. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa.
-6. **D4 — Ghi wardrobe vào database (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage rồi đặt kết quả (đường dẫn ảnh + tag) vào result queue — không ghi thẳng database. Data server tiêu thụ result queue để ghi wardrobe vào database và cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`).
+2. **D0b — Tách người dùng khỏi ảnh nhóm** (trách nhiệm mới, trước đây là C1 trên mobile): với ảnh chụp ở chế độ ảnh nhóm, AI server phải cô lập đúng người dùng trước khi tách trang phục, nếu không sẽ tạo ra item từ quần áo của người khác trong ảnh. Bước này chuyển từ mobile sang server vì các model segmentation đủ nhẹ để chạy on-device (MobileSAM, EdgeSAM) cho chất lượng mask không đạt yêu cầu trên ảnh thật; ở server có thể dùng model mạnh hơn không bị giới hạn tài nguyên thiết bị. Do ảnh gửi lên **chưa được bôi xám**, server tự xác định đâu là người dùng bằng cách đối chiếu khuôn mặt với embedding tham chiếu đã lưu của account (cùng loại embedding mà mobile dùng ở A4), rồi dùng vị trí đó làm prompt cho model segmentation. **Bước này còn trả về danh sách loại trang phục thực sự có mặt** — đầu vào bắt buộc cho D1 (xem dưới).
+3. **D1 — Tách trang phục**: model chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục. Hiện thực tham chiếu dùng **image-edit model + LoRA** để *vẽ lại* trang phục thành ảnh mockup phẳng, không phải segmentation cắt pixel từ ảnh gốc (hệ quả xem phần dưới).
+4. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1. Bước này càng quan trọng hơn sau khi B1 trên mobile được nới ngưỡng gom cụm (xem [1.1](#11-pipeline-xử-lý-on-device)) — mobile ưu tiên gom mạnh để giảm tải, phần trùng lặp còn sót lại do server bắt. **Thay đổi so với thiết kế gốc: D2 chạy *sau* D3**, và không cần thêm model CLIP riêng — xem giải thích ở phần dưới.
+5. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa. Ngoài tag, bước này còn sinh **embedding** dùng cho D2 và cho tìm kiếm wardrobe sau này.
+6. **D4 — Ghi wardrobe vào database (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage rồi đặt kết quả (đường dẫn ảnh + tag + embedding) vào result queue — không ghi thẳng database. Data server tiêu thụ result queue để ghi wardrobe vào database và cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`). Lưu ý **một ảnh gốc sinh ra nhiều item**, nên một bản tin kết quả chứa một danh sách item chứ không phải một item (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
 
 Cấu trúc bản tin của job queue và result queue được định nghĩa chi tiết ở [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue).
+
+#### Hiện thực tham chiếu cho D0b–D3
+
+**D0b, D1 và D3 đã có bản chạy được**, kiểm chứng trên ảnh thật, trong repo này — xem [README.md](README.md) để biết cách chạy và các số đo. `test_extract_outfit.py` chạy cả ba bằng một lệnh và là bản mô tả chính xác nhất luồng xử lý mà worker của ai-server cần hiện thực lại:
+
+**D2 thì chưa** — repo mới chỉ cung cấp *đầu vào* cho nó (`visual_embedding` do D3 sinh ra); phần so trùng và ngưỡng quyết định vẫn phải viết ở ai-server, và D4 cũng chưa có vì repo không có database/hàng đợi.
+
+```bash
+python3 test_extract_outfit.py --lightning4 --fp8 <ảnh_gốc>
+```
+
+Ánh xạ giữa mã giai đoạn và code:
+
+| Bước | Model / kỹ thuật | Code |
+|---|---|---|
+| D0b | `insightface/buffalo_l` (ArcFace) đối chiếu khuôn mặt + `facebook/sam-vit-base` cô lập người + `yainage90/fashion-object-detection` (Conditional DETR) liệt kê loại trang phục | `outfit_items.py`, `detect_clothing_by_face.py`, `detect_clothing_yolo.py`; giữ model nóng qua `item_detector_service.py` |
+| D1 | `Qwen-Image-Edit-2511` + LoRA `QIE-2511-Extract-Outfit` (+ LoRA Lightning 4/8 bước) chạy trên ComfyUI, rồi crop bằng connected components | `build_prompt()` / `build_workflow()` / `crop_items()` trong `test_extract_outfit.py` |
+| D3 | Magic Eye phase 2 (SigLIP-base + 8 head thuộc tính) + phase 3 (sinh text embedding) | `wardrobe_classifier.py`, trọng số ở `models/magic_eye/` |
+
+**D0b — chi tiết đã kiểm chứng.** Người dùng được chọn bằng độ tương đồng ArcFace (ngưỡng mặc định 0.35); nếu không có ảnh tham chiếu thì lấy người lớn nhất khung hình. Những người còn lại bị bôi xám bằng mask SAM trước khi nhận diện. Một cạm bẫy đã đo được và đã xử lý: SAM khi được prompt bằng box người chỉ trả về *người*, còn **đồ mang theo là vật thể riêng** nên bị bôi xám mất — đo trên một ảnh thật, 99.1% chiếc túi đeo chéo của chủ thể (150.960/152.391 px) bị xóa, và điểm nhận diện túi tụt còn 0.2106. Cách khắc phục đang dùng: chạy detector trên **ảnh gốc** trước để định vị các item, segment thêm mọi box nằm ít nhất 80% bên trong box người rồi hợp vào mask của chủ thể. Sau sửa, túi đó lên **0.8134**. Ngưỡng 80% được chọn ở mép trên của khoảng đo được (đồ của chính chủ thể 0.833–1.000, đồ người khác ≤0.431); thử 0.65 thì một ảnh khác bị hỏng kết quả. Hạn chế còn lại: quyền sở hữu suy ra từ hình học box, nên vật người khác cầm *chắn trước* chủ thể vẫn bị tính là của chủ thể.
+
+**D0b sinh thêm danh sách loại trang phục có mặt** (`hat`, `outer`, `dress` vs `top`+`bottom`, `bag`, `shoes`) — không có trong thiết kế gốc, nhưng **D1 bắt buộc phải có**: LoRA tách trang phục suy đoán "có/không có" rất kém, và mọi loại không được xác nhận có mặt mà bị nhắc tên trong prompt đều làm tăng khả năng model tự vẽ thêm. Danh sách này đúng bằng những gì detector định vị được — không giả định gì thêm, cũng không bịa thêm.
+
+**D1 — hệ quả quan trọng của việc dùng image-edit model.** Ảnh trang phục trong wardrobe là ảnh **được vẽ lại** trên nền trắng, không phải vùng pixel cắt ra từ ảnh của người dùng. Ba hệ quả cần biết khi thiết kế phần còn lại của hệ thống:
+
+- **Có lợi cho quyền riêng tư**: ảnh kết quả không còn khuôn mặt, hậu cảnh hay bất kỳ dấu vết nào của bối cảnh chụp — khớp với yêu cầu ở [Bảo mật và vòng đời dữ liệu](#bảo-mật-và-vòng-đời-dữ-liệu) rằng chỉ ảnh đã tách mới được lưu dài hạn.
+- **Chi tiết có thể lệch so với thực tế**: model tái tạo hoa văn/phom dáng chứ không sao chép, nên tag của D3 và so khớp của D2 đều thực hiện trên ảnh tái tạo. Với mục đích wardrobe (nhận diện "cái áo hoa be tay ngắn") là chấp nhận được; nếu sau này cần đối chiếu chính xác từng chi tiết sản phẩm thì phải giữ thêm crop từ ảnh gốc.
+- **Không đảm bảo 100% theo mọi seed**: một seed cụ thể vẫn có thể làm chồng lấn hai món hoặc thêm món không yêu cầu. Worker nên coi đây là lỗi có thể thử lại với seed khác, không phải lỗi vĩnh viễn của ảnh.
+
+Prompt được sinh tự động từ danh sách của D0b, sắp các món vào lưới đánh số rõ ràng (`row 1 left`, `row 1 right`, ...) kèm khai báo kích thước lưới, để mỗi món nằm gọn một ô với khoảng trắng rộng ở giữa. Các bài học chỉnh prompt (ngắn gọn thắng dài dòng, mô tả thắng mệnh lệnh, không bao giờ nhắc tên loại chưa xác nhận) nằm ở mục "Prompt-tuning notes" của README — nên đọc trước khi sửa prompt.
+
+**D1 — bước crop không cần thêm model.** Vì prompt đã yêu cầu nền trắng phẳng, các món cách xa nhau, không chạm/không chồng nhau, nên chỉ cần phân tích thành phần liên thông trên mặt nạ khác-nền là đủ và chính xác. Bốn điểm đã phải xử lý:
+
+- Nền là gần-trắng chứ không phải `#ffffff` (ảnh mẫu đo được `(245, 245, 244)`), nên màu nền được **lấy mẫu từ viền ảnh**; so với `#ffffff` cứng thì toàn bộ nền bị coi là tiền cảnh.
+- Một *món* không phải lúc nào cũng là một vùng liên thông: đôi dép là hai vùng, túi có quai cuộn bên cạnh cũng có thể là hai. Các vùng cách nhau dưới 3% cạnh ngắn được gộp lại — trên ảnh mẫu, dép-với-dép cách ~14 px trong khi áo-với-quần cách ~50 px và hàng-với-hàng ~124 px, nên ngưỡng này nằm giữa hai thang đo rất rộng.
+- Thứ tự đọc theo hàng (gom hàng trước, rồi trái→phải trong hàng); sắp xếp thẳng theo tọa độ `y` sẽ đan xen hai cột.
+- Crop ra **ảnh vuông, đệm bằng chính màu nền** chứ không cắt vào món đồ, vì D3 resize cứng về 224×224 không giữ tỉ lệ — đưa thẳng box cao vào sẽ bóp méo trang phục theo chiều ngang.
+
+Nếu số món tìm được **khác** số món prompt yêu cầu, tên crop lùi về đánh số theo vị trí thay vì gán nhãn sai. Worker nên **log lại chênh lệch này**: đó là tín hiệu chất lượng cho biết lần sinh ảnh đó có vấn đề (thiếu món hoặc thừa món), hữu ích để quyết định thử lại với seed khác.
+
+**D3 — mô hình và đầu ra.** Hai model chạy nối tiếp trên mỗi crop: `phase2.pt` (backbone SigLIP-base + 8 head thuộc tính) cho ra visual embedding và logits thuộc tính; `phase3.pt` nhận visual embedding *cùng* các thuộc tính đã dự đoán để sinh text embedding dùng cho tìm kiếm. Phase 3 là head nằm trên phase 2 nên luôn phải load cả hai. Không gian nhãn: gender 5, category 4, sub_category 49, type 122, color 23, neck 12, sleeve 5, pattern 11. Các head đa nhãn dùng ngưỡng riêng cho từng lớp (ngưỡng 0.5 phẳng vừa dự đoán thừa màu phổ biến vừa bỏ sót màu hiếm) và có cơ chế lấy top-1 khi không lớp nào vượt ngưỡng, nên một món không bao giờ ra kết quả rỗng màu.
+
+Mỗi crop cho ra một bản ghi — đây chính là đơn vị dữ liệu mà D4 ghi vào database:
+
+| Trường | Ví dụ | Ghi chú |
+|---|---|---|
+| `type`, `category`, `sub_category`, `gender` | `shirts`, `clothing`, `shirts`, `men` | đơn nhãn |
+| `color` | `[{beige, 91.1}, {brown, 67.7}]` | đa nhãn, kèm độ tin cậy |
+| `neck`, `sleeve`, `pattern` | `[spread collar]`, `[short sleeve]`, `[]` | đa nhãn, rỗng nếu không áp dụng |
+| `original_text` | `short sleeve shirts in beige and brown. spread collar. men's clothing.` | mô tả sinh từ các thuộc tính trên |
+| `visual_embedding` | 768 chiều, đã chuẩn hóa L2 | **đầu vào của D2** |
+| `text_embedding` | 768 chiều | dùng cho tìm kiếm wardrobe |
+
+Trọng số đã được commit sẵn trong repo (`models/magic_eye/`, 203 MB qua Git LFS) nên worker không cần tải model từ nguồn ngoài lúc chạy; chi tiết ở [models/magic_eye/README.md](models/magic_eye/README.md).
+
+**D2 — đảo thứ tự so với thiết kế gốc.** Thiết kế ban đầu đặt D2 trước D3 và dự tính thêm một model CLIP riêng để tính độ tương đồng. Không cần nữa: `visual_embedding` mà D3 sinh ra đã là vector 768 chiều chuẩn hóa L2 của đúng ảnh trang phục đó, nên cosine similarity chỉ còn là một phép nhân vô hướng, và dùng lại chính không gian đặc trưng mà model đã được huấn luyện trên dữ liệu thời trang — sát với "cùng một cái áo hay không" hơn CLIP zero-shot. Đổi lại, **D2 phải chạy sau D3**, và thứ tự thực tế trên worker là D0b → D1 → D3 → D2 → D4.
+
+Khử trùng lặp cần làm ở hai mức:
+
+- **Trong cùng một ảnh gốc**: hiếm, nhưng khi model sinh ảnh vẽ lặp một món vào hai ô thì hai crop gần như trùng khít — bắt được ở mức này rẻ hơn là để lọt vào database.
+- **Giữa các ảnh gốc / với wardrobe sẵn có**: so bản ghi mới với embedding của các item đã có của cùng account. Đây là mức mà thiết kế gốc nhắm tới, và là lưới an toàn cho trường hợp index cục bộ của mobile bị mất (xem [1.2](#12-tương-tác-với-server)).
+
+Ngưỡng cosine cụ thể **chưa chốt** — cần đo trên dữ liệu thật của hệ thống rồi mới đặt, vì đặt cao sẽ tạo item trùng còn đặt thấp sẽ gộp nhầm hai chiếc áo khác nhau cùng kiểu cùng màu. Có thể siết thêm bằng cách chỉ so các item cùng `type`/`category` (đã có sẵn từ D3), vừa giảm số phép so vừa loại bớt nhầm lẫn giữa các loại khác nhau.
+
+**Giấy phép.** Các model nêu trên (`insightface/buffalo_l`, `facebook/sam-vit-base`, `yainage90/fashion-object-detection`, `Qwen-Image-Edit-2511` + LoRA `QIE-2511-Extract-Outfit`, SigLIP) đều chưa qua rà soát ở [2.4](#24-giấy-phép-modeldữ-liệu). Phải hoàn tất rà soát trước khi đưa vào production thương mại — riêng bộ nhận diện khuôn mặt và các model huấn luyện trên dữ liệu thời trang nghiên cứu là nhóm rủi ro cao nhất, cần kiểm tra giấy phép của **bộ trọng số**, không chỉ của mã nguồn.
+
+**Chi phí thời gian mỗi ảnh** (đo thực tế, xem phần Benchmarks của README):
+
+| Bước | Thời gian |
+|---|---|
+| D0b — một người trong ảnh | ~1.4s (GPU GTX 1660 SUPER) / ~7–9s (CPU) |
+| D0b — ảnh nhóm, có cô lập SAM | ~6.6s (GPU) / ~27s (CPU) |
+| D1 — sinh ảnh, Lightning 4 bước + fp8 | ~8–11s (RTX 4090), 17s (L4) |
+| D1 — sinh ảnh, đủ 40 bước, GGUF | 212s (L4) — không dùng cho sản xuất |
+| D1 — crop | không đáng kể, chỉ CPU |
+| D3 — phân loại 4 crop | dưới 1s sau khi model đã nạp |
+
+Tức là D1 chiếm gần như toàn bộ thời gian và là thứ quyết định số worker GPU cần có. Hai lưu ý vận hành đã đo được: `--use-sage-attention` làm ảnh ra **NaN/đen hoàn toàn** với tổ hợp checkpoint+LoRA này, không được bật; và detector của D0b chiếm VRAM suốt thời gian chạy, nên trên máy chỉ có một GPU đang phục vụ sinh ảnh thì đặt `OUTFIT_ITEMS_DEVICE=cpu` để hai bên không tranh VRAM.
 
 #### Khả năng chịu tải và mở rộng
 
@@ -237,7 +315,7 @@ Tạo một Docker network riêng dạng bridge với subnet cố định (ví d
 | Thành phần | Vai trò | IP nội bộ | Port | Expose ra ngoài? |
 |---|---|---|---|---|
 | data-server | API cho Mobile, quản lý job, ghi database | 172.28.0.10 | 8080 | Có — map ra IP public của vast.ai |
-| ai-server | Worker xử lý D1–D3, cần GPU | 172.28.0.20 | 8090 (chỉ health check nội bộ) | Không |
+| ai-server | Worker xử lý D0b–D3, cần GPU | 172.28.0.20 | 8090 (chỉ health check nội bộ) | Không |
 | postgres-db | Database chính (user, job, wardrobe) | 172.28.0.30 | 5432 | Không |
 | object-storage (MinIO) | Lưu ảnh gốc và ảnh trang phục đã tách | 172.28.0.40 | 9000 (API), 9001 (console quản trị) | Không, trừ khi tạm mở console để debug thủ công |
 | queue (Redis) | Job queue và Result queue (hai danh sách riêng trong cùng một Redis) | 172.28.0.50 | 6379 | Không |
@@ -266,14 +344,14 @@ Không có autoscale GPU thật vì chỉ có một máy; nếu muốn giả l�
 2. Cài Docker và Docker Compose trên máy nếu chưa có sẵn.
 3. Tạo Docker network riêng với subnet cố định như bảng ở [2.3.2](#232-mạng-nội-bộ-và-bảng-phân-bổ-ip).
 4. Khởi tạo lần lượt postgres-db, object-storage, queue — gán đúng IP tĩnh cho từng container, kiểm tra từng dịch vụ chạy healthy trước khi sang bước tiếp theo.
-5. Build và chạy ai-server, cấu hình trỏ tới IP của object-storage và queue theo bảng 2.3.2; xác nhận container nhận diện đúng GPU của máy.
+5. Build và chạy ai-server, cấu hình trỏ tới IP của object-storage và queue theo bảng 2.3.2; xác nhận container nhận diện đúng GPU của máy. Image của ai-server cần có sẵn: ComfyUI + các checkpoint/LoRA của D1, bộ nhận diện của D0b, và bộ trọng số phân loại của D3 (`models/magic_eye/`, lấy qua `git lfs pull` lúc build — nếu quên, file `.pt` chỉ là con trỏ LFS và bước D3 sẽ báo lỗi rõ ràng). Danh sách đầy đủ ở mục "Models required" của [README.md](README.md). Nếu chỉ có một GPU dùng chung cho D1 và D0b, đặt `OUTFIT_ITEMS_DEVICE=cpu` cho bộ nhận diện để không tranh VRAM với ComfyUI.
 6. Build và chạy data-server, cấu hình trỏ tới IP của postgres-db, object-storage, queue; map port ra IP public của vast.ai.
 7. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
 8. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
 
 ### 2.4 Giấy phép model/dữ liệu
 
-Nhiều model thời trang chất lượng cao trên các nền tảng nghiên cứu (Hugging Face, GitHub) được huấn luyện trên các bộ dữ liệu chỉ cấp phép phi thương mại (DeepFashion, DeepFashion2, ModaNet...). Trước khi đưa bất kỳ model self-host nào (dùng ở D1–D3) vào production thương mại, cần kiểm tra kỹ:
+Nhiều model thời trang chất lượng cao trên các nền tảng nghiên cứu (Hugging Face, GitHub) được huấn luyện trên các bộ dữ liệu chỉ cấp phép phi thương mại (DeepFashion, DeepFashion2, ModaNet...). Trước khi đưa bất kỳ model self-host nào (dùng ở D0b–D3) vào production thương mại, cần kiểm tra kỹ:
 
 - Giấy phép của kiến trúc/mã nguồn model.
 - Giấy phép của bộ trọng số (weights) đã huấn luyện sẵn — thường bị ràng buộc bởi giấy phép của dữ liệu huấn luyện, khác với giấy phép của code.
@@ -399,11 +477,25 @@ data-server và ai-server không gọi thẳng nhau qua HTTP — toàn bộ trao
 
 **Result queue (ai-server → data-server)**
 
+Một ảnh gốc sinh ra **nhiều** món trang phục, nên một bản tin kết quả mang một danh sách:
+
 | Trường | Kiểu | Mô tả |
 |---|---|---|
 | jobId | string | Job mà kết quả này thuộc về |
-| itemId | string | Đối chiếu với bản tin job queue tương ứng |
+| itemId | string | Đối chiếu với bản tin job queue tương ứng (là *ảnh gốc*, không phải món trang phục) |
 | result | enum | "success" / "failed" |
-| objectKey | string (nếu success) | Đường dẫn ảnh trang phục đã tách |
-| tags | danh sách (nếu success) | Kết quả phân loại từ D3 |
+| garments | danh sách (nếu success) | Mỗi phần tử là một món trang phục tách được, cấu trúc bên dưới. Có thể rỗng nếu ảnh không có trang phục nào nhận được |
 | errorReason | string (nếu failed) | Lý do lỗi, phục vụ debug/retry |
+
+Mỗi phần tử của `garments` — đúng bằng một bản ghi mà D3 sinh ra (xem [Hiện thực tham chiếu cho D0b–D3](#hiện-thực-tham-chiếu-cho-d0bd3)):
+
+| Trường | Kiểu | Mô tả |
+|---|---|---|
+| objectKey | string | Đường dẫn ảnh món trang phục trên object-storage |
+| tags | object | Kết quả phân loại từ D3: `type`, `category`, `sub_category`, `gender`, `color[]`, `neck[]`, `sleeve[]`, `pattern[]` |
+| description | string | Mô tả sinh từ các tag trên |
+| visualEmbedding | mảng 768 số thực | Đã chuẩn hóa L2. Data server lưu lại để D2 của các job sau so trùng với item này |
+| textEmbedding | mảng 768 số thực | Phục vụ tìm kiếm wardrobe |
+| duplicateOf | string hoặc null | Nếu D2 xác định trùng với một item đã có, ghi id item đó; data-server bỏ qua không tạo bản ghi mới |
+
+Vì hai trường embedding làm bản tin nặng lên đáng kể — đo trên kết quả thật: **33 KB/món** ở dạng JSON số thực, tức toàn bộ phần còn lại của bản ghi chỉ chiếm chưa tới 0.5 KB — nên với ảnh nhiều món, bản tin dễ vượt giới hạn kích thước message của một số hệ hàng đợi. Hai phương án giảm tải, chọn khi đo thấy cần: ai-server ghi embedding thành file cạnh ảnh trên object-storage và bản tin chỉ mang đường dẫn; hoặc truyền embedding ở dạng nhị phân/base64 fp16 thay vì mảng số thực JSON (~3 KB/món).
