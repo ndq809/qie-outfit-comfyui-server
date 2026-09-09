@@ -1,4 +1,10 @@
 __pycache__/
 *.pyc
 result*.png
+# ...except the one committed as a test fixture: it stands in for a
+# Qwen-Image-Edit-2511 output so the crop + classify steps can be run on a machine
+# that can't host the generation model (README "Testing without the GPU pipeline").
+!result_v4.png
 images/
+# Per-run item crops and their wardrobe_index.json (test_extract_outfit.py output).
+*_items/

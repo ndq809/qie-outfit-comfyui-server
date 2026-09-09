@@ -2,7 +2,45 @@
 
 ComfyUI server setup to run [prithivMLmods/QIE-2511-Extract-Outfit](https://huggingface.co/prithivMLmods/QIE-2511-Extract-Outfit),
 a LoRA on top of `Qwen-Image-Edit-2511` that extracts garments from a photo into a
-clean flat-lay mockup.
+clean flat-lay mockup — and the pipeline around it that turns one photo of a person
+into a set of individually classified wardrobe items.
+
+## The pipeline
+
+```
+ photo of a person
+        │
+        ▼
+ ┌──────────────────────┐  fashion-object-detection + SAM + ArcFace
+ │ 1. detect worn items │  → which categories are actually present
+ └──────────────────────┘    (hat? outerwear? dress vs top+bottom? bag? shoes?)
+        │  item list
+        ▼
+ ┌──────────────────────┐  Qwen-Image-Edit-2511 + QIE-2511-Extract-Outfit LoRA
+ │ 2. extract outfit    │  → one flat-mockup grid, each garment in its own cell
+ └──────────────────────┘    on plain white
+        │  result grid
+        ▼
+ ┌──────────────────────┐  background-difference mask + connected components
+ │ 3. crop items        │  → one square PNG per item
+ └──────────────────────┘
+        │  crops
+        ▼
+ ┌──────────────────────┐  Magic Eye phase 2 + phase 3 (models/magic_eye/)
+ │ 4. classify          │  → type, category, colour, pattern, neck, sleeve,
+ └──────────────────────┘    gender + 768-d embeddings → wardrobe_index.json
+```
+
+All four stages run from one command:
+
+```bash
+python3 test_extract_outfit.py --lightning4 --fp8 photo.jpg
+```
+
+Stage 1 exists because the LoRA guesses presence badly; stage 3 is cheap because
+stage 2's prompt *guarantees* a plain background with wide gaps; stage 4 is what
+turns a picture of a garment into a wardrobe record. Each stage is documented in
+its own section below.
 
 ## Models required
 
@@ -20,29 +58,55 @@ Place these in the corresponding `ComfyUI/models/` subfolders:
 Also required: the [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom node (only needed if using the GGUF unet variant).
 
 `test_extract_outfit.py`'s auto-prompt path additionally needs `transformers`,
-`torchvision` and `scipy` (mostly pulled in by ComfyUI's own requirements) for the
-worn-item detector, plus `insightface` + `onnxruntime` for face matching:
+`torchvision`, `scipy` and `opencv-python` (mostly pulled in by ComfyUI's own
+requirements) for the worn-item detector and the crop step, plus `insightface` +
+`onnxruntime` for face matching:
 
 ```bash
-pip install transformers torchvision scipy
+pip install transformers torchvision scipy opencv-python
 pip install insightface onnxruntime      # only needed for --selfie
 ```
 
 The detector models (`yainage90/fashion-object-detection`, `facebook/sam-vit-base`,
 `insightface/buffalo_l`) download themselves on first use into `HF_HOME` /
-`~/.insightface` — nothing to place by hand.
+`~/.insightface` — nothing to place by hand. So does
+`google/siglip-base-patch16-224`, the backbone architecture the classifier is built
+on (its weights are overwritten by `models/magic_eye/phase2.pt`).
+
+### The classifier is in this repo — clone it with Git LFS
+
+The wardrobe classifier's trained weights are committed under `models/magic_eye/`
+(203 MB), so stage 4 needs nothing placed by hand — but `phase2.pt` is 195 MB, over
+GitHub's 100 MB blob limit, so the two `.pt` files are **Git LFS** objects:
+
+```bash
+git lfs install     # once per machine
+git clone https://github.com/ndq809/qie-outfit-comfyui-server.git
+# already cloned without LFS? →
+git lfs pull
+```
+
+Without this they arrive as one-line pointer files and the classification step stops
+with a message saying so. See [`models/magic_eye/README.md`](models/magic_eye/README.md)
+for what each file is.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `test_extract_outfit.py` | Terminal client: detects the worn items, builds the prompt, runs the ComfyUI workflow. |
-| `outfit_items.py` | The worn-item detector used by the auto-prompt path. Wraps the two scripts below. |
+| `test_extract_outfit.py` | Terminal client, and the whole pipeline: detects the worn items, builds the prompt, runs the ComfyUI workflow, crops the result into items, classifies them. |
+| `outfit_items.py` | The worn-item detector used by the auto-prompt path (stage 1). Wraps the two scripts below. |
 | `item_detector_service.py` | Keeps those models warm behind `127.0.0.1:18189` so repeat runs skip the load cost. |
 | `detect_clothing_yolo.py` | Standalone garment detector (multi-scale + person-crop TTA, hue dress arbitration). |
 | `detect_clothing_by_face.py` | Standalone: picks one person out of a group photo by face, isolates them with SAM, then detects their clothes. |
+| `wardrobe_classifier.py` | Stage 4: the Magic Eye classifier. Also runnable on any folder of item images on its own. |
+| `magic_eye/` | Model definitions for that classifier (`model_phase2.py`, `model_phase3.py`, …), vendored from the MS_Model_Magic_Eye training project. |
+| `models/magic_eye/` | Its trained weights + taxonomy — the committed bundle. [Details](models/magic_eye/README.md). |
+| `scripts/export_magic_eye_bundle.py` | Regenerates that bundle from the training project after a retrain. |
+| `result_v4.png` | A saved extraction result, committed as a fixture so stages 3–4 can be exercised without the generation model. |
 
-`outfit_items.py` imports the last two, so all five files must sit in the same folder.
+`outfit_items.py` imports `detect_clothing_yolo.py` and `detect_clothing_by_face.py`,
+so those three must sit in the same folder.
 
 ## Service setup (Vast.ai / supervisor)
 
@@ -88,8 +152,18 @@ supervisorctl reread && supervisorctl update
 ```bash
 source /venv/main/bin/activate
 python3 test_extract_outfit.py --lightning4 --fp8 [--seed N] [--selfie ref.jpg] \
-    [--detect-threshold F] [--face-threshold F] <input_image> ["<custom prompt>"]
+    [--detect-threshold F] [--face-threshold F] [--crop-dir DIR] [--bundle DIR] \
+    [--no-classify] [--classify-cpu] <input_image> ["<custom prompt>"]
 ```
+
+One run produces, next to the input photo:
+
+| Output | What |
+|---|---|
+| `<input>_result.png` | the generated flat-mockup grid, downloaded from ComfyUI |
+| `<input>_items/NN_<item>.png` | one square crop per item, named after what the prompt asked for in that cell |
+| `<input>_items/wardrobe_index.json` | the classified attributes + embeddings, one record per crop |
+| `<input>_isolated.png` | the SAM-isolated subject, only for photos with more than one person |
 
 Flags:
 - `--fp8` — use the native fp8mixed checkpoint (recommended: fast, numerically stable).
@@ -107,6 +181,49 @@ Flags:
   `2026_02_18_16_30_05_IMG_0876.JPG` were missing from the item list entirely, and the
   generation duplicated the bag to fill the layout).
 - `--face-threshold F` — minimum ArcFace cosine similarity for `--selfie` (default 0.35).
+- `--crop-dir DIR` — where the item crops go (default `<input>_items/` next to the photo).
+- `--no-classify` — stop after cropping. Useful when only the crops are wanted, or to
+  avoid loading the classifier onto a GPU that ComfyUI is already filling.
+- `--classify-cpu` — run the classifier on CPU for the same reason (it is a 97M-param
+  model; the CPU pass costs a few seconds, not minutes).
+- `--bundle DIR` — classifier weights to use (default `models/magic_eye/`).
+- `--result-image PATH` — **skip generation** and run stages 3–4 on an existing grid.
+
+### Testing without the GPU pipeline
+
+Stages 3 and 4 don't need Qwen-Image-Edit-2511 — only its output. `result_v4.png` is
+committed as exactly that, so the crop + classify half of the pipeline can be
+developed and checked on any machine, including one with no ComfyUI at all:
+
+```bash
+python3 test_extract_outfit.py --result-image result_v4.png
+```
+
+```
+Cropping items out of result_v4.png ...
+  01_item_1.png: 461x461 from box (32, 145, 425, 542)
+  02_item_2.png: 412x412 from box (476, 187, 831, 492)
+  03_item_3.png: 399x399 from box (112, 666, 339, 1010)
+  04_item_4.png: 328x328 from box (544, 710, 776, 993)
+
+Classifying 4 crops with .../models/magic_eye ...
+  models loaded on cuda (gender=5  category=4  sub_category=49  type=122  color=23 ...)
+
+  01_item_1.png  (prompted as: item 1)
+    type=shirts  category=clothing/shirts  gender=men
+    color=[beige 91.1%, brown 67.7%]  neck=['spread collar']  sleeve=['short sleeve']  pattern=[]
+    description: short sleeve shirts in beige and brown. spread collar. men's clothing.
+  ... (3 more)
+```
+
+Crops get positional names (`item 1`…) on this path, because the prompt's item list
+only exists when stage 1 actually ran.
+
+The classifier is also usable on its own, against any folder of item images:
+
+```bash
+python3 wardrobe_classifier.py path/to/items -o wardrobe_index.json
+```
 
 ### Auto-detected prompt (no hardcoded items)
 
@@ -203,6 +320,87 @@ warm — see `item_detector_service.py`), so repeat runs pay only inference time
 of reloading the detectors every run. Falls back to running the detector in-process
 automatically if that service isn't running (SAM and insightface are loaded lazily,
 only when a multi-person input or `--selfie` actually needs them).
+
+### Stage 3: cropping the grid into items
+
+`crop_items()` cuts the generated mockup back into one square PNG per garment. No
+detector is involved, and deliberately so: the generation prompt already asks for a
+*"Plain white background, each item placed separately with a wide gap of clear white
+space between them, no touching, no overlapping, nothing else in the frame"* — which
+is precisely the condition that makes plain connected-component analysis exact. The
+fashion detector from stage 1 is the weaker tool here anyway, having been trained on
+garments worn by a person rather than on flat mockups.
+
+- **Background is sampled, not assumed.** The mockup background is near-white but not
+  `#ffffff` (`result_v4.png` measures `(245, 245, 244)`), so the mask is built by
+  thresholding against the median of a thin border frame. Against a hardcoded white,
+  the entire background would come back as foreground.
+- **A morphological close spans the print inside a garment**, which is otherwise not
+  one connected blob — a floral shirt is hundreds.
+- **Components are merged when the gap between them is under 3% of the short side**,
+  because one *item* is not always one blob: a pair of shoes is two, and a bag with
+  its strap coiled beside it can be two. On `result_v4.png` that threshold (~26 px)
+  sits in the middle of a wide margin — shoe-to-shoe is ~14 px, while shirt-to-shorts
+  is ~50 px and row-to-row ~124 px. The "wide gap" the prompt asks for is what keeps
+  those two scales apart.
+- **Reading order is row-major**, computed by grouping boxes into rows first and then
+  sorting each row left-to-right. A plain sort by `y` interleaves the two columns,
+  since items in one grid row are never aligned to the pixel.
+- **Crops are square, padded with the sampled background** rather than cut into the
+  garment. The classifier resizes to a fixed 224×224 without preserving aspect ratio,
+  so feeding it a tall garment box directly would squash it horizontally into
+  something its training images never contained.
+- **Crops are named after the item the prompt asked for in that cell** — but only when
+  the number found matches the number requested. If the model dropped or added a cell,
+  the names fall back to positional (`item 1`, `item 2`, …) rather than confidently
+  labelling a bag as footwear. The mismatch is printed.
+- Crops from a previous run are deleted first, since stage 4 classifies every image in
+  the folder and would otherwise report last run's leftovers as part of this outfit.
+
+### Stage 4: classifying each item
+
+`wardrobe_classifier.py` predicts the eight attributes the wardrobe index is built on
+— gender, category, sub_category, type, colour, neck, sleeve, pattern — plus the two
+768-d embeddings used for retrieval, and writes `wardrobe_index.json` into the crop
+folder. Two trained models run per crop, both in `models/magic_eye/`:
+
+| | |
+|---|---|
+| `phase2.pt` | SigLIP-base vision backbone + the 8 attribute heads. The classifier proper: image → visual embedding → attribute logits. |
+| `phase3.pt` | Text-embedding generator. Consumes phase 2's visual embedding *and* its predicted attributes to produce the text embedding wardrobe search matches against. It is a head on top of phase 2, so the two are always loaded together. |
+
+Multi-label heads (colour, neck, sleeve, pattern) use per-class thresholds tuned
+upstream rather than a flat 0.5, which over-predicts common colours and drops rare
+ones, and fall back to the top-1 class when nothing clears its threshold — so an item
+never comes back with no colour at all.
+
+On `result_v4.png`, all four items and every attribute:
+
+| crop | type | category | colour |
+|---|---|---|---|
+| 01 | shirts | clothing/shirts | beige 91.1%, brown 67.7% — short sleeve, spread collar |
+| 02 | shorts | clothing/shorts | black 99.9% |
+| 03 | shoulder bags | bags/shoulder bags | black 99.2% |
+| 04 | sandals | shoes/sandals | black 99.8% |
+
+The models come from a separate training project (**MS_Model_Magic_Eye**), which they
+are exported *out of* rather than read from — depending on it by absolute path meant
+stage 4 only ran on the one machine that had that folder. Upstream's artefacts total
+1.15 GB, so `scripts/export_magic_eye_bundle.py` reduces them to 203 MB in three ways,
+none of which change a predicted label:
+
+1. **Optimizer state dropped** — Adam keeps two extra fp32 tensors per parameter,
+   about two thirds of the 709 MB phase 2 file, and is only needed to resume training.
+2. **Weights stored fp16** — matmuls still run in fp32 (`load_state_dict` casts on
+   load); this only halves what sits on disk. Measured against the fp32 originals on
+   the `result_v4.png` crops: every label identical, colour confidences within 0.1
+   percentage points (brown 67.6% → 67.7%).
+3. **Taxonomy precomputed** — upstream rebuilds its label maps at every startup by
+   streaming a 394 MB, 257k-item anchor corpus and reading scores out of an Excel
+   workbook. The result is eight label→index maps, two hierarchy matrices and four
+   score look-ups: 40 KB of JSON. This also removes `openpyxl` and ~30s from every run.
+
+Re-run that script after a retrain; don't hand-edit the bundle.
 
 ### Running the detectors on their own
 

@@ -3,17 +3,33 @@
 
 Usage:
     python3 test_extract_outfit.py [--selfie ref.jpg] <input_image> [prompt]
+    python3 test_extract_outfit.py --result-image result_v4.png
 
 Uploads the image to ComfyUI, runs it through the Qwen-Image-Edit-2511 (GGUF Q5_K_S)
 + QIE-2511-Extract-Outfit LoRA pipeline, and saves the result next to the input.
+
+The result is a flat-mockup grid of the individual garments, which is then:
+  1. cropped into one square image per item (crop_items), and
+  2. run through the Magic Eye wardrobe classifier (classify_crops) to get each
+     item's type/category/colour/pattern attributes.
+
+Both steps work on any such grid, not only a freshly generated one: pass
+--result-image to skip generation and start from a saved result. That is the way to
+exercise them on a machine that cannot host Qwen-Image-Edit-2511 itself.
 """
 import json
+import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
 
 COMFY_URL = "http://127.0.0.1:18188"
 UNET_NAME = "qwen-image-edit-2511-Q4_K_M.gguf"
@@ -26,6 +42,11 @@ LIGHTNING_LORAS = {
     8: "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
 }
 ITEM_SERVICE_URL = "http://127.0.0.1:18189"
+# Wardrobe attribute classifier applied to each cropped item. The trained weights are
+# committed to this repo (models/magic_eye/, via Git LFS) rather than read out of the
+# separate MS_Model_Magic_Eye project they came from, so this step runs anywhere the
+# repo is cloned - see scripts/export_magic_eye_bundle.py for how they get here.
+MAGIC_EYE_BUNDLE = Path(__file__).resolve().parent / "models" / "magic_eye"
 
 # Prompt wording for each item flag detect_worn_items() returns, in the order the
 # items are laid into the grid.
@@ -137,7 +158,10 @@ def _grid_shape_desc(n):
     return f"a grid: {rows} {row_word} of 2 items side by side, then 1 final row with exactly 1 item centered"
 
 
-def build_prompt(detected):
+def prompt_items(detected):
+    """The item list the prompt asks for, in grid order (row-major). Split out of
+    build_prompt() because the crop step needs the same list to label the crops it
+    cuts out of the result: cell k of the generated grid holds items[k]."""
     items = [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
     if not items:
         # The detector localised nothing at all (bad crop, heavy occlusion, threshold
@@ -145,6 +169,11 @@ def build_prompt(detected):
         # fall back to the two garments any clothed person is wearing - this is the one
         # place presence is assumed rather than detected.
         items = ["top/shirt", "bottom (skirt/pants)"]
+    return items
+
+
+def build_prompt(detected):
+    items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))
     item_word = "item" if n == 1 else "items"
@@ -242,6 +271,200 @@ def build_workflow(image_name, prompt, seed=42, lightning_steps=None, fp8=False)
     return nodes
 
 
+def download_output(filename, dest):
+    """Pull a generated image out of ComfyUI's output folder onto local disk. The
+    crop step needs the pixels, not just the filename the /history entry reports."""
+    url = f"{COMFY_URL}/view?filename={urllib.parse.quote(filename)}&type=output"
+    with urllib.request.urlopen(url) as r:
+        data = r.read()
+    Path(dest).write_bytes(data)
+    return dest
+
+
+# --- Step 1: cut the generated grid back into individual item images -------------
+#
+# The generation prompt lays the items out on a plain white background "with a wide
+# gap of clear white space between them, no touching, no overlapping, nothing else in
+# the frame" - i.e. it *guarantees* the exact condition that makes plain connected-
+# component analysis on a background-difference mask sufficient here. No detector is
+# needed (and the fashion detector used for the input photo is trained on garments
+# worn by a person, not on flat mockups, so it is the weaker tool on this image).
+
+def _background_color(img):
+    """Median of a thin border frame. The mockup background is near-white but not
+    pure #ffffff (result_v4.png measures (245, 245, 244)), so thresholding against a
+    hardcoded white would leave a halo of "foreground" over the whole background."""
+    edge = max(2, min(img.shape[:2]) // 200)
+    border = np.concatenate([
+        img[:edge].reshape(-1, 3), img[-edge:].reshape(-1, 3),
+        img[:, :edge].reshape(-1, 3), img[:, -edge:].reshape(-1, 3),
+    ])
+    return np.median(border, axis=0)
+
+
+def _item_boxes(img, tol=18, min_area_frac=0.0005, merge_gap_frac=0.03):
+    """Bounding boxes of the laid-out items, in row-major (reading) order.
+
+    Components are merged when the gap between them is smaller than merge_gap_frac of
+    the image's short side, because a single *item* is not always a single connected
+    blob: a pair of shoes is two blobs a few pixels apart, and a bag whose strap is
+    coiled beside it can be two as well. The prompt asks for a "wide gap" between
+    different items, so the within-item gap is reliably much smaller than the
+    between-item one - 3% (~26px at 880px wide) sits between the two on result_v4.png
+    (shoe-to-shoe ~14px, shirt-to-shorts ~50px, row-to-row ~124px)."""
+    h, w = img.shape[:2]
+    bg = _background_color(img)
+    diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
+    mask = (diff > tol).astype(np.uint8)
+    # Close over the pattern/print detail inside a garment (a floral shirt is not one
+    # solid blob at pixel level), then open to drop JPEG-ish speckle in the background.
+    k = max(3, (min(h, w) // 100) | 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    boxes = [
+        (s[cv2.CC_STAT_LEFT], s[cv2.CC_STAT_TOP],
+         s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH], s[cv2.CC_STAT_TOP] + s[cv2.CC_STAT_HEIGHT])
+        for s in (stats[i].tolist() for i in range(1, n))
+        if s[cv2.CC_STAT_AREA] > min_area_frac * h * w
+    ]
+
+    gap = merge_gap_frac * min(h, w)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                a, b = boxes[i], boxes[j]
+                dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+                dy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+                if dx <= gap and dy <= gap:
+                    boxes[i] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+                    del boxes[j]
+                    merged = True
+                    break
+            if merged:
+                break
+
+    # Reading order: group into rows first (two items in the same row of the grid are
+    # never vertically aligned to the pixel, so a plain sort by y interleaves the
+    # columns), then left-to-right within each row.
+    boxes.sort(key=lambda b: b[1])
+    rows, current = [], []
+    for box in boxes:
+        if current and box[1] > min(c[3] for c in current):  # starts below every box in the row
+            rows.append(current)
+            current = []
+        current.append(box)
+    if current:
+        rows.append(current)
+    return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
+
+
+def _square_crop(img, box, pad_frac=0.08):
+    """Square crop centred on the item, padded with the background colour.
+
+    Square because the classifier resizes to a fixed 224x224 without preserving aspect
+    ratio (magic_eye's val transform is a plain Resize((224, 224))): feeding it a tall
+    garment box directly would squash the garment horizontally, which is not what its
+    training images look like. Padding with the sampled background instead of cropping
+    to a square *inside* the item keeps the whole garment in frame and matches the
+    plain studio background the model was trained on."""
+    x0, y0, x1, y1 = box
+    side = int(round(max(x1 - x0, y1 - y0) * (1 + 2 * pad_frac)))
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    left, top = int(round(cx - side / 2)), int(round(cy - side / 2))
+
+    out = np.empty((side, side, 3), dtype=img.dtype)
+    out[:] = _background_color(img).astype(img.dtype)
+    # Intersection of the square with the image, copied into the same spot of the canvas.
+    sx0, sy0 = max(0, left), max(0, top)
+    sx1, sy1 = min(img.shape[1], left + side), min(img.shape[0], top + side)
+    out[sy0 - top:sy1 - top, sx0 - left:sx1 - left] = img[sy0:sy1, sx0:sx1]
+    return Image.fromarray(out)
+
+
+def crop_items(result_path, out_dir, items=None):
+    """Crop every item out of the generated grid into its own square PNG.
+
+    items: the phrase list build_prompt() asked for, in grid order, used to name the
+    crops. Only trusted when the number of items found matches the number asked for -
+    if the model dropped or added a cell, positional names are used instead of
+    mislabelling e.g. a bag as "footwear"."""
+    img = np.array(Image.open(result_path).convert("RGB"))
+    boxes = _item_boxes(img)
+    if items and len(items) != len(boxes):
+        print(f"  note: prompt asked for {len(items)} items but {len(boxes)} were found "
+              f"in the result - falling back to positional names")
+        items = None
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Drop crops left by an earlier run: the classifier step classifies every image in
+    # this folder, so a run that finds fewer items than the last one would otherwise
+    # report the previous run's leftovers as part of this outfit.
+    for stale in out_dir.glob("[0-9][0-9]_*.png"):
+        stale.unlink()
+
+    crops = []
+    for i, box in enumerate(boxes):
+        label = items[i] if items else f"item {i + 1}"
+        slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        path = out_dir / f"{i + 1:02d}_{slug}.png"
+        crop = _square_crop(img, box)
+        crop.save(path)
+        crops.append({"label": label, "path": path, "box": box, "size": crop.size})
+    return crops
+
+
+# --- Step 2: classify each crop with the Magic Eye model -------------------------
+
+def classify_crops(crop_dir, bundle=MAGIC_EYE_BUNDLE, device=None):
+    """Run every crop through the Magic Eye wardrobe classifier and write
+    wardrobe_index.json next to them.
+
+    Two models run per crop, both in the bundle: phase2.pt is the classifier proper
+    (SigLIP backbone + the 8 attribute heads), and phase3.pt is a head on top of it
+    that turns phase 2's visual embedding and predicted attributes into the 768-d
+    text embedding wardrobe search matches against - which is why loading one without
+    the other is not a thing. See wardrobe_classifier.py."""
+    import wardrobe_classifier
+
+    records = wardrobe_classifier.classify_images(
+        Path(crop_dir), bundle_dir=Path(bundle), device=device)
+    out_json = Path(crop_dir) / "wardrobe_index.json"
+    out_json.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    return records
+
+
+def extract_and_classify(result_path, out_dir, items=None, classify=True, device=None,
+                         bundle=MAGIC_EYE_BUNDLE):
+    print(f"\nCropping items out of {result_path} ...")
+    crops = crop_items(result_path, out_dir, items=items)
+    for c in crops:
+        print(f"  {c['path'].name}: {c['size'][0]}x{c['size'][1]} from box {c['box']}")
+    if not crops:
+        print("  no items found in the result image - nothing to classify")
+        return crops, []
+    if not classify:
+        return crops, []
+
+    print(f"\nClassifying {len(crops)} crops with {bundle} ...")
+    records = classify_crops(out_dir, bundle=bundle, device=device)
+    by_name = {r["image_name"]: r for r in records}
+    for c in crops:
+        r = by_name.get(c["path"].name)
+        if not r:
+            continue
+        colors = ", ".join(f"{x['color']} {x['confidence']}%" for x in r["color"])
+        print(f"\n  {c['path'].name}  (prompted as: {c['label']})")
+        print(f"    type={r['type']}  category={r['category']}/{r['sub_category']}  gender={r['gender']}")
+        print(f"    color=[{colors}]  neck={r['neck']}  sleeve={r['sleeve']}  pattern={r['pattern']}")
+        print(f"    description: {r['original_text']}")
+    return crops, records
+
+
 def main():
     args = sys.argv[1:]
     lightning_steps = None
@@ -273,11 +496,52 @@ def main():
         i = args.index("--face-threshold")
         face_threshold = float(args[i + 1])
         del args[i:i + 2]
+    # Use an already-generated grid instead of running Qwen-Image-Edit-2511. The
+    # extraction model needs ~30GB of weights resident, so on a machine that can't
+    # host it the crop + classify steps are still testable against a saved result
+    # (e.g. --result-image result_v4.png).
+    result_image = None
+    if "--result-image" in args:
+        i = args.index("--result-image")
+        result_image = args[i + 1]
+        del args[i:i + 2]
+    crop_dir = None
+    if "--crop-dir" in args:
+        i = args.index("--crop-dir")
+        crop_dir = args[i + 1]
+        del args[i:i + 2]
+    bundle = MAGIC_EYE_BUNDLE
+    if "--bundle" in args:
+        i = args.index("--bundle")
+        bundle = Path(args[i + 1])
+        del args[i:i + 2]
+    classify = "--no-classify" not in args
+    if not classify:
+        args.remove("--no-classify")
+    classify_device = None
+    if "--classify-cpu" in args:
+        import torch
+        classify_device = torch.device("cpu")
+        args.remove("--classify-cpu")
+
+    usage = (f"Usage: {sys.argv[0]} [--lightning4|--lightning8] [--fp8] [--seed N] "
+             f"[--selfie ref.jpg] [--detect-threshold F] [--face-threshold F] "
+             f"[--crop-dir DIR] [--bundle models/magic_eye] [--no-classify] [--classify-cpu] "
+             f"<input_image> [prompt]\n"
+             f"       {sys.argv[0]} --result-image result_v4.png [--crop-dir DIR] "
+             f"[--no-classify]   (skip generation, crop+classify an existing grid)")
+
+    # Generation skipped: crop and classify the supplied grid and stop. Item names
+    # from the prompt aren't available here, so the crops get positional names.
+    if result_image:
+        out_dir = Path(crop_dir) if crop_dir else Path(result_image).with_name(
+            f"{Path(result_image).stem}_items")
+        extract_and_classify(result_image, out_dir, classify=classify,
+                             device=classify_device, bundle=bundle)
+        return
 
     if len(args) < 1:
-        print(f"Usage: {sys.argv[0]} [--lightning4|--lightning8] [--fp8] [--seed N] "
-              f"[--selfie ref.jpg] [--detect-threshold F] [--face-threshold F] "
-              f"<input_image> [prompt]")
+        print(usage)
         sys.exit(1)
     image_path = args[0]
     # Where to save the SAM-isolated subject if the photo has more than one person -
@@ -285,6 +549,7 @@ def main():
     src = Path(image_path)
     isolated_path = src.with_name(f"{src.stem}_isolated.png")
 
+    items = None
     if len(args) > 1:
         prompt = args[1]
         generation_image_path = image_path
@@ -301,6 +566,7 @@ def main():
         print(f"  detector: {scores}, persons={detected.get('persons')}"
               + (", isolated with SAM" if detected.get("isolated_by_sam") else "")
               + (f", face similarity={detected['face_similarity']}" if "face_similarity" in detected else ""))
+        items = prompt_items(detected)
         prompt = build_prompt(detected)
 
         # More than one person in the photo: the extraction model would otherwise see
@@ -361,7 +627,17 @@ def main():
         for img in out.get("images", []):
             saved.append(img["filename"])
     print(f"Done in {elapsed:.1f}s. Output image(s): {saved}")
-    print(f"Fetch with: curl -s '{COMFY_URL}/view?filename={saved[0]}&type=output' -o result.png" if saved else "No image output produced.")
+    if not saved:
+        print("No image output produced.")
+        return
+
+    result_path = src.with_name(f"{src.stem}_result.png")
+    download_output(saved[0], result_path)
+    print(f"Saved result to {result_path}")
+
+    out_dir = Path(crop_dir) if crop_dir else src.with_name(f"{src.stem}_items")
+    extract_and_classify(result_path, out_dir, items=items, classify=classify,
+                         device=classify_device, bundle=bundle)
 
 
 if __name__ == "__main__":
