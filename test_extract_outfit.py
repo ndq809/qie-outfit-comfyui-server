@@ -29,7 +29,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
+from torchvision import transforms as T
+from transformers import AutoModelForImageSegmentation
 
 COMFY_URL = "http://127.0.0.1:18188"
 UNET_NAME = "qwen-image-edit-2511-Q4_K_M.gguf"
@@ -302,35 +305,87 @@ def _background_color(img):
     return np.median(border, axis=0)
 
 
-def _item_boxes(img, tol=18, min_area_frac=0.0005, merge_gap_frac=0.03):
-    """Bounding boxes of the laid-out items, in row-major (reading) order.
+SEGMENTER_MODEL_NAME = "ZhengPeng7/BiRefNet_lite"
+_segmenter_cache = {}
 
-    Components are merged when the gap between them is smaller than merge_gap_frac of
-    the image's short side, because a single *item* is not always a single connected
-    blob: a pair of shoes is two blobs a few pixels apart, and a bag whose strap is
-    coiled beside it can be two as well. The prompt asks for a "wide gap" between
-    different items, so the within-item gap is reliably much smaller than the
-    between-item one - 3% (~26px at 880px wide) sits between the two on result_v4.png
-    (shoe-to-shoe ~14px, shirt-to-shorts ~50px, row-to-row ~124px)."""
-    h, w = img.shape[:2]
-    bg = _background_color(img)
-    diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
-    mask = (diff > tol).astype(np.uint8)
-    # Close over the pattern/print detail inside a garment (a floral shirt is not one
-    # solid blob at pixel level), then open to drop JPEG-ish speckle in the background.
-    k = max(3, (min(h, w) // 100) | 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
 
+def _load_segmenter(device):
+    """Lazy singleton, kept warm for the life of the process (the ai-server worker
+    handles many jobs per process; a fresh load per job was measured at ~1s)."""
+    key = str(device)
+    if key not in _segmenter_cache:
+        model = AutoModelForImageSegmentation.from_pretrained(
+            SEGMENTER_MODEL_NAME, trust_remote_code=True).to(device).eval()
+        transform = T.Compose([
+            T.Resize((1024, 1024)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        _segmenter_cache[key] = (model, transform)
+    return _segmenter_cache[key]
+
+
+def _reading_order(boxes):
+    """Group into rows first (two items in the same grid row are never vertically
+    aligned to the pixel, so a plain sort by y interleaves the columns), then
+    left-to-right within each row."""
+    boxes = sorted(boxes, key=lambda b: b[1])
+    rows, current = [], []
+    for b in boxes:
+        if current and b[1] > min(c[3] for c in current):  # starts below every box in the row
+            rows.append(current)
+            current = []
+        current.append(b)
+    if current:
+        rows.append(current)
+    return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
+
+
+@torch.no_grad()
+def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0.01):
+    """One box per item on the generated flat-mockup, from a class-agnostic
+    foreground segmentation.
+
+    The mockup is exactly the case this suits: plain background, items laid flat,
+    never overlapping - so "which pixels are an item" is the whole question, and
+    "which *kind* of item" is D3's job, not this step's. Two earlier approaches
+    were measured on the same 9 real generations and both lost to this one:
+
+      - background-diff + connected components: collapsed separate items into one
+        blob whenever their edges touched or shared a faint anti-aliased seam.
+      - yainage90/fashion-object-detection (the D0b detector, reused here): 5/9.
+        It has to *classify* to detect, and its confidence is badly calibrated on
+        this synthetic flat-mockup domain - visually identical sandals scored 0.96
+        on one generation and 0.04 on another - so real items kept being dropped
+        no matter where the threshold went, and per-class overrides only traded
+        one failure for another.
+
+    BiRefNet scored 9/9 on the same set at 100ms/image on GPU, and needs no score
+    threshold at all, which is what removed that whole class of tuning problem.
+
+    merge_gap_frac exists because one *item* is not always one blob: a pair of
+    shoes is two, a bag with its strap coiled beside it can be two. 1% of the
+    short side sits between the within-item gap and the between-item one; 3% (the
+    value the connected-components version used) was measured merging a shirt
+    into the shorts next to it, which sat only 11px away on one generation.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, transform = _load_segmenter(device)
+
+    pred = model(transform(image).unsqueeze(0).to(device))[-1].sigmoid().cpu()[0, 0]
+    mask = Image.fromarray((pred.numpy() * 255).astype(np.uint8)).resize(image.size)
+    mask = (np.array(mask) > 127).astype(np.uint8)
+
+    h, w = mask.shape
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     boxes = [
         (s[cv2.CC_STAT_LEFT], s[cv2.CC_STAT_TOP],
          s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH], s[cv2.CC_STAT_TOP] + s[cv2.CC_STAT_HEIGHT])
         for s in (stats[i].tolist() for i in range(1, n))
-        if s[cv2.CC_STAT_AREA] > min_area_frac * h * w
+        if s[cv2.CC_STAT_AREA] >= min_area_frac * h * w
     ]
 
-    gap = merge_gap_frac * min(h, w)
+    gap = merge_gap_frac * min(w, h)
     merged = True
     while merged:
         merged = False
@@ -347,19 +402,7 @@ def _item_boxes(img, tol=18, min_area_frac=0.0005, merge_gap_frac=0.03):
             if merged:
                 break
 
-    # Reading order: group into rows first (two items in the same row of the grid are
-    # never vertically aligned to the pixel, so a plain sort by y interleaves the
-    # columns), then left-to-right within each row.
-    boxes.sort(key=lambda b: b[1])
-    rows, current = [], []
-    for box in boxes:
-        if current and box[1] > min(c[3] for c in current):  # starts below every box in the row
-            rows.append(current)
-            current = []
-        current.append(box)
-    if current:
-        rows.append(current)
-    return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
+    return _reading_order(boxes)
 
 
 def _square_crop(img, box, pad_frac=0.08):
@@ -385,15 +428,23 @@ def _square_crop(img, box, pad_frac=0.08):
     return Image.fromarray(out)
 
 
-def crop_items(result_path, out_dir, items=None):
+def crop_items(result_path, out_dir, items=None, device=None):
     """Crop every item out of the generated grid into its own square PNG.
+
+    Each item's box comes from a class-agnostic foreground segmentation
+    (_detect_item_boxes), sized to that item alone; _square_crop then extends its
+    background out to a standard square so the classifier never sees a squashed
+    garment.
 
     items: the phrase list build_prompt() asked for, in grid order, used to name the
     crops. Only trusted when the number of items found matches the number asked for -
     if the model dropped or added a cell, positional names are used instead of
     mislabelling e.g. a bag as "footwear"."""
-    img = np.array(Image.open(result_path).convert("RGB"))
-    boxes = _item_boxes(img)
+    result_img = Image.open(result_path).convert("RGB")
+    img = np.array(result_img)
+    t = time.time()
+    boxes = _detect_item_boxes(result_img, device=device)
+    print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
     if items and len(items) != len(boxes):
         print(f"  note: prompt asked for {len(items)} items but {len(boxes)} were found "
               f"in the result - falling back to positional names")
@@ -441,7 +492,7 @@ def classify_crops(crop_dir, bundle=MAGIC_EYE_BUNDLE, device=None):
 def extract_and_classify(result_path, out_dir, items=None, classify=True, device=None,
                          bundle=MAGIC_EYE_BUNDLE):
     print(f"\nCropping items out of {result_path} ...")
-    crops = crop_items(result_path, out_dir, items=items)
+    crops = crop_items(result_path, out_dir, items=items, device=device)
     for c in crops:
         print(f"  {c['path'].name}: {c['size'][0]}x{c['size'][1]} from box {c['box']}")
     if not crops:
@@ -566,6 +617,9 @@ def main():
         print(f"  detector: {scores}, persons={detected.get('persons')}"
               + (", isolated with SAM" if detected.get("isolated_by_sam") else "")
               + (f", face similarity={detected['face_similarity']}" if "face_similarity" in detected else ""))
+        d0b_timing = detected.get("timing") or {}
+        if d0b_timing:
+            print("  [D0b model timing] " + ", ".join(f"{k}={v}s" for k, v in d0b_timing.items()))
         items = prompt_items(detected)
         prompt = build_prompt(detected)
 

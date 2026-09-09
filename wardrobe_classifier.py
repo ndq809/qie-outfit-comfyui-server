@@ -31,6 +31,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -230,9 +231,13 @@ def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
     if not images:
         return []
 
+    t = time.time()
     model_p2, model_p3, taxonomy, transform, device = load_models(bundle_dir, device)
+    load_time = time.time() - t
     if verbose:
         print(f"  models loaded on {device} ({taxonomy.summary()})")
+
+    phase2_time = phase3_time = 0.0
 
     maps = {name: invert_map(getattr(taxonomy, f"{name}_map")) for name in
             ("gender", "category", "sub_category", "type", "color", "neck", "sleeve", "pattern")}
@@ -253,9 +258,11 @@ def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
             continue
 
         pixel_values = torch.stack(pixel_batch).to(device)
+        t = time.time()
         visual_emb = F.normalize(model_p2.backbone(pixel_values=pixel_values).pooler_output,
                                  p=2, dim=-1)
         preds = model_p2.classifier(visual_emb)
+        phase2_time += time.time() - t
 
         genders = decode_single_label(preds["gender"], maps["gender"])
         categories = decode_single_label(preds["category"], maps["category"])
@@ -270,7 +277,9 @@ def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
         patterns = decode_multi_label(preds["pattern"], maps["pattern"], multi_label_threshold,
                                       per_class_thresholds=pct["pattern"])
 
+        t = time.time()
         text_emb = model_p3(visual_emb=visual_emb, **predictions_to_phase3_inputs(preds))
+        phase3_time += time.time() - t
         visual_cpu, text_cpu = visual_emb.cpu(), text_emb.cpu()
 
         for i, path in enumerate(valid):
@@ -287,6 +296,9 @@ def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
                 "visual_embedding": visual_cpu[i].tolist(),
                 "text_embedding": text_cpu[i].tolist(),
             })
+    if verbose:
+        print(f"  [D3 model timing] load={load_time:.3f}s phase2={phase2_time:.3f}s "
+              f"phase3={phase3_time:.3f}s (n={len(results)} crops)")
     return results
 
 

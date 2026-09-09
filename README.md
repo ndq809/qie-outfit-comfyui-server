@@ -21,7 +21,7 @@ into a set of individually classified wardrobe items.
  └──────────────────────┘    on plain white
         │  result grid
         ▼
- ┌──────────────────────┐  background-difference mask + connected components
+ ┌──────────────────────┐  BiRefNet_lite foreground segmentation
  │ 3. crop items        │  → one square PNG per item
  └──────────────────────┘
         │  crops
@@ -68,8 +68,9 @@ pip install insightface onnxruntime      # only needed for --selfie
 ```
 
 The detector models (`yainage90/fashion-object-detection`, `facebook/sam-vit-base`,
-`insightface/buffalo_l`) download themselves on first use into `HF_HOME` /
-`~/.insightface` — nothing to place by hand. So does
+`insightface/buffalo_s`) download themselves on first use into `HF_HOME` /
+`~/.insightface` — nothing to place by hand. So do `ZhengPeng7/BiRefNet_lite` (the
+crop step's segmentation model, loaded with `trust_remote_code`) and
 `google/siglip-base-patch16-224`, the backbone architecture the classifier is built
 on (its weights are overwritten by `models/magic_eye/phase2.pt`).
 
@@ -257,8 +258,8 @@ instead of the CLIP ViT-B/32 zero-shot classifier this used to run:
 - **SAM person isolation** — if more than one person is in the frame, the subject's
   pixel mask is cut out with `facebook/sam-vit-base` and everyone else is painted
   neutral grey before detection, so another person's clothes can't enter the item list.
-  The subject is the largest person in frame, or the ArcFace (`insightface/buffalo_l`)
-  match for `--selfie` when given.
+  The subject is the largest person in frame, or the ArcFace
+  (`insightface/buffalo_s`) match for `--selfie` when given.
 
   **The mask includes what the subject carries.** SAM prompted with a person box
   returns only the *person* — anything carried is a separate object to it, so the bag
@@ -323,26 +324,33 @@ only when a multi-person input or `--selfie` actually needs them).
 
 ### Stage 3: cropping the grid into items
 
-`crop_items()` cuts the generated mockup back into one square PNG per garment. No
-detector is involved, and deliberately so: the generation prompt already asks for a
-*"Plain white background, each item placed separately with a wide gap of clear white
-space between them, no touching, no overlapping, nothing else in the frame"* — which
-is precisely the condition that makes plain connected-component analysis exact. The
-fashion detector from stage 1 is the weaker tool here anyway, having been trained on
-garments worn by a person rather than on flat mockups.
+`crop_items()` cuts the generated mockup back into one square PNG per garment. The
+boxes come from **`ZhengPeng7/BiRefNet_lite`**, a class-agnostic foreground
+segmentation model: the mockup is a plain background with items laid flat and never
+overlapping, so "which pixels are an item" is the whole question here — "which *kind*
+of item" is stage 4's job.
 
-- **Background is sampled, not assumed.** The mockup background is near-white but not
-  `#ffffff` (`result_v4.png` measures `(245, 245, 244)`), so the mask is built by
-  thresholding against the median of a thin border frame. Against a hardcoded white,
-  the entire background would come back as foreground.
-- **A morphological close spans the print inside a garment**, which is otherwise not
-  one connected blob — a floral shirt is hundreds.
-- **Components are merged when the gap between them is under 3% of the short side**,
+Two earlier approaches were measured against this one on the same 9 real generations,
+scored on whether the number of boxes matched the number of objects actually rendered:
+
+| Approach | Score |
+|---|---|
+| background-diff + connected components | collapsed separate items into one blob whenever their edges touched or shared a faint anti-aliased seam |
+| `yainage90/fashion-object-detection` (stage 1's detector, reused here) | 5/9 |
+| **BiRefNet_lite** | **9/9**, ~100 ms/image on GPU once warm |
+
+The detector lost because it has to *classify* in order to detect, and its confidence
+is badly calibrated on this synthetic flat-mockup domain — visually identical sandals
+scored 0.96 on one generation and 0.04 on another — so real items kept being dropped
+wherever the threshold went, and per-class overrides only traded one failure for
+another. A segmentation model needs no score threshold at all, which removes that
+whole class of tuning problem.
+
+- **Blobs are merged when the gap between them is under 1% of the short side**,
   because one *item* is not always one blob: a pair of shoes is two, and a bag with
-  its strap coiled beside it can be two. On `result_v4.png` that threshold (~26 px)
-  sits in the middle of a wide margin — shoe-to-shoe is ~14 px, while shirt-to-shorts
-  is ~50 px and row-to-row ~124 px. The "wide gap" the prompt asks for is what keeps
-  those two scales apart.
+  its strap coiled beside it can be two. 1% sits between the within-item gap and the
+  between-item one; 3% (what the connected-components version used) was measured
+  merging a shirt into the shorts beside it, only 11 px away on one generation.
 - **Reading order is row-major**, computed by grouping boxes into rows first and then
   sorting each row left-to-right. A plain sort by `y` interleaves the two columns,
   since items in one grid row are never aligned to the pixel.

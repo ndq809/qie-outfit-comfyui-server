@@ -6,8 +6,8 @@ Pipeline:
 1. Detect tất cả người trong ảnh nhóm (Faster R-CNN, COCO person, có sẵn từ
    detect_clothing_yolo.py) -> nhiều box người.
 2. Detect khuôn mặt + tính embedding cho ảnh nhóm VÀ ảnh selfie tham chiếu
-   (insightface/buffalo_l - ArcFace embedding, chuẩn công nghiệp cho face
-   recognition, chạy trên CPU qua onnxruntime).
+   (insightface/buffalo_s - ArcFace embedding, chuẩn công nghiệp cho face
+   recognition, chạy qua onnxruntime - xem FACE_MODEL_PACK bên dưới).
 3. So cosine similarity giữa embedding selfie và từng khuôn mặt trong ảnh
    nhóm -> chọn khuôn mặt khớp nhất (phải vượt FACE_MATCH_THRESHOLD để
    tránh nhận nhầm).
@@ -49,6 +49,17 @@ if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 SAM_MODEL_NAME = "facebook/sam-vit-base"
+# buffalo_s (SCRFD-500MF + w600k_mbf) thay cho buffalo_l (SCRFD-10GF + w600k_r50):
+# do tren 9 anh that, mat khop dung van 0.442-0.604 va mat nguoi khac cao nhat chi
+# 0.254 - tuc la nguong 0.35 van nam giua khoang phan tach - nhung nhanh hon ~1.7x
+# (413ms -> 242ms moi anh nhom). Quan trong hon: w600k_mbf chinh la MobileFaceNet
+# mobile dung o buoc A4, nen embedding server va mobile nam cung mot khong gian -
+# w600k_r50 cua buffalo_l thi khong so sanh truc tiep duoc voi embedding mobile.
+FACE_MODEL_PACK = "buffalo_s"
+# Chi 2 module nay duoc dung (bbox tu detection, normed_embedding tu recognition).
+# Mac dinh FaceAnalysis nap ca landmark_2d_106 + landmark_3d_68 + genderage va chay
+# chung tren TUNG khuon mat: do duoc 1358ms -> 413ms moi anh nhom khi bo di.
+FACE_MODULES = ["detection", "recognition"]
 FACE_MATCH_THRESHOLD = 0.35  # cosine similarity ArcFace - duoi nguong nay coi la khong khop
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # mask SAM phải phủ tối thiểu bao nhiêu % diện tích box người mới được coi
@@ -59,7 +70,7 @@ MASK_BG_COLOR = (128, 128, 128)  # mau nen trung tinh thay cho nguoi khac/backgr
 
 def load_face_app():
     from insightface.app import FaceAnalysis
-    app = FaceAnalysis(name="buffalo_l")
+    app = FaceAnalysis(name=FACE_MODEL_PACK, allowed_modules=FACE_MODULES)
     app.prepare(ctx_id=0, det_size=(640, 640))
     return app
 
@@ -78,14 +89,26 @@ def get_all_person_boxes(person_model, person_pre, image: Image.Image):
     return out["boxes"][mask].tolist()
 
 
+_ref_embedding_cache = {}
+
+
 def find_reference_embedding(face_app, selfie_path: Path):
+    # Anh tham chieu cua mot account khong doi, nhung outfit_items.detect_worn_items()
+    # goi ham nay lai cho TUNG anh xu ly - do duoc 216-391ms moi lan cho cung mot
+    # file. Cache theo (duong dan, mtime, size) nen thay anh selfie van sinh lai.
+    stat = Path(selfie_path).stat()
+    key = (str(selfie_path), stat.st_mtime_ns, stat.st_size)
+    if key in _ref_embedding_cache:
+        return _ref_embedding_cache[key]
+
     img = np.array(Image.open(selfie_path).convert("RGB"))[:, :, ::-1]  # RGB -> BGR cho insightface
     faces = face_app.get(img)
     if not faces:
         raise ValueError(f"Không phát hiện khuôn mặt nào trong ảnh selfie: {selfie_path}")
     # nếu selfie có nhiều mặt (hiếm), lấy mặt lớn nhất (chủ thể chính)
     faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
-    return faces[0].normed_embedding
+    _ref_embedding_cache[key] = faces[0].normed_embedding
+    return _ref_embedding_cache[key]
 
 
 def match_face_in_group(face_app, group_image: Image.Image, ref_embedding):
@@ -193,7 +216,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    print("Đang tải face recognition (insightface/buffalo_l) ...")
+    print(f"Đang tải face recognition (insightface/{FACE_MODEL_PACK}) ...")
     face_app = load_face_app()
     ref_embedding = find_reference_embedding(face_app, args.selfie)
     print(f"Đã lấy embedding từ selfie: {args.selfie.name}")

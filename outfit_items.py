@@ -47,6 +47,7 @@ them warm across requests (see that file).
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -211,13 +212,25 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
 
     cloth_model, procs_full, procs_crop, person_model, person_pre = load_clothing_models()
     image = Image.open(image_path).convert("RGB")
+    timing = {}
+
+    t = time.time()
     person_boxes = byface.get_all_person_boxes(person_model, person_pre, image)
+    timing["person_detect"] = time.time() - t
 
     target_box, face_similarity = None, None
     if selfie_path:
+        t = time.time()
         face_app = _load_face_app()
+        timing["face_load"] = time.time() - t
+        t = time.time()
+        # Cached per selfie file inside find_reference_embedding, so this is only
+        # paid once per worker process rather than once per image.
         ref_embedding = byface.find_reference_embedding(face_app, Path(selfie_path))
+        timing["face_ref_embed"] = time.time() - t
+        t = time.time()
         face, face_similarity = byface.match_face_in_group(face_app, image, ref_embedding)
+        timing["face_match_group"] = time.time() - t
         if face is None or face_similarity < face_match_threshold:
             raise ValueError(
                 f"No face in {image_path} matches the selfie "
@@ -234,37 +247,48 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         # Same reasoning as detect_clothing_by_face.py: with a single person there
         # is nobody to filter out, and painting the background grey measurably
         # shifts the detector's scores, so SAM only runs when it can actually help.
+        t = time.time()
         sam_model, sam_processor = _load_sam()
+        timing["sam_load"] = time.time() - t
         # First pass on the ORIGINAL image, only to locate the subject's items so
         # the isolation mask can keep them - see _subject_mask(). Detection proper
         # still runs on the isolated image below, because a clean grey background
         # scores better than a crowded one.
+        t = time.time()
         pre = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
             Path(image_path), DEVICE, threshold, resolve_dress=True,
         )
+        timing["fashion_detect_locate"] = time.time() - t
+        t = time.time()
         mask = _subject_mask(sam_model, sam_processor, image, target_box,
                              [d["box"] for d in pre])
+        timing["sam_segment"] = time.time() - t
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
             isolated.save(save_isolated_to)
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir) / "isolated.png"
             isolated.save(tmp_path)
+            t = time.time()
             detections = clothing.predict_image(
                 cloth_model, procs_full, procs_crop, person_model, person_pre,
                 tmp_path, DEVICE, threshold, resolve_dress=True,
             )
+            timing["fashion_detect_final"] = time.time() - t
     else:
+        t = time.time()
         detections = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
             Path(image_path), DEVICE, threshold, resolve_dress=True,
         )
+        timing["fashion_detect_final"] = time.time() - t
 
     result = _flags_from_detections(detections)
     result["persons"] = len(person_boxes)
     result["isolated_by_sam"] = isolated_by_sam
     result["device"] = DEVICE
+    result["timing"] = {k: round(v, 3) for k, v in timing.items()}
     if face_similarity is not None:
         result["face_similarity"] = round(float(face_similarity), 4)
     return result
