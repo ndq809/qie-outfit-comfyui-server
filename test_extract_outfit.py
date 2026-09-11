@@ -347,8 +347,11 @@ def _reading_order(boxes):
 
 @torch.no_grad()
 def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0.01):
-    """One box per item on the generated flat-mockup, from a class-agnostic
-    foreground segmentation.
+    """One item per entry on the generated flat-mockup, from a class-agnostic
+    foreground segmentation. Returns (alpha, labels, groups) where `alpha` is the
+    soft foreground matte, `labels` the connected-component map, and `groups` a
+    list of {"box", "components"} in reading order — the component ids are what
+    lets the crop step keep one item's pixels and drop its neighbour's.
 
     The mockup is exactly the case this suits: plain background, items laid flat,
     never overlapping - so "which pixels are an item" is the whole question, and
@@ -377,68 +380,158 @@ def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0
     model, transform = _load_segmenter(device)
 
     pred = model(transform(image).unsqueeze(0).to(device))[-1].sigmoid().cpu()[0, 0]
-    mask = Image.fromarray((pred.numpy() * 255).astype(np.uint8)).resize(image.size)
-    mask = (np.array(mask) > 127).astype(np.uint8)
+    # Kept as a soft matte, not thresholded away: the hard mask is only for finding
+    # components, while the crop step alpha-blends with these fractional edge values
+    # so isolated items keep the anti-aliased outline the generator drew instead of a
+    # stair-stepped one. BILINEAR for the same reason - NEAREST would quantise it back.
+    alpha = np.asarray(
+        Image.fromarray((pred.numpy() * 255).astype(np.uint8)).resize(image.size, Image.BILINEAR),
+        dtype=np.float32) / 255.0
 
-    h, w = mask.shape
-    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    boxes = [
-        (s[cv2.CC_STAT_LEFT], s[cv2.CC_STAT_TOP],
-         s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH], s[cv2.CC_STAT_TOP] + s[cv2.CC_STAT_HEIGHT])
-        for s in (stats[i].tolist() for i in range(1, n))
-        if s[cv2.CC_STAT_AREA] >= min_area_frac * h * w
-    ]
+    h, w = alpha.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((alpha > 0.5).astype(np.uint8), 8)
+    boxed = {
+        i: (st[cv2.CC_STAT_LEFT], st[cv2.CC_STAT_TOP],
+            st[cv2.CC_STAT_LEFT] + st[cv2.CC_STAT_WIDTH],
+            st[cv2.CC_STAT_TOP] + st[cv2.CC_STAT_HEIGHT])
+        for i, st in ((i, stats[i].tolist()) for i in range(1, n))
+    }
+    big = [i for i in boxed if stats[i][cv2.CC_STAT_AREA] >= min_area_frac * h * w]
+    groups = [{"box": boxed[i], "components": [i]} for i in big]
 
     gap = merge_gap_frac * min(w, h)
     merged = True
     while merged:
         merged = False
-        for i in range(len(boxes)):
-            for j in range(i + 1, len(boxes)):
-                a, b = boxes[i], boxes[j]
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                a, b = groups[i]["box"], groups[j]["box"]
                 dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
                 dy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
-                if dx <= gap and dy <= gap:
-                    boxes[i] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
-                    del boxes[j]
+                if (dx <= gap and dy <= gap) or _looks_like_one_pair(a, b, gap):
+                    groups[i] = {
+                        "box": (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])),
+                        "components": groups[i]["components"] + groups[j]["components"],
+                    }
+                    del groups[j]
                     merged = True
                     break
             if merged:
                 break
 
-    return _reading_order(boxes)
+    # Components too small to be an item of their own are not noise to be thrown away:
+    # a detached strap, buckle or drawstring tip is a real part of the garment it sits
+    # on, and the previous rectangular copy always included them for free. Anything not
+    # already claimed gets attached to the item whose box contains at least 80% of it,
+    # so those parts survive the matte. 80% is the same containment rule D0b uses to
+    # decide a carried item belongs to the subject.
+    claimed = {c for g in groups for c in g["components"]}
+    for cid, cbox in boxed.items():
+        if cid in claimed:
+            continue
+        host = max(groups, key=lambda g: _containment(cbox, g["box"]), default=None)
+        if host is not None and _containment(cbox, host["box"]) >= 0.8:
+            host["components"].append(cid)
+
+    by_box = {g["box"]: g for g in groups}
+    return alpha, labels, [by_box[b] for b in _reading_order([g["box"] for g in groups])]
 
 
-def _square_crop(img, box, pad_frac=0.08):
-    """Square crop centred on the item, padded with the background colour.
+def _containment(inner, outer):
+    """Fraction of `inner`'s area that lies inside `outer`."""
+    ix0 = max(inner[0], outer[0]); iy0 = max(inner[1], outer[1])
+    ix1 = min(inner[2], outer[2]); iy1 = min(inner[3], outer[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return ((ix1 - ix0) * (iy1 - iy0)) / area if area else 0.0
+
+
+def _looks_like_one_pair(a, b, gap):
+    """Second merge rule, for the case a pure distance threshold provably cannot
+    settle: a pair of shoes is two components, and on a measured generation the two
+    sandals sat 11px apart - while on another generation a shirt sat 11px from the
+    shorts beside it. Same gap, opposite correct answers, so distance alone is not a
+    discriminator no matter where the threshold goes.
+
+    What does separate them is that a *pair* is two near-identical mirrored objects
+    side by side: same height band, same size. A shirt and a pair of shorts differ
+    markedly in both. So this merges only when the two components sit on the same
+    row, overlap vertically almost completely, and match closely in width and
+    height - and even then only within a few multiples of the base gap, so items on
+    opposite sides of the grid are never joined."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    dx = max(0, max(ax0, bx0) - min(ax1, bx1))
+    dy = max(0, max(ay0, by0) - min(ay1, by1))
+    if dy > 0 or dx > gap * 4:
+        return False  # not side by side, or too far apart to be one object
+
+    aw, ah = ax1 - ax0, ay1 - ay0
+    bw, bh = bx1 - bx0, by1 - by0
+    overlap = min(ay1, by1) - max(ay0, by0)
+    if overlap < 0.8 * min(ah, bh):
+        return False  # not sharing a height band
+
+    return (min(aw, bw) / max(aw, bw) >= 0.7) and (min(ah, bh) / max(ah, bh) >= 0.7)
+
+
+def _square_crop(img, box, alpha, labels, components, pad_frac=0.08):
+    """One item, matted off the grid and re-composited onto a clean background.
+
+    The obvious implementation - copy the square region of the grid straight out -
+    is wrong here, and measurably so. An item's box is sized to the item, but the
+    square that contains it is wider than the item whenever the garment is tall, so
+    the copied region reaches into the neighbouring cell and brings that item's
+    pixels with it. Measured on `result_v4.png`: the two sandals, 11px apart, each
+    produced a crop containing *both* sandals, so one pair of shoes became two
+    near-identical wardrobe items; a shirt crop carried a black slice of the
+    trousers beside it. D3 then classifies, and D2 fingerprints, whatever bled in.
+
+    So the item is cut out by its own segmentation instead: `components` names the
+    connected components belonging to *this* item, and every pixel outside them -
+    including a neighbour standing inside the same square - is replaced by fresh
+    background. Compositing (rather than a hard stencil) keeps BiRefNet's fractional
+    edge values, so the garment keeps a soft outline rather than a jagged one.
+
+    The background is regenerated from the grid's own sampled colour, so the result
+    still looks like the plain studio backdrop D3 was trained on - the point is to
+    rebuild it cleanly behind one garment, not to switch to transparency, which the
+    classifier would flatten to black.
 
     Square because the classifier resizes to a fixed 224x224 without preserving aspect
     ratio (magic_eye's val transform is a plain Resize((224, 224))): feeding it a tall
     garment box directly would squash the garment horizontally, which is not what its
     training images look like. Padding with the sampled background instead of cropping
-    to a square *inside* the item keeps the whole garment in frame and matches the
-    plain studio background the model was trained on."""
+    to a square *inside* the item keeps the whole garment in frame."""
+    bg = _background_color(img).astype(np.float32)
+
+    # Matte for this item alone: soft foreground alpha, zeroed everywhere that belongs
+    # to a different component (neighbours) or to the background.
+    item_alpha = np.where(np.isin(labels, components), alpha, 0.0).astype(np.float32)
+    isolated = img.astype(np.float32) * item_alpha[..., None] + bg * (1.0 - item_alpha[..., None])
+
     x0, y0, x1, y1 = box
     side = int(round(max(x1 - x0, y1 - y0) * (1 + 2 * pad_frac)))
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     left, top = int(round(cx - side / 2)), int(round(cy - side / 2))
 
-    out = np.empty((side, side, 3), dtype=img.dtype)
-    out[:] = _background_color(img).astype(img.dtype)
+    out = np.empty((side, side, 3), dtype=np.float32)
+    out[:] = bg
     # Intersection of the square with the image, copied into the same spot of the canvas.
     sx0, sy0 = max(0, left), max(0, top)
     sx1, sy1 = min(img.shape[1], left + side), min(img.shape[0], top + side)
-    out[sy0 - top:sy1 - top, sx0 - left:sx1 - left] = img[sy0:sy1, sx0:sx1]
-    return Image.fromarray(out)
+    out[sy0 - top:sy1 - top, sx0 - left:sx1 - left] = isolated[sy0:sy1, sx0:sx1]
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
 def crop_items(result_path, out_dir, items=None, device=None):
     """Crop every item out of the generated grid into its own square PNG.
 
-    Each item's box comes from a class-agnostic foreground segmentation
-    (_detect_item_boxes), sized to that item alone; _square_crop then extends its
-    background out to a standard square so the classifier never sees a squashed
-    garment.
+    Each item's box and segmentation come from a class-agnostic foreground pass
+    (_detect_item_boxes); _square_crop then mattes that item off the grid, drops any
+    neighbour standing inside the same square, rebuilds the background behind it, and
+    extends out to a standard square so the classifier never sees a squashed garment.
 
     items: the phrase list build_prompt() asked for, in grid order, used to name the
     crops. Only trusted when the number of items found matches the number asked for -
@@ -447,10 +540,10 @@ def crop_items(result_path, out_dir, items=None, device=None):
     result_img = Image.open(result_path).convert("RGB")
     img = np.array(result_img)
     t = time.time()
-    boxes = _detect_item_boxes(result_img, device=device)
+    alpha, labels, groups = _detect_item_boxes(result_img, device=device)
     print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
-    if items and len(items) != len(boxes):
-        print(f"  note: prompt asked for {len(items)} items but {len(boxes)} were found "
+    if items and len(items) != len(groups):
+        print(f"  note: prompt asked for {len(items)} items but {len(groups)} were found "
               f"in the result - falling back to positional names")
         items = None
 
@@ -463,11 +556,12 @@ def crop_items(result_path, out_dir, items=None, device=None):
         stale.unlink()
 
     crops = []
-    for i, box in enumerate(boxes):
+    for i, group in enumerate(groups):
+        box = group["box"]
         label = items[i] if items else f"item {i + 1}"
         slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
         path = out_dir / f"{i + 1:02d}_{slug}.png"
-        crop = _square_crop(img, box)
+        crop = _square_crop(img, box, alpha, labels, group["components"])
         crop.save(path)
         crops.append({"label": label, "path": path, "box": box, "size": crop.size})
     return crops

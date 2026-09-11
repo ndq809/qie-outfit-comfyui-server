@@ -349,11 +349,13 @@ only when a multi-person input or `--selfie` actually needs them).
 
 ### Stage 3: cropping the grid into items
 
-`crop_items()` cuts the generated mockup back into one square PNG per garment. The
-boxes come from **`ZhengPeng7/BiRefNet_lite`**, a class-agnostic foreground
-segmentation model: the mockup is a plain background with items laid flat and never
-overlapping, so "which pixels are an item" is the whole question here — "which *kind*
-of item" is stage 4's job.
+`crop_items()` cuts the generated mockup back into one square PNG per garment — each
+one matted off the grid by its own segmentation and re-composited onto a clean
+background, so a neighbouring garment standing inside the same square is removed
+rather than carried along. The masks come from **`ZhengPeng7/BiRefNet_lite`**, a
+class-agnostic foreground segmentation model: the mockup is a plain background with
+items laid flat and never overlapping, so "which pixels are an item" is the whole
+question here — "which *kind* of item" is stage 4's job.
 
 Two earlier approaches were measured against this one on the same 9 real generations,
 scored on whether the number of boxes matched the number of objects actually rendered:
@@ -371,11 +373,31 @@ wherever the threshold went, and per-class overrides only traded one failure for
 another. A segmentation model needs no score threshold at all, which removes that
 whole class of tuning problem.
 
+- **Each item is matted out by its own segmentation and re-composited onto a freshly
+  rebuilt background**, rather than copied out as a rectangle. An item's box is sized
+  to the item, but the square containing it is wider than the item whenever the
+  garment is tall, so a plain copy reaches into the next cell and brings that item's
+  pixels with it. Measured: a pair of trousers had **8,337 px of the shirt beside it**
+  inside its square, and on `result_v4.png` two sandals 11 px apart each produced a
+  crop containing *both*, turning one pair of shoes into two near-identical wardrobe
+  items. Stage 4 then tags, and D2 fingerprints, whatever bled in.
+- **The matte is soft, not a hard stencil.** BiRefNet's probabilities are kept as a
+  continuous alpha and alpha-blended, so the garment keeps the anti-aliased outline
+  the generator drew. The background is rebuilt from the grid's own sampled colour —
+  not transparency, which the classifier would flatten to black.
 - **Blobs are merged when the gap between them is under 1% of the short side**,
   because one *item* is not always one blob: a pair of shoes is two, and a bag with
-  its strap coiled beside it can be two. 1% sits between the within-item gap and the
-  between-item one; 3% (what the connected-components version used) was measured
-  merging a shirt into the shorts beside it, only 11 px away on one generation.
+  its strap coiled beside it can be two. Distance alone cannot settle it, though: two
+  sandals measured 11 px apart (merge) while on another generation a shirt sat 11 px
+  from the shorts beside it (do not merge). So a second rule handles that case — merge
+  only when the two blobs share a row, overlap vertically almost completely, and match
+  within 30% in both width and height, i.e. look like the two mirrored halves of a
+  pair rather than two different garments.
+- **Blobs too small to be an item of their own are attached, not discarded.** A
+  detached strap, buckle or drawstring tip is a real part of the garment it sits on,
+  and the old rectangular copy included them for free. Anything unclaimed is attached
+  to the item whose box contains at least 80% of it — the same containment rule stage
+  1 uses to decide a carried item belongs to the subject.
 - **Reading order is row-major**, computed by grouping boxes into rows first and then
   sorting each row left-to-right. A plain sort by `y` interleaves the two columns,
   since items in one grid row are never aligned to the pixel.
