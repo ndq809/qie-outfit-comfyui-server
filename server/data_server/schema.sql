@@ -85,3 +85,10 @@ CREATE TABLE IF NOT EXISTS wardrobe_items (
 );
 CREATE INDEX IF NOT EXISTS idx_wardrobe_items_account_id ON wardrobe_items(account_id, id);
 CREATE INDEX IF NOT EXISTS idx_wardrobe_items_job_id ON wardrobe_items(job_id);
+
+-- D0b face reference (wardrobe-system-spec.md §2.1, step D0b): the account's
+-- registered selfie, used by ai-server to pick the right person out of a group
+-- photo before isolating them with SAM. Stored as an object key in the raw
+-- bucket; the key rides along in the job-queue ticket so ai-server can fetch it
+-- without ever being given postgres's address (§2.3.3).
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS face_ref_key TEXT;

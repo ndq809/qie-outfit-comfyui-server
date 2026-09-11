@@ -5,6 +5,7 @@ consumes ai-server's results into the database.
 """
 import logging
 import threading
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -21,12 +22,46 @@ log = logging.getLogger("data-server")
 app = FastAPI(title="Wardrobe data-server (test)")
 
 
+# Object key of the test-deployment fixed reference face, or None when not configured.
+# Populated once at startup so create_job doesn't re-check the filesystem per request.
+_fixed_face_ref_key: Optional[str] = None
+
+
 @app.on_event("startup")
 def _startup():
     storage.ensure_buckets()
+    _load_fixed_face_ref()
     t = threading.Thread(target=run_result_consumer, daemon=True)
     t.start()
     log.info("result_consumer thread started")
+
+
+def _load_fixed_face_ref():
+    """TEST DEPLOYMENT ONLY (wardrobe-system-spec.md §2.3.7). Uploads the configured
+    reference selfie into object-storage once at boot and remembers its key, so every
+    job gets a working D0b face reference without the client ever calling
+    /v1/face-reference. Uploaded rather than read from disk at job time because
+    ai-server fetches it from object-storage and may not share this filesystem.
+
+    A missing or unreadable file is logged and ignored, not fatal: the system still
+    works without it, D0b just falls back to "largest person in frame"."""
+    global _fixed_face_ref_key
+    configured = get_settings().test_fixed_face_ref_image
+    if not configured:
+        return
+    path = Path(configured)
+    if not path.is_file():
+        log.warning("TEST_FIXED_FACE_REF_IMAGE=%s does not exist — jobs will fall back "
+                    "to largest-person-in-frame for group photos", configured)
+        return
+    try:
+        storage.upload_file(get_settings().minio_raw_bucket, storage.FIXED_FACE_REF_KEY,
+                            path, content_type="image/jpeg")
+    except Exception:
+        log.exception("could not upload fixed face reference %s", configured)
+        return
+    _fixed_face_ref_key = storage.FIXED_FACE_REF_KEY
+    log.info("fixed D0b face reference active: %s -> %s", configured, _fixed_face_ref_key)
 
 
 # --- auth -------------------------------------------------------------------
@@ -59,6 +94,14 @@ class CreateJobRequest(BaseModel):
     uploadedItems: list[str]
 
 
+class FaceRefPresignRequest(BaseModel):
+    contentType: str
+
+
+class FaceRefCommitRequest(BaseModel):
+    objectKey: str
+
+
 # --- routes -------------------------------------------------------------------
 
 @app.post("/v1/uploads/presign")
@@ -79,6 +122,54 @@ def presign(req: PresignRequest, identity=Depends(current_account)):
     return {"batchId": batch_id, "items": out_items}
 
 
+@app.post("/v1/face-reference/presign")
+def face_reference_presign(req: FaceRefPresignRequest, identity=Depends(current_account)):
+    """D0b needs a reference face to tell the account owner apart from everyone
+    else in a group photo (wardrobe-system-spec.md §2.1). Same
+    upload-straight-to-object-storage shape as /v1/uploads/presign so Mobile
+    reuses the code path it already has."""
+    settings = get_settings()
+    key = storage.face_ref_object_key(identity["account_id"], req.contentType)
+    url = storage.presign_put(settings.minio_raw_bucket, key, req.contentType,
+                              settings.presign_expires_seconds)
+    return {
+        "objectKey": key,
+        "uploadUrl": url,
+        "expiresAt": _expires_at(settings.presign_expires_seconds),
+    }
+
+
+@app.put("/v1/face-reference")
+def face_reference_commit(req: FaceRefCommitRequest, identity=Depends(current_account)):
+    """Called after the PUT to uploadUrl succeeds. Verifies the object is really
+    there before recording it — otherwise a failed upload would leave every later
+    job pointing at a key ai-server can't fetch."""
+    settings = get_settings()
+    expected_prefix = f"face/{identity['account_id']}/"
+    if not req.objectKey.startswith(expected_prefix):
+        raise HTTPException(status_code=403, detail="objectKey does not belong to this account")
+    try:
+        storage.s3_client().head_object(Bucket=settings.minio_raw_bucket, Key=req.objectKey)
+    except Exception:
+        raise HTTPException(status_code=400, detail="no object uploaded at that objectKey")
+    db.set_account_face_ref(identity["account_id"], req.objectKey)
+    return {"objectKey": req.objectKey, "status": "registered"}
+
+
+@app.get("/v1/face-reference")
+def face_reference_get(identity=Depends(current_account)):
+    """`source` says which reference D0b will actually use: "account" for one this
+    account registered, "test-fixture" for the fixed image the test deployment
+    supplies (§2.3.7), null when there is none and D0b falls back to the largest
+    person in frame."""
+    key = db.get_account_face_ref(identity["account_id"])
+    if key:
+        return {"registered": True, "objectKey": key, "source": "account"}
+    if _fixed_face_ref_key:
+        return {"registered": True, "objectKey": _fixed_face_ref_key, "source": "test-fixture"}
+    return {"registered": False, "objectKey": None, "source": None}
+
+
 @app.post("/v1/jobs")
 def create_job(req: CreateJobRequest, identity=Depends(current_account)):
     rows = db.get_batch_items(req.batchId, req.uploadedItems)
@@ -87,8 +178,11 @@ def create_job(req: CreateJobRequest, identity=Depends(current_account)):
     items = [{"local_id": r["local_id"], "object_key": r["object_key"]} for r in rows]
     job = db.create_job(identity["account_id"], identity["user_id"], req.batchId, items)
     db.mark_job_processing_if_pending(job["jobId"])
+    # An account that registered its own face wins; the fixed test fixture is only a
+    # fallback, so production behaviour is unchanged when it isn't configured.
+    face_ref_key = db.get_account_face_ref(identity["account_id"]) or _fixed_face_ref_key
     for it in items:
-        queue.push_job(job["jobId"], it["local_id"], it["object_key"])
+        queue.push_job(job["jobId"], it["local_id"], it["object_key"], face_ref_key=face_ref_key)
     return job
 
 

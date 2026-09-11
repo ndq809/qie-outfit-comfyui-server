@@ -26,10 +26,15 @@ def redis_client() -> redis.Redis:
     return _client
 
 
-def push_job(job_id: str, item_id: str, object_key: str, retry_count: int = 0):
+def push_job(job_id: str, item_id: str, object_key: str, retry_count: int = 0,
+             face_ref_key: str | None = None):
+    """faceRefKey extends the §3.3 job-queue message: D0b has to know which face
+    in a group photo belongs to the account owner, and ai-server can't look that
+    up itself (no postgres access, §2.3.3). Optional — absent means "no reference
+    registered", and D0b falls back to the largest person in frame."""
     redis_client().lpush(JOB_QUEUE, json.dumps({
         "jobId": job_id, "itemId": item_id, "objectKey": object_key,
-        "retryCount": retry_count,
+        "retryCount": retry_count, "faceRefKey": face_ref_key,
     }))
 
 

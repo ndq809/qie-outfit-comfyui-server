@@ -21,6 +21,18 @@ class Settings(BaseSettings):
 
     # object-storage (MinIO, S3-compatible)
     minio_endpoint: str = "127.0.0.1:9000"
+    # Mobile must PUT straight to object-storage (§1.2 D0), so presigned URLs have
+    # to carry a host the phone can reach — but sigv4 signs the Host header, and the
+    # reverse proxy in front rewrites Host to its upstream value. So the two are
+    # configured separately:
+    #   minio_presign_endpoint — host:port the signature is computed against; must
+    #       equal what object-storage actually receives in the Host header (i.e. the
+    #       proxy's upstream address). Defaults to minio_endpoint.
+    #   minio_public_url — origin substituted into the returned URL for the client.
+    #       Empty means "hand back the signing endpoint unchanged" (direct access,
+    #       no proxy), which is the production shape.
+    minio_presign_endpoint: str = ""
+    minio_public_url: str = ""
     minio_access_key: str = ""
     minio_secret_key: str = ""
     minio_raw_bucket: str = "wardrobe-raw"
@@ -44,6 +56,13 @@ class Settings(BaseSettings):
     wardrobe_dedup_threshold: float = 0.90
     max_job_retries: int = 3
 
+    # TEST DEPLOYMENT ONLY (wardrobe-system-spec.md §2.3.7). Path to an image on the
+    # data-server box used as the D0b reference face for every account that has not
+    # registered one of its own. Lets the test client skip the /v1/face-reference
+    # upload entirely and start at POST /v1/uploads/presign. Leave EMPTY in
+    # production: there the reference face is per-user and must come from the user.
+    test_fixed_face_ref_image: str = ""
+
     presign_expires_seconds: int = 900
     read_url_expires_seconds: int = 3600
 
@@ -58,6 +77,14 @@ class Settings(BaseSettings):
     @property
     def minio_url(self) -> str:
         return f"http://{self.minio_endpoint}"
+
+    @property
+    def minio_signing_url(self) -> str:
+        return f"http://{self.minio_presign_endpoint or self.minio_endpoint}"
+
+    @property
+    def minio_client_url(self) -> str:
+        return self.minio_public_url or self.minio_signing_url
 
     @property
     def redis_kwargs(self) -> dict:

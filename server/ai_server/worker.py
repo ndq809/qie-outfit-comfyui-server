@@ -43,6 +43,7 @@ def run_worker_loop(stop_event=None):
 def _handle_ticket(ticket: dict):
     job_id, item_id, object_key = ticket["jobId"], ticket["itemId"], ticket["objectKey"]
     retry_count = ticket.get("retryCount", 0)
+    face_ref_key = ticket.get("faceRefKey")
 
     if queue.is_cancelled(job_id):
         log.info("job %s cancelled, skipping ticket %s", job_id, item_id)
@@ -53,26 +54,42 @@ def _handle_ticket(ticket: dict):
     with tempfile.TemporaryDirectory(prefix="wardrobe_") as tmp:
         tmp_dir = Path(tmp)
         try:
-            garments = _process_image(job_id, item_id, object_key, tmp_dir, settings)
+            garments = _process_image(job_id, item_id, object_key, tmp_dir, settings,
+                                      face_ref_key=face_ref_key)
             queue.push_result(job_id, item_id, "success", garments=garments)
             log.info("job %s item %s done: %d garment(s)", job_id, item_id, len(garments))
         except Exception as exc:
             log.exception("processing failed for job %s item %s", job_id, item_id)
             if retry_count < settings.max_job_retries:
                 log.info("requeueing job %s item %s (retry %d)", job_id, item_id, retry_count + 1)
-                queue.push_job(job_id, item_id, object_key, retry_count=retry_count + 1)
+                queue.push_job(job_id, item_id, object_key, retry_count=retry_count + 1,
+                               face_ref_key=face_ref_key)
             else:
                 queue.push_dead(ticket)
                 queue.push_result(job_id, item_id, "failed", error_reason=str(exc)[:500])
 
 
-def _process_image(job_id: str, item_id: str, object_key: str, tmp_dir: Path, settings) -> list[dict]:
+def _process_image(job_id: str, item_id: str, object_key: str, tmp_dir: Path, settings,
+                   face_ref_key: str | None = None) -> list[dict]:
     ext = Path(object_key).suffix or ".jpg"
     raw_path = tmp_dir / f"input{ext}"
     storage.download_to(settings.minio_raw_bucket, object_key, raw_path)
 
+    # D0b: with a registered reference face, the subject is picked by ArcFace
+    # similarity instead of "largest person in frame" — the difference that makes
+    # group photos usable at all (wardrobe-system-spec.md §2.1, D0b).
+    selfie_path = None
+    if face_ref_key:
+        try:
+            selfie_path = str(storage.download_to(
+                settings.minio_raw_bucket, face_ref_key, tmp_dir / f"faceref{Path(face_ref_key).suffix or '.jpg'}"))
+        except Exception:
+            log.warning("face reference %s could not be fetched; falling back to largest person",
+                        face_ref_key)
+
     isolated_path = tmp_dir / "isolated.png"
-    detected = pipeline.detect_worn_items(str(raw_path), save_isolated_to=str(isolated_path))
+    detected = pipeline.detect_worn_items(str(raw_path), selfie=selfie_path,
+                                          save_isolated_to=str(isolated_path))
     items = pipeline.prompt_items(detected)
     prompt = pipeline.build_prompt(detected)
 

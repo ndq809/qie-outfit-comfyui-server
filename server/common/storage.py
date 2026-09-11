@@ -24,6 +24,20 @@ def s3_client():
     )
 
 
+def s3_presign_client():
+    """Separate client pinned to the signing endpoint. Only used to generate
+    presigned URLs — every server-side get/put still goes over s3_client()."""
+    s = get_settings()
+    return boto3.client(
+        "s3",
+        endpoint_url=s.minio_signing_url,
+        aws_access_key_id=s.minio_access_key,
+        aws_secret_access_key=s.minio_secret_key,
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+
+
 def ensure_buckets():
     s = get_settings()
     client = s3_client()
@@ -36,6 +50,20 @@ def ensure_buckets():
 def raw_object_key(account_id: str, batch_id: str, local_id: str, content_type: str) -> str:
     ext = _ext_from_content_type(content_type)
     return f"raw/{account_id}/{batch_id}/{local_id}{ext}"
+
+
+def face_ref_object_key(account_id: str, content_type: str) -> str:
+    """The account's D0b reference selfie. Overwritten in place on re-register,
+    so an account only ever has one — the old object doesn't linger in the raw
+    bucket the way a uuid-suffixed key would."""
+    return f"face/{account_id}/reference{_ext_from_content_type(content_type)}"
+
+
+# Where the test-deployment fixed reference face is parked. Deliberately outside the
+# per-account face/<account_id>/ namespace: it belongs to no account, it is shared by
+# all of them, and keeping it separate means it is never mistaken for one a real user
+# registered (and never served by GET /v1/face-reference).
+FIXED_FACE_REF_KEY = "face/_test_fixture/reference.jpg"
 
 
 def item_object_key(job_id: str, item_id: str, index: int) -> str:
@@ -55,20 +83,30 @@ def _ext_from_content_type(content_type: str) -> str:
     }.get((content_type or "").lower(), ".bin")
 
 
+def _to_client_url(url: str) -> str:
+    """Swap the signing origin for the one the client can reach. Only the origin
+    changes — path and every X-Amz-* query parameter are left byte-for-byte as
+    signed, so the signature still verifies at the far end (the proxy restores the
+    signing Host on the way through)."""
+    s = get_settings()
+    signing, client = s.minio_signing_url, s.minio_client_url
+    return client + url[len(signing):] if client != signing and url.startswith(signing) else url
+
+
 def presign_put(bucket: str, key: str, content_type: str, expires: int) -> str:
-    return s3_client().generate_presigned_url(
+    return _to_client_url(s3_presign_client().generate_presigned_url(
         "put_object",
         Params={"Bucket": bucket, "Key": key, "ContentType": content_type},
         ExpiresIn=expires,
-    )
+    ))
 
 
 def presign_get(bucket: str, key: str, expires: int) -> str:
-    return s3_client().generate_presigned_url(
+    return _to_client_url(s3_presign_client().generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires,
-    )
+    ))
 
 
 def download_to(bucket: str, key: str, dest: Path) -> Path:

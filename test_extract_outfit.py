@@ -18,6 +18,7 @@ Both steps work on any such grid, not only a freshly generated one: pass
 exercise them on a machine that cannot host Qwen-Image-Edit-2511 itself.
 """
 import json
+import os
 import re
 import sys
 import time
@@ -34,7 +35,7 @@ from PIL import Image
 from torchvision import transforms as T
 from transformers import AutoModelForImageSegmentation
 
-COMFY_URL = "http://127.0.0.1:18188"
+COMFY_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:18188")
 UNET_NAME = "qwen-image-edit-2511-Q4_K_M.gguf"
 UNET_NAME_FP8 = "qwen_image_edit_2511_fp8mixed.safetensors"
 CLIP_NAME = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
@@ -44,7 +45,7 @@ LIGHTNING_LORAS = {
     4: "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
     8: "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors",
 }
-ITEM_SERVICE_URL = "http://127.0.0.1:18189"
+ITEM_SERVICE_URL = os.environ.get("ITEM_DETECTOR_URL", "http://127.0.0.1:18189")
 # Wardrobe attribute classifier applied to each cropped item. The trained weights are
 # committed to this repo (models/magic_eye/, via Git LFS) rather than read out of the
 # separate MS_Model_Magic_Eye project they came from, so this step runs anywhere the
@@ -105,7 +106,10 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
     except urllib.error.HTTPError as e:
         # The service is up and rejected the request (e.g. no face in the image matches
         # the selfie) - retrying the same work in-process would fail identically.
-        print("Item detection failed:", e.read().decode())
+        detail = e.read().decode()
+        print("Item detection failed:", detail)
+        if __name__ != "__main__":
+            raise RuntimeError(f"item detector rejected the request: {detail}") from e
         sys.exit(1)
     except (urllib.error.URLError, ConnectionError, OSError):
         print("  (item_detector service unreachable, loading the detector in-process instead)")
