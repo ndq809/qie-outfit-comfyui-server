@@ -65,6 +65,12 @@ requirements) for the worn-item detector and the crop step, plus `insightface` +
 ```bash
 pip install transformers torchvision scipy opencv-python
 pip install insightface onnxruntime      # only needed for --selfie
+
+# ...or, to run ArcFace on the GPU instead of the CPU, swap in the GPU build. The two
+# packages provide the same `onnxruntime` module and clash, so uninstall first. Match
+# the CUDA major your torch was built against — 1.22 is the CUDA 12.x line; 1.30 needs
+# CUDA 13 and fails with "libcublasLt.so.13: cannot open shared object file" on cu12x.
+pip uninstall -y onnxruntime && pip install "onnxruntime-gpu==1.22.0"
 ```
 
 The detector models (`yainage90/fashion-object-detection`, `facebook/sam-vit-base`,
@@ -122,10 +128,29 @@ Two supervisor services:
   (`/opt/supervisor-scripts/item_detector.sh`), runs `item_detector_service.py` on
   `127.0.0.1:18189`. No portal entry needed (internal use only by
   `test_extract_outfit.py`). Config: `scripts/item_detector.conf`. It uses the GPU by
-  default and therefore holds VRAM while running — on a single-GPU box that is also
-  serving ComfyUI, add `export OUTFIT_ITEMS_DEVICE=cpu` to `scripts/item_detector.sh`
-  before installing it (see [the timing table](#auto-detected-prompt-no-hardcoded-items)
-  for what that costs).
+  default and therefore holds VRAM (~4.1GB) while running. On a single-GPU box that is
+  also serving ComfyUI you have two options:
+  - **Keep it on GPU** (measured 4.5s vs ~27s per group photo): start ComfyUI with
+    `--reserve-vram 4` so it leaves headroom instead of filling the card. On a 24GB
+    RTX 3090 Ti all three consumers — ComfyUI ~17GB, this detector ~4.1GB, the D3
+    classifier ~2.8GB — coexist at a measured peak of 24056/24564 MiB.
+  - **Move it to CPU**: `export OUTFIT_ITEMS_DEVICE=cpu` in `scripts/item_detector.sh`
+    (see [the timing table](#auto-detected-prompt-no-hardcoded-items) for the cost).
+
+  **ArcFace does not follow `OUTFIT_ITEMS_DEVICE`.** Face matching runs on onnxruntime,
+  not torch, so it needs `onnxruntime-gpu` **and** the CUDA libraries on
+  `LD_LIBRARY_PATH` (`scripts/item_detector.sh` sets both). Miss either and insightface
+  falls back to CPU *silently* — `/health` still reports `"device": "cuda"`, because that
+  field reflects the torch models only. Verify with:
+  ```python
+  from insightface.app import FaceAnalysis
+  app = FaceAnalysis(name="buffalo_s", allowed_modules=["detection", "recognition"])
+  app.prepare(ctx_id=0, det_size=(640, 640))
+  for n, m in app.models.items(): print(n, m.session.get_providers())
+  # want CUDAExecutionProvider first, not CPUExecutionProvider alone
+  ```
+  Pin `onnxruntime-gpu` to the CUDA major this box's torch uses: 1.22 for CUDA 12.x.
+  1.30 requires CUDA 13 and fails to load `libcublasLt.so.13` on a cu128 build.
 
 Install both the same way:
 ```bash

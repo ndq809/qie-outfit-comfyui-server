@@ -18,6 +18,7 @@ Lưu ý về ba thay đổi so với thiết kế gốc, đã phản ánh trong 
   - [2.1 Kiến trúc chung](#21-kiến-trúc-chung)
   - [2.2 Triển khai Production](#22-triển-khai-production)
   - [2.3 Triển khai Test (1 máy vast.ai)](#23-triển-khai-test-1-máy-vastai)
+    - [2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)
   - [2.4 Giấy phép model/dữ liệu](#24-giấy-phép-modeldữ-liệu)
 - [Phần 3 — API Spec](#phần-3--api-spec)
   - [3.1 Data server API](#31-data-server-api)
@@ -346,8 +347,51 @@ Không có autoscale GPU thật vì chỉ có một máy; nếu muốn giả l�
 4. Khởi tạo lần lượt postgres-db, object-storage, queue — gán đúng IP tĩnh cho từng container, kiểm tra từng dịch vụ chạy healthy trước khi sang bước tiếp theo.
 5. Build và chạy ai-server, cấu hình trỏ tới IP của object-storage và queue theo bảng 2.3.2; xác nhận container nhận diện đúng GPU của máy. Image của ai-server cần có sẵn: ComfyUI + các checkpoint/LoRA của D1, bộ nhận diện của D0b, và bộ trọng số phân loại của D3 (`models/magic_eye/`, lấy qua `git lfs pull` lúc build — nếu quên, file `.pt` chỉ là con trỏ LFS và bước D3 sẽ báo lỗi rõ ràng). Danh sách đầy đủ ở mục "Models required" của [README.md](README.md). Nếu chỉ có một GPU dùng chung cho D1 và D0b, đặt `OUTFIT_ITEMS_DEVICE=cpu` cho bộ nhận diện để không tranh VRAM với ComfyUI.
 6. Build và chạy data-server, cấu hình trỏ tới IP của postgres-db, object-storage, queue; map port ra IP public của vast.ai.
-7. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
-8. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
+7. Đặt `TEST_FIXED_FACE_REF_IMAGE` trỏ tới ảnh khuôn mặt dùng chung cho môi trường test ([2.3.7](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)); xác nhận log khởi động của data-server báo đã nạp được, và `GET /v1/face-reference` trả `source: "test-fixture"`. Bỏ qua bước này nếu muốn test đúng luồng đăng ký khuôn mặt của Production.
+8. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
+9. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
+
+#### 2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)
+
+D0b cần một ảnh khuôn mặt tham chiếu để biết người nào trong ảnh nhóm là chủ tài khoản
+(xem [2.1](#21-kiến-trúc-chung), bước D0b). Ở Production ảnh này do chính user cung cấp
+lúc đăng ký khuôn mặt. Ở môi trường Test, để rút ngắn vòng lặp thử nghiệm, **server cố
+định sẵn một ảnh dùng chung cho mọi account** — client không cần upload ảnh khuôn mặt,
+và bắt đầu thẳng từ `POST /v1/uploads/presign`.
+
+Cấu hình bằng một biến môi trường duy nhất của data-server:
+
+```
+TEST_FIXED_FACE_REF_IMAGE=/workspace/qie-outfit-comfyui-server/face-image/selfie.jpg
+```
+
+Cách hoạt động:
+
+1. Lúc khởi động, data-server đọc file này và **upload lên object-storage** một lần vào
+   key cố định `face/_test_fixture/reference.jpg`. Phải upload chứ không đọc thẳng từ đĩa
+   lúc chạy job, vì bên tiêu thụ là ai-server — ở Production nó nằm trên máy khác, không
+   nhìn thấy filesystem của data-server.
+2. Khi tạo job, data-server lấy `face_ref_key` theo thứ tự ưu tiên:
+   **ảnh của chính account** (nếu đã đăng ký qua `/v1/face-reference`) → **ảnh cố định
+   này** → không có gì. Giá trị chọn được gắn vào trường `faceRefKey` của vé việc như
+   bình thường (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
+3. ai-server không biết và không cần biết ảnh đó từ đâu ra — nó chỉ thấy một `faceRefKey`
+   trong vé việc và tải về từ object-storage, **đúng như luồng Production**. Không có
+   nhánh code riêng cho Test ở phía ai-server.
+
+Ba điểm cần lưu ý:
+
+- **Key nằm ngoài namespace `face/<account_id>/`** vì ảnh này không thuộc account nào và
+  được mọi account dùng chung — để không bao giờ bị nhầm là ảnh do user thật đăng ký.
+- **Ảnh của account vẫn thắng.** Biến này chỉ là giá trị lùi, nên hành vi Production
+  không đổi khi không cấu hình nó. `GET /v1/face-reference` trả thêm trường `source`
+  (`"account"` / `"test-fixture"` / `null`) để biết cái nào đang thực sự có hiệu lực.
+- **File thiếu không làm sập server**: chỉ ghi cảnh báo vào log rồi bỏ qua, D0b lùi về
+  suy đoán "người lớn nhất khung hình" — cùng hành vi như khi không cấu hình gì.
+
+**Bắt buộc bỏ trống `TEST_FIXED_FACE_REF_IMAGE` ở Production.** Để nguyên nghĩa là mọi
+user chưa đăng ký khuôn mặt đều bị đối chiếu với khuôn mặt của một người lạ, và wardrobe
+sẽ chứa quần áo của người đó.
 
 ### 2.4 Giấy phép model/dữ liệu
 
