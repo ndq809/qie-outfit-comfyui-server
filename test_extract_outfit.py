@@ -58,8 +58,14 @@ ITEM_PHRASES = [
     ("headwear", "hat"),
     ("outer", "jacket/outerwear"),
     ("one_piece", "dress"),
-    ("top", "top/shirt"),
-    ("bottom", "bottom (skirt/pants)"),
+    # Named by body region, not by garment type. The detector's whole vocabulary is
+    # bag/bottom/dress/hat/outer/shoes/top - it never says "shirt", "pants" or "skirt",
+    # so any such word here is a guess the prompt states as fact, which is the one thing
+    # the README's prompt-tuning notes say not to do. It was also drawing skirts on male
+    # subjects. "garment" has to stay in the phrase though: with a bare "top"/"bottom"
+    # the model drew bags and pouches instead of clothes (see build_prompt).
+    ("top", "upper-body garment"),
+    ("bottom", "lower-body garment"),
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
@@ -163,26 +169,11 @@ def _grid_shape_desc(n):
     return f"a grid: {rows} {row_word} of 2 items side by side, then 1 final row with exactly 1 item centered"
 
 
-# The bottom phrase names a category for the model to draw, so it must not name one
-# belonging to the other gender: "skirt" in the prompt of a man's photo is exactly the
-# "never name a category that isn't present" failure the README warns about, and it was
-# measurably drawing skirts on male subjects. Only the wording changes - no sentence is
-# added, because adding one measurably destabilises the layout (see build_prompt).
-BOTTOM_PHRASE_BY_GENDER = {
-    "male": "bottom (pants/shorts)",
-    "female": "bottom (skirt/pants)",
-}
-
-
 def prompt_items(detected):
     """The item list the prompt asks for, in grid order (row-major). Split out of
     build_prompt() because the crop step needs the same list to label the crops it
     cuts out of the result: cell k of the generated grid holds items[k]."""
-    bottom = BOTTOM_PHRASE_BY_GENDER.get(detected.get("gender"))
-    items = [
-        bottom if (key == "bottom" and bottom) else phrase
-        for key, phrase in ITEM_PHRASES if detected.get(key)
-    ]
+    items = [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
     if not items:
         # The detector localised nothing at all (bad crop, heavy occlusion, threshold
         # too high). Emitting a prompt with an empty item list would be malformed, so
@@ -193,21 +184,35 @@ def prompt_items(detected):
 
 
 def build_prompt(detected):
-    """Gender reaches this prompt only by changing the bottom item's wording
-    (BOTTOM_PHRASE_BY_GENDER), never as a sentence of its own.
+    """How the top/bottom items are named was measured three ways, 15 paired
+    generations each (5 photos x 3 seeds, same detection and seed, only the wording
+    differing), counting items dropped and garment slots filled with an accessory:
 
-    Measured over 9 photos x 4 wordings: adding "Men's clothing." to the prompt made
-    the layout worse - items drawn but not asked for went up (23 -> 25 items over 9
-    generations, count mismatches 1 -> 2), including one generation that drew the same
-    pouch twice and another that dropped the trousers. That is the README's "keep it
-    short" lesson: this is a LoRA-conditioned diffusion model, and an extra clause
-    competes with the layout instructions rather than refining them.
+        "top/shirt" + "bottom (pants/shorts)"      2 dropped,  2 accessories
+        "upper-body garment" + "lower-body ..."    3 dropped,  3 accessories
+        "top" + "bottom"                           4 dropped,  9 accessories
 
-    Re-wording the bottom phrase instead costs no extra length and, over 27 paired
-    generations (9 photos x 3 seeds), removed both of the skirts the current wording
-    drew on male subjects - in each case the paired run produced shorts or jeans - and
-    cut items the classifier tags as women's from 17 to 11, with item counts unchanged
-    (mismatches 4 vs 4)."""
+    So the region wording ties with naming a subtype, while dropping the noun entirely
+    loses badly: with a bare "top"/"bottom" the model drew pouches, briefcases and
+    backpacks where clothes belonged, and once returned one item out of three. "top"
+    and "bottom" are not garment nouns in English, so there is nothing to anchor what
+    gets drawn.
+
+    The region wording wins on not lying instead: the detector only reports which body
+    region has something on it, so "shirt"/"pants"/"skirt" were guesses the prompt
+    stated as fact - and with "skirt" named on every male subject's prompt, skirts got
+    drawn on men. Naming the region says exactly what is known and leaves the garment
+    type to the model, which also removes gender from this prompt entirely.
+
+    Note what these numbers do *not* cover: the layout metrics alone (asked vs found)
+    are blind to this failure - the bare "top"/"bottom" runs had the same item counts
+    as the others and simply drew the wrong objects. Judge a wording change by what
+    lands in each cell, not by how many cells were filled.
+
+    Gender as a *sentence* was also tried and rejected: appending "Men's clothing." over
+    9 photos pushed items drawn 23 -> 25 and count mismatches 1 -> 2, drawing one pouch
+    twice and dropping a pair of trousers. This is a LoRA-conditioned diffusion model -
+    an extra clause competes with the layout instructions rather than refining them."""
     items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))

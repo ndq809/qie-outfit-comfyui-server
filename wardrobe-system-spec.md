@@ -205,7 +205,21 @@ python3 test_extract_outfit.py --lightning4 --fp8 <ảnh_gốc>
 
 **D0b sinh thêm danh sách loại trang phục có mặt** (`hat`, `outer`, `dress` vs `top`+`bottom`, `bag`, `shoes`) — không có trong thiết kế gốc, nhưng **D1 bắt buộc phải có**: LoRA tách trang phục suy đoán "có/không có" rất kém, và mọi loại không được xác nhận có mặt mà bị nhắc tên trong prompt đều làm tăng khả năng model tự vẽ thêm. Danh sách này đúng bằng những gì detector định vị được — không giả định gì thêm, cũng không bịa thêm.
 
-**D0b còn trả về giới tính của chủ thể**, đọc từ head `genderage` của insightface trên đúng khuôn mặt vừa đối chiếu, nên chỉ tốn thêm **14.5ms/ảnh** (51.6 → 66.1ms). D1 dùng nó để **đổi cách gọi tên món bottom**: chủ thể nam thì prompt ghi `bottom (pants/shorts)` thay cho `bottom (skirt/pants)`. Lý do: phrase cũ nhắc chữ "skirt" trong **mọi** prompt kể cả khi chủ thể là nam — đúng vào lỗi "nhắc tên loại chưa xác nhận có mặt" mà chính D0b sinh ra để tránh — và model vẽ váy cho nam thật. Đo trên 27 lần sinh ghép cặp (9 ảnh × 3 seed): xoá sạch cả 2 lần váy mà cách gọi cũ tạo ra (cặp tương ứng ra shorts và jeans), số món bị D3 gắn nhãn nữ giảm 17 → 11, số món không đổi. **Chỉ đổi chữ, không thêm câu** — thêm câu `Men's clothing.` vào prompt đo được làm hỏng bố cục (số món vẽ ra 23 → 25, lệch số món 1 → 2). Khi không có khuôn mặt để đọc giới tính thì giữ nguyên phrase cũ, không đoán.
+**Prompt của D1 gọi tên theo vùng cơ thể, không đoán loại trang phục.** Detector của D0b chỉ có 7 nhãn (`bag`, `bottom`, `dress`, `hat`, `outer`, `shoes`, `top`) — **không bao giờ** biết đó là quần dài, quần short hay chân váy. Nên cách gọi cũ `top/shirt` và `bottom (skirt/pants)` là **suy đoán do code tự thêm**, phát biểu như thể đã xác nhận; và vì chữ "skirt" nằm trong prompt của **mọi** chủ thể kể cả nam, model vẽ váy cho nam thật. Nay dùng `upper-body garment` / `lower-body garment`: nói đúng phần đã biết, để model tự quyết định loại.
+
+Đo 3 cách, mỗi cách 15 lần sinh ghép cặp (5 ảnh × 3 seed, cùng detection cùng seed), đếm số món bị thiếu và số ô đáng lẽ là quần áo nhưng bị vẽ thành phụ kiện:
+
+| Cách gọi tên | Món thiếu | Vẽ thành phụ kiện |
+|---|---|---|
+| `top/shirt` + `bottom (pants/shorts)` | 2 | 2 |
+| `upper-body garment` + `lower-body garment` | 3 | 3 |
+| `top` + `bottom` | 4 | **9** |
+
+Hai cách đầu ngang nhau, cách gọi theo vùng thắng ở chỗ không bịa thêm loại. **Nhưng không được bỏ hẳn danh từ**: chỉ ghi `top`/`bottom` thì model vẽ ra ví, cặp, ba lô vào chỗ quần áo (một lần chỉ trả về 1/3 món) — trong tiếng Anh hai chữ đó không phải danh từ chỉ quần áo nên không neo được vật thể. Chữ `garment` phải giữ.
+
+Một cạm bẫy khi đánh giá: **chỉ số "lệch số món" hoàn toàn không bắt được lỗi này** — các lần chạy `top`/`bottom` có số món y hệt hai cách kia, chỉ là vẽ sai đồ. Phải xét *cái gì nằm trong từng ô*, không phải *có bao nhiêu ô được lấp*.
+
+Vì prompt không còn tên loại nào mang giới tính, **không cần giới tính chủ thể nữa** — head `genderage` của insightface đã bật thử (tốn thêm 14.5ms/ảnh) rồi tắt lại. Thêm giới tính thành **một câu riêng** (`Men's clothing.`) cũng đã thử và bị loại: đo trên 9 ảnh làm số món vẽ ra 23 → 25 và lệch số món 1 → 2, vì câu thêm vào cạnh tranh với chỉ dẫn bố cục.
 
 **D1 — hệ quả quan trọng của việc dùng image-edit model.** Ảnh trang phục trong wardrobe là ảnh **được vẽ lại** trên nền trắng, không phải vùng pixel cắt ra từ ảnh của người dùng. Ba hệ quả cần biết khi thiết kế phần còn lại của hệ thống:
 
