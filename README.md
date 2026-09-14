@@ -507,6 +507,21 @@ python detect_clothing_yolo.py --images-dir images --single-scale --no-person-cr
   invent X" clause, naming an absent category (e.g. "shoes") in the prompt text
   measurably increases the chance it gets drawn anyway. Detect first, then only
   mention categories that are actually there.
+- **That applies to the other gender's categories too.** The bottom item used to be
+  described as `bottom (skirt/pants)` for everyone, so every male subject's prompt
+  named "skirt" — and skirts duly got drawn on men. It is now
+  `bottom (pants/shorts)` when the subject is male, taken from `genderage` on the
+  face D0b already matched (+14.5 ms/photo: 51.6 → 66.1 ms). Over 27 paired
+  generations (9 photos × 3 seeds) this removed both of the skirts the old wording
+  produced — the paired run gave shorts and jeans instead — and cut items the
+  classifier tags as women's from 17 to 11, with item counts unchanged (4 mismatches
+  either way).
+- **Say it by re-wording, not by adding a sentence.** Appending `Men's clothing.` to
+  the prompt was measured alongside the re-wording and made things *worse*: over 9
+  photos, items drawn went 23 → 25 and count mismatches 1 → 2, with one generation
+  drawing the same pouch twice and another dropping the trousers. Gender is a
+  property of the items being named, so it belongs in their wording; as its own
+  clause it just competes with the layout instructions.
 - **No prompt is 100% reliable across every seed.** Even with the current
   auto-detected + grid-positioned prompt, a given seed can occasionally still overlap
   two items or add an unrequested one. Use `--seed N` to retry rather than chasing

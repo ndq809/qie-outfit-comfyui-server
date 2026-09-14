@@ -56,10 +56,12 @@ SAM_MODEL_NAME = "facebook/sam-vit-base"
 # mobile dung o buoc A4, nen embedding server va mobile nam cung mot khong gian -
 # w600k_r50 cua buffalo_l thi khong so sanh truc tiep duoc voi embedding mobile.
 FACE_MODEL_PACK = "buffalo_s"
-# Chi 2 module nay duoc dung (bbox tu detection, normed_embedding tu recognition).
-# Mac dinh FaceAnalysis nap ca landmark_2d_106 + landmark_3d_68 + genderage va chay
-# chung tren TUNG khuon mat: do duoc 1358ms -> 413ms moi anh nhom khi bo di.
-FACE_MODULES = ["detection", "recognition"]
+# bbox tu detection, normed_embedding tu recognition, gender tu genderage (D1 dung
+# gioi tinh de khong nhac ten loai trang phuc cua gioi kia trong prompt).
+# Van bo 2 module landmark_2d_106 + landmark_3d_68: ca 3 cung nap thi do duoc
+# 1358ms -> 413ms moi anh nhom khi bo di, con rieng genderage chi them 14.5ms/anh
+# (51.6 -> 66.1ms, do tren 9 anh that).
+FACE_MODULES = ["detection", "recognition", "genderage"]
 FACE_MATCH_THRESHOLD = 0.35  # cosine similarity ArcFace - duoi nguong nay coi la khong khop
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # mask SAM phải phủ tối thiểu bao nhiêu % diện tích box người mới được coi

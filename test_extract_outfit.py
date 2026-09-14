@@ -163,11 +163,26 @@ def _grid_shape_desc(n):
     return f"a grid: {rows} {row_word} of 2 items side by side, then 1 final row with exactly 1 item centered"
 
 
+# The bottom phrase names a category for the model to draw, so it must not name one
+# belonging to the other gender: "skirt" in the prompt of a man's photo is exactly the
+# "never name a category that isn't present" failure the README warns about, and it was
+# measurably drawing skirts on male subjects. Only the wording changes - no sentence is
+# added, because adding one measurably destabilises the layout (see build_prompt).
+BOTTOM_PHRASE_BY_GENDER = {
+    "male": "bottom (pants/shorts)",
+    "female": "bottom (skirt/pants)",
+}
+
+
 def prompt_items(detected):
     """The item list the prompt asks for, in grid order (row-major). Split out of
     build_prompt() because the crop step needs the same list to label the crops it
     cuts out of the result: cell k of the generated grid holds items[k]."""
-    items = [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
+    bottom = BOTTOM_PHRASE_BY_GENDER.get(detected.get("gender"))
+    items = [
+        bottom if (key == "bottom" and bottom) else phrase
+        for key, phrase in ITEM_PHRASES if detected.get(key)
+    ]
     if not items:
         # The detector localised nothing at all (bad crop, heavy occlusion, threshold
         # too high). Emitting a prompt with an empty item list would be malformed, so
@@ -178,6 +193,21 @@ def prompt_items(detected):
 
 
 def build_prompt(detected):
+    """Gender reaches this prompt only by changing the bottom item's wording
+    (BOTTOM_PHRASE_BY_GENDER), never as a sentence of its own.
+
+    Measured over 9 photos x 4 wordings: adding "Men's clothing." to the prompt made
+    the layout worse - items drawn but not asked for went up (23 -> 25 items over 9
+    generations, count mismatches 1 -> 2), including one generation that drew the same
+    pouch twice and another that dropped the trousers. That is the README's "keep it
+    short" lesson: this is a LoRA-conditioned diffusion model, and an extra clause
+    competes with the layout instructions rather than refining them.
+
+    Re-wording the bottom phrase instead costs no extra length and, over 27 paired
+    generations (9 photos x 3 seeds), removed both of the skirts the current wording
+    drew on male subjects - in each case the paired run produced shorts or jeans - and
+    cut items the classifier tags as women's from 17 to 11, with item counts unchanged
+    (mismatches 4 vs 4)."""
     items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))

@@ -218,7 +218,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     person_boxes = byface.get_all_person_boxes(person_model, person_pre, image)
     timing["person_detect"] = time.time() - t
 
-    target_box, face_similarity = None, None
+    target_box, face_similarity, subject_gender = None, None, None
     if selfie_path:
         t = time.time()
         face_app = _load_face_app()
@@ -237,6 +237,11 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
                 f"(best similarity={face_similarity:.3f}, need >= {face_match_threshold})"
             )
         target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)
+        # Read off the face already matched above, so it costs one extra head on a
+        # crop we have anyway. Only ever set when a face was actually matched -
+        # build_prompt() must not guess a gender it wasn't told (see its docstring).
+        if getattr(face, "gender", None) is not None:
+            subject_gender = "male" if int(face.gender) == 1 else "female"
     elif len(person_boxes) > 1:
         # No reference face: assume the subject of an outfit-extraction photo is
         # the person occupying the most of the frame.
@@ -291,6 +296,8 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     result["timing"] = {k: round(v, 3) for k, v in timing.items()}
     if face_similarity is not None:
         result["face_similarity"] = round(float(face_similarity), 4)
+    if subject_gender is not None:
+        result["gender"] = subject_gender
     return result
 
 
