@@ -149,6 +149,28 @@ rm /etc/supervisor/conf.d/clip_classifier.conf /opt/supervisor-scripts/clip_clas
 supervisorctl reread && supervisorctl update
 ```
 
+## Seeing what the pipeline did (test only)
+
+The worker keeps nothing by design — it works in a temp dir, and the original is deleted
+from object-storage the moment extraction succeeds — which makes a bad wardrobe item
+hard to explain after the fact. Set `WARDROBE_REPORT_DIR` and every stage is kept
+instead, with an HTML page rebuilt after each photo:
+
+```bash
+echo 'WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_out' >> ${WORKSPACE:-/workspace}/.env
+supervisorctl restart ai-server
+# then run a job; open <dir>/index.html
+```
+
+Each photo gets a card showing **original → SAM-isolated subject → generated grid →
+per-item crops**, plus what the detector found, the subject's gender, the face-match
+similarity, how many items the prompt asked for versus how many were found, the exact D1
+prompt, and each crop's tags. Crops dropped by D2 as duplicates are still shown, outlined
+and labelled — that is usually the answer to "why is this item missing from my wardrobe".
+
+Leave it empty in production: it retains the user's original photo, which the spec
+requires deleting once extraction is done.
+
 ## Usage
 
 ```bash

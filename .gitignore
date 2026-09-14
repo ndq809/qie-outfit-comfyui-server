@@ -8,3 +8,4 @@ result*.png
 images/
 # Per-run item crops and their wardrobe_index.json (test_extract_outfit.py output).
 *_items/
+wardrobe_report_out/

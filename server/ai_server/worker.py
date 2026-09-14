@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for t
 
 import test_extract_outfit as pipeline  # noqa: E402
 
+from server.ai_server import report  # noqa: E402
 from server.common import queue, storage  # noqa: E402
 from server.common.config import get_settings  # noqa: E402
 from server.common.embeddings import cosine_similarity  # noqa: E402
@@ -90,10 +91,12 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
     crops, records = pipeline.extract_and_classify(
         result_path, crop_dir, items=items, classify=True, device=None,
     )
+    kept = _drop_same_image_duplicates(records) if records else []
+
+    _write_report(job_id, item_id, raw_path, isolated_path, result_path,
+                  crops, records, kept, detected, items, prompt, settings)
     if not records:
         return []
-
-    kept = _drop_same_image_duplicates(records)
 
     garments = []
     for idx, record in enumerate(kept, start=1):
@@ -115,6 +118,26 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
             "textEmbedding": record["text_embedding"],
         })
     return garments
+
+
+def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
+                  crops, records, kept, detected, items, prompt, settings):
+    """Test-only (WARDROBE_REPORT_DIR). Wrapped so a reporting problem can never fail a
+    job whose extraction actually worked."""
+    if not settings.wardrobe_report_dir:
+        return
+    try:
+        report.save_stages(
+            settings.wardrobe_report_dir, job_id, item_id,
+            original=raw_path,
+            isolated=isolated_path if detected.get("isolated_by_sam") else None,
+            grid=result_path, crops=crops, records=records,
+            kept_names={r["image_name"] for r in kept},
+            detected={**detected, "_asked_items": items}, prompt=prompt,
+        )
+        report.build_index(settings.wardrobe_report_dir)
+    except Exception:
+        log.exception("could not write the extraction report for %s/%s", job_id, item_id)
 
 
 def _detect_with_face_ref(raw_path: Path, face_ref_key: str | None, isolated_path: Path,

@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # MUST be empty in production.
     test_fixed_face_ref_image: str = ""
 
+    # Test-only: keep every pipeline stage of each photo on disk (original, the
+    # SAM-isolated subject, the generated grid, the per-item crops) and build an HTML
+    # page to compare them. MUST be empty in production — it keeps the user's original
+    # photo, which §"Bảo mật và vòng đời dữ liệu" requires deleting once extraction is
+    # done. Empty = nothing is written.
+    wardrobe_report_dir: str = ""
+
     @property
     def postgres_dsn(self) -> str:
         return (
