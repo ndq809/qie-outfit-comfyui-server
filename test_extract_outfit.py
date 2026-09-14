@@ -344,73 +344,8 @@ def _reading_order(items):
     return [it for row in rows for it in sorted(row, key=lambda it: it["box"][0])]
 
 
-def _split_into(blobs, k, lo, hi):
-    """Cut blobs into k consecutive bands along one axis at the k-1 widest gaps.
-
-    lo/hi pick the axis out of the box: (0, 2) for x, (1, 3) for y. The gap measured is
-    edge-to-edge (next box's near edge minus the widest far edge seen so far), not
-    centre-to-centre, so a tall item beside a short one in the same band doesn't read as
-    a gap. Returns None when there are fewer blobs than bands to fill."""
-    if k <= 1:
-        return [blobs]
-    if len(blobs) < k:
-        return None
-
-    order = sorted(blobs, key=lambda b: b["box"][lo])
-    gaps, edge = [], order[0]["box"][hi]
-    for i in range(1, len(order)):
-        gaps.append((order[i]["box"][lo] - edge, i))
-        edge = max(edge, order[i]["box"][hi])
-
-    cuts = sorted(i for _, i in sorted(gaps, key=lambda g: g[0], reverse=True)[:k - 1])
-    bands, prev = [], 0
-    for c in cuts:
-        bands.append(order[prev:c])
-        prev = c
-    bands.append(order[prev:])
-    return bands
-
-
-def _group_by_prompt_grid(blobs, n):
-    """Fold blobs down to exactly n items using the grid the prompt itself specified.
-
-    The generation prompt does not merely hope for a layout, it dictates one: n items in
-    ceil(n/2) rows of two, with a single centred item in the last row when n is odd (see
-    _grid_positions/_grid_shape_desc). So when more blobs are found than items were asked
-    for, the extra blobs are *parts* of items, and which parts belong together is a
-    question the grid already answers - cut into rows, cut each row into its cells, and
-    whatever lands in one cell is one item.
-
-    This replaces a distance threshold for that decision, which had run out of road: a
-    pair of sandals sat 11px apart on one generation while a shirt and the shorts beside
-    it sat 11px apart on another, so no gap value could separate "two halves of one item"
-    from "two different items". Position in the stated grid separates them exactly,
-    because those two cases differ in which *cell* they occupy, not in how close they are.
-
-    Returns None if the blobs cannot fill the grid (the model dropped a cell), leaving
-    the caller on its threshold-merged result and the item-count mismatch visible."""
-    row_sizes = [2] * (n // 2) + ([1] if n % 2 else [])
-    rows = _split_into(blobs, len(row_sizes), 1, 3)
-    if rows is None:
-        return None
-
-    cells = []
-    for row, size in zip(rows, row_sizes):
-        split = _split_into(row, size, 0, 2)
-        if split is None:
-            return None
-        cells.extend(split)
-
-    if len(cells) != n or any(not c for c in cells):
-        return None
-    return [{"ids": [i for b in cell for i in b["ids"]],
-             "box": (min(b["box"][0] for b in cell), min(b["box"][1] for b in cell),
-                     max(b["box"][2] for b in cell), max(b["box"][3] for b in cell))}
-            for cell in cells]
-
-
 @torch.no_grad()
-def _segment_items(image, device=None, expected=None, min_area_frac=0.002, merge_gap_frac=0.01):
+def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02):
     """One (box, alpha) per item on the generated flat-mockup, from a class-agnostic
     foreground segmentation. The alpha matte is what keeps a neighbouring item out of
     this item's picture - see _isolate_on_background.
@@ -433,13 +368,22 @@ def _segment_items(image, device=None, expected=None, min_area_frac=0.002, merge
     threshold at all, which is what removed that whole class of tuning problem.
 
     One *item* is not always one blob: a pair of shoes is two, a bag with its strap
-    coiled beside it can be two. Two mechanisms put those back together, in order:
+    coiled beside it can be two. Blobs closer than merge_gap_frac of the short side are
+    merged back into one item. Measured edge-to-edge on six real generations, the two
+    populations do not overlap:
 
-      - merge_gap_frac, for blobs almost touching (1% of the short side). Kept
-        deliberately tight, because it cannot tell a split item from two close ones.
-      - expected, the item count the prompt asked for: when blobs still outnumber it,
-        _group_by_prompt_grid assigns them to the grid cells the prompt dictated,
-        which decides the ambiguous cases the gap alone cannot.
+      within one item (shoe pairs)   0.34%, 0.91%, 1.25%
+      between two items (closest)    3.18%, 3.30%, 4.77%, 9.77%, 14.89%
+
+    2% sits between them with ~1.6x margin either way. They separate this cleanly
+    because the prompt demands "a wide gap of clear white space between them", so
+    between-item spacing is deliberate while a split item's is incidental.
+
+    An earlier attempt used the item count from the prompt instead, folding surplus
+    blobs into the grid cells the prompt laid out. That was wrong: the count is what
+    was *asked for*, not what was drawn, and the generator misses and adds items in
+    both directions. On a job where the detector found one garment and the generation
+    drew two, it merged a shirt and a skirt into a single "item".
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, transform = _load_segmenter(device)
@@ -479,12 +423,6 @@ def _segment_items(image, device=None, expected=None, min_area_frac=0.002, merge
                     break
             if merged:
                 break
-
-    if expected and len(groups) > expected:
-        regrouped = _group_by_prompt_grid(groups, expected)
-        if regrouped is not None:
-            print(f"  {len(groups)} regions -> {expected} items via the prompt's grid")
-            groups = regrouped
 
     for g in groups:
         x0, y0, x1, y1 = g["box"]
@@ -543,7 +481,7 @@ def crop_items(result_path, out_dir, items=None, device=None):
     result_img = Image.open(result_path).convert("RGB")
     img = np.array(result_img)
     t = time.time()
-    found = _segment_items(result_img, device=device, expected=len(items) if items else None)
+    found = _segment_items(result_img, device=device)
     print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
     if items and len(items) != len(found):
         print(f"  note: prompt asked for {len(items)} items but {len(found)} were found "

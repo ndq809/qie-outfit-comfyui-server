@@ -348,22 +348,28 @@ another. A segmentation model needs no score threshold at all, which removes tha
 whole class of tuning problem.
 
 - **One *item* is not always one blob** — a pair of shoes is two, and a bag with its
-  strap coiled beside it can be two. Two things put them back together, in order:
-  blobs closer than 1% of the short side are merged outright, and then, if blobs
-  still outnumber the items the prompt asked for, **they are assigned to the grid
-  cells the prompt dictated** and whatever shares a cell becomes one item.
+  strap coiled beside it can be two. Blobs closer than **2% of the short side** are
+  merged back into one item. Measured edge-to-edge across six real generations, the
+  two populations don't overlap:
 
-  The grid is what makes this decidable. A gap threshold alone had run out of road:
-  a pair of sandals sat 11 px apart on one generation, while a shirt and the shorts
-  beside it sat 11 px apart on another — no value separates those two cases. Their
-  difference is not distance but *which cell they occupy*, and the prompt already
-  states the grid (`ceil(n/2)` rows of two, a single centred item in the last row
-  when `n` is odd), so the layout is known before the image is even read. Rows are
-  cut at the widest vertical gaps, each row at the widest horizontal gap. On
-  `result_v4.png` this folds 5 blobs into the 4 items asked for, turning two
-  half-crops of one sandal each back into a single picture of the pair. If the blobs
-  cannot fill the grid — the model dropped a cell — the regrouping is skipped and the
-  count mismatch stays visible instead of being papered over.
+  | | gaps observed |
+  |---|---|
+  | within one item (shoe pairs) | 0.34%, 0.91%, 1.25% |
+  | between two items (closest pair in each grid) | 3.18%, 3.30%, 4.77%, 9.77%, 14.89% |
+
+  2% sits between them with ~1.6× margin on both sides. They separate this cleanly
+  because the prompt demands "a wide gap of clear white space between them", so
+  between-item spacing is deliberate while a split item's is incidental. (The old 1%
+  default was measured *under* a real pair: sandals 11 px apart on `result_v4.png`
+  came out as two half-items.)
+
+  **Do not use the prompt's item count to decide this.** An earlier version folded
+  surplus blobs into the grid cells the prompt laid out, on the assumption that more
+  blobs than items meant the extras were parts. The count is what was *asked for*,
+  not what was drawn, and the generator misses and adds items in both directions — on
+  a real job where the detector found one garment and the generation drew two, it
+  merged a shirt and a skirt into a single "item". The count mismatch is a quality
+  signal to log, not a target to force the segmentation to hit.
 - **Reading order is row-major**, computed by grouping boxes into rows first and then
   sorting each row left-to-right. A plain sort by `y` interleaves the two columns,
   since items in one grid row are never aligned to the pixel.
