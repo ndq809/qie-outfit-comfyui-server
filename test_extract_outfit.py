@@ -179,7 +179,7 @@ def prompt_items(detected):
         # too high). Emitting a prompt with an empty item list would be malformed, so
         # fall back to the two garments any clothed person is wearing - this is the one
         # place presence is assumed rather than detected.
-        items = ["top/shirt", "bottom (skirt/pants)"]
+        items = [dict(ITEM_PHRASES)["top"], dict(ITEM_PHRASES)["bottom"]]
     return items
 
 
@@ -379,6 +379,38 @@ def _reading_order(items):
     return [it for row in rows for it in sorted(row, key=lambda it: it["box"][0])]
 
 
+def _regions_within(labels, a, b, gap):
+    """True when a's and b's actual pixels come within `gap` of each other.
+
+    Measured on the gap between their *bounding boxes* instead, two items laid out
+    diagonally read as touching: on one real generation a shirt (x 39-595) and the
+    trousers beside it (x 545-775) overlapped in both axes, so the box gap was 0 and
+    they were merged into a single "item", even though the nearest pixel of one was
+    49px from the other and the grid was visually perfect. The box gap is a lower
+    bound on the pixel distance, so it still works as a cheap prefilter.
+    """
+    ba, bb = a["box"], b["box"]
+    dx = max(0, max(ba[0], bb[0]) - min(ba[2], bb[2]))
+    dy = max(0, max(ba[1], bb[1]) - min(ba[3], bb[3]))
+    if dx > gap or dy > gap:
+        return False
+
+    # Only the neighbourhood of the two regions matters, and cropping it keeps the
+    # distance transform off the rest of the frame.
+    pad = int(np.ceil(gap)) + 2
+    x0 = max(0, min(ba[0], bb[0]) - pad); y0 = max(0, min(ba[1], bb[1]) - pad)
+    x1 = min(labels.shape[1], max(ba[2], bb[2]) + pad)
+    y1 = min(labels.shape[0], max(ba[3], bb[3]) + pad)
+    sub = labels[y0:y1, x0:x1]
+
+    mask_a = np.isin(sub, a["ids"])
+    mask_b = np.isin(sub, b["ids"])
+    if not mask_a.any() or not mask_b.any():
+        return False
+    dist = cv2.distanceTransform((~mask_a).astype(np.uint8), cv2.DIST_L2, 3)
+    return float(dist[mask_b].min()) <= gap
+
+
 @torch.no_grad()
 def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02):
     """One (box, alpha) per item on the generated flat-mockup, from a class-agnostic
@@ -403,9 +435,10 @@ def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02)
     threshold at all, which is what removed that whole class of tuning problem.
 
     One *item* is not always one blob: a pair of shoes is two, a bag with its strap
-    coiled beside it can be two. Blobs closer than merge_gap_frac of the short side are
-    merged back into one item. Measured edge-to-edge on six real generations, the two
-    populations do not overlap:
+    coiled beside it can be two. Blobs whose pixels come within merge_gap_frac of the
+    short side of each other are merged back into one item (_regions_within - the
+    distance is between the regions themselves, not between their bounding boxes).
+    Measured edge-to-edge on six real generations, the two populations do not overlap:
 
       within one item (shoe pairs)   0.34%, 0.91%, 1.25%
       between two items (closest)    3.18%, 3.30%, 4.77%, 9.77%, 14.89%
@@ -445,10 +478,8 @@ def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02)
         merged = False
         for i in range(len(groups)):
             for j in range(i + 1, len(groups)):
-                a, b = groups[i]["box"], groups[j]["box"]
-                dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
-                dy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
-                if dx <= gap and dy <= gap:
+                if _regions_within(labels, groups[i], groups[j], gap):
+                    a, b = groups[i]["box"], groups[j]["box"]
                     groups[i] = {
                         "ids": groups[i]["ids"] + groups[j]["ids"],
                         "box": (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])),

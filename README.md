@@ -379,9 +379,16 @@ another. A segmentation model needs no score threshold at all, which removes tha
 whole class of tuning problem.
 
 - **One *item* is not always one blob** — a pair of shoes is two, and a bag with its
-  strap coiled beside it can be two. Blobs closer than **2% of the short side** are
-  merged back into one item. Measured edge-to-edge across six real generations, the
-  two populations don't overlap:
+  strap coiled beside it can be two. Blobs whose **pixels** come within **2% of the
+  short side** of each other are merged back into one item. Measure that between
+  *bounding boxes* instead and two items laid out diagonally read as touching: on one
+  real generation a shirt (x 39–595) and the trousers beside it (x 545–775) overlapped
+  in both axes, so the box gap was 0, the two were merged into a single "item", and the
+  photo produced one garment instead of two — from a visually perfect grid. The nearest
+  pixel of one was 49 px from the other, well outside the 18 px threshold. The box gap
+  is a lower bound on the pixel distance, so it survives as a cheap prefilter.
+
+  Measured edge-to-edge across six real generations, the two populations don't overlap:
 
   | | gaps observed |
   |---|---|

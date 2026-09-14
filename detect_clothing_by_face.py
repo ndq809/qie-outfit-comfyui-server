@@ -129,6 +129,29 @@ def match_face_in_group(face_app, group_image: Image.Image, ref_embedding):
 
 
 def match_face_to_person_box(face_bbox, person_boxes):
+    """Which person box owns this face.
+
+    Khi hai nguoi dung/ngoi sat nhau, cac box nguoi CHONG LEN NHAU va ca hai deu
+    chua tam khuon mat, nen "box dau tien chua tam mat" chon trung ai la ngau nhien
+    theo thu tu danh sach - do tren anh that: mat cua chu the nam cach mep tren cua
+    box duoc chon dung 5px trong khi box do cao 1710px, tuc la mask SAM sau do co lap
+    nham hoan toan sang nguoi khac.
+
+    Nen doi tieu chi: box phai chua TRON box khuon mat (dung sai 5% chieu cao mat, vi
+    box nguoi doi khi cat sat dinh dau), roi trong so do lay box NHO NHAT - box om sat
+    nhat la cua chinh nguoi do. Do tren 6 anh nhieu nguoi: sua dung 3 ca isolate nham,
+    giu nguyen 3 ca von da dung.
+    """
+    fx0, fy0, fx1, fy1 = face_bbox[0], face_bbox[1], face_bbox[2], face_bbox[3]
+    tol = 0.05 * (fy1 - fy0)
+    contains_face = [
+        box for box in person_boxes
+        if box[0] <= fx0 + tol and box[1] <= fy0 + tol
+        and box[2] >= fx1 - tol and box[3] >= fy1 - tol
+    ]
+    if contains_face:
+        return min(contains_face, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+
     fx = (face_bbox[0] + face_bbox[2]) / 2
     fy = (face_bbox[1] + face_bbox[3]) / 2
     for box in person_boxes:
