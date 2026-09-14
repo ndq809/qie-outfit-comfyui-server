@@ -99,6 +99,19 @@ FACE_MATCH_THRESHOLD = byface.FACE_MATCH_THRESHOLD
 # subject; a marginal one costs more than it adds.
 ITEM_INSIDE_PERSON_FRAC = 0.8
 
+# Per-class floors applied on top of THRESHOLD, for classes whose score is not
+# calibrated like the rest.
+#
+# hat: the detector calls hair, a hair flower and a bare head "hat" in a tight band
+# just above 0.4. Labelled by eye over 67 real photos, every photo that produced a
+# hat item was checked: the four false ones scored 0.401 / 0.415 / 0.422 / 0.462
+# (short hair, a bare head, an orchid pinned in hair) and the one real one 0.717 (a
+# navy cap and a straw hat). Nothing real was observed between them, so 0.55 sits in
+# the gap - closer to the false side on purpose, since it rests on a single positive.
+# Hats are rare in this corpus (1 of 67 photos), so a missed hat costs less than the
+# junk item a false one puts in the wardrobe.
+CLASS_THRESHOLDS = {"hat": 0.55}
+
 
 _clothing_models = None
 _sam = None
@@ -137,18 +150,22 @@ def _flags_from_detections(detections):
         if d["score"] > best.get(d["label"], 0.0):
             best[d["label"]] = d["score"]
 
+    def present(label):
+        score = best.get(label)
+        return score is not None and score >= CLASS_THRESHOLDS.get(label, 0.0)
+
     return {
-        "headwear": "hat" in best,
-        "footwear": "shoes" in best,
-        "bag": "bag" in best,
-        "outer": "outer" in best,
+        "headwear": present("hat"),
+        "footwear": present("shoes"),
+        "bag": present("bag"),
+        "outer": present("outer"),
         # predict_image(resolve_dress=True) already drops whichever side of the
         # dress-vs-top+bottom conflict loses on hue, so a surviving "dress" is
         # the detector's verdict that this outfit is one garment, and a
         # surviving top/bottom pair is its verdict that it is two.
-        "one_piece": "dress" in best,
-        "top": "top" in best,
-        "bottom": "bottom" in best,
+        "one_piece": present("dress"),
+        "top": present("top"),
+        "bottom": present("bottom"),
         "scores": {label: round(score, 4) for label, score in best.items()},
     }
 
