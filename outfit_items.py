@@ -160,15 +160,42 @@ def _box_area(box):
     return (box[2] - box[0]) * (box[3] - box[1])
 
 
+def _dress_vs_pair_loser(effective):
+    """A dress and a top/bottom are mutually exclusive readings of one outfit, so one
+    of them has to go.
+
+    clothing.resolve_dress_conflict() settles this by comparing the hue of the top and
+    bottom regions - but it only runs when dress, top AND bottom are all present, and
+    returns untouched otherwise. On a chest-up selfie there is no bottom to detect, so
+    a patterned shirt that also scored as a dress left both flags standing and the
+    prompt asked for a dress and a shirt at once, putting a "mid length dresses" item
+    in a man's wardrobe.
+
+    With no bottom there is no colour evidence to weigh, so fall back to the detector's
+    own confidence. This also backstops the three-way case: that arbitration bails out
+    when the boxes overlap too little, and nothing downstream noticed.
+    """
+    dress = effective.get("dress")
+    pair = [effective[k] for k in ("top", "bottom") if k in effective]
+    if dress is None or not pair:
+        return frozenset()
+    return frozenset({"top", "bottom"}) if dress >= max(pair) else frozenset({"dress"})
+
+
 def _flags_from_detections(detections):
     best = {}
     for d in detections:
         if d["score"] > best.get(d["label"], 0.0):
             best[d["label"]] = d["score"]
 
+    # Kept separate from best[] so result["scores"] still reports everything the
+    # detector saw - the report page needs that to explain a decision.
+    effective = {label: score for label, score in best.items()
+                 if score >= CLASS_THRESHOLDS.get(label, 0.0)}
+    suppressed = _dress_vs_pair_loser(effective)
+
     def present(label):
-        score = best.get(label)
-        return score is not None and score >= CLASS_THRESHOLDS.get(label, 0.0)
+        return label in effective and label not in suppressed
 
     return {
         "headwear": present("hat"),
