@@ -112,6 +112,22 @@ ITEM_INSIDE_PERSON_FRAC = 0.8
 # junk item a false one puts in the wardrobe.
 CLASS_THRESHOLDS = {"hat": 0.55}
 
+# Single-person photos get no SAM isolation (see detect_worn_items), so nothing stops
+# the detector reporting an object lying in the background as the subject's. Keeping
+# only detections that overlap the subject's person box by this much is enough, and
+# unlike isolating it does not touch a pixel of the image.
+#
+# Measured over all 57 detections on 25 real single-person photos, by how much of the
+# garment box lies inside the person box: exactly one falls below 50% - a pair of shoes
+# on the floor behind the subject, at 27% - and the lowest real one is 66.1%. 50% sits
+# in that gap with 2.4x margin.
+#
+# Deliberately looser than ITEM_INSIDE_PERSON_FRAC (0.8), which answers a different
+# question (what to add to the isolation mask). Four real garments here sit between 50%
+# and 80%, one of them an outer whose box is larger than the person box the detector
+# drew, so 0.8 would throw them away.
+SUBJECT_ITEM_MIN_FRAC = 0.5
+
 
 _clothing_models = None
 _sam = None
@@ -300,6 +316,19 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
             Path(image_path), DEVICE, threshold, resolve_dress=True,
         )
         timing["fashion_detect_final"] = time.time() - t
+        # Nobody to paint out here, but the background still holds objects the
+        # detector will happily report as worn - shoes on the floor behind the
+        # subject, for one. Drop whatever does not sit on the subject.
+        # SAM isolation was measured as the alternative and lost: greying the
+        # background shifted scores enough to change the flags on 12 of these 25
+        # photos, losing real garments (a top at 0.642, a dress at 0.494) as well as
+        # the false shoes. Filtering by box changes 1 of 25 - only the false one.
+        subject_box = target_box or (person_boxes[0] if len(person_boxes) == 1 else None)
+        if subject_box is not None:
+            detections = [
+                d for d in detections
+                if _box_inside_frac(d["box"], subject_box) >= SUBJECT_ITEM_MIN_FRAC
+            ]
 
     result = _flags_from_detections(detections)
     result["persons"] = len(person_boxes)
