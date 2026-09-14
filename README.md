@@ -115,9 +115,10 @@ Two supervisor services:
 
 - **ComfyUI** — `scripts/comfyui.sh` (`/opt/supervisor-scripts/comfyui.sh`), runs
   `python main.py --listen 127.0.0.1 --port 18188`. Config: `scripts/comfyui.conf`.
-  Expose via the instance's Caddy auth edge by adding a `ComfyUI` entry to
-  `/etc/portal.yaml` (`external_port: 10100`, `internal_port: 18188`), then
-  `supervisorctl reread && supervisorctl update`.
+  Stays on loopback with no `/etc/portal.yaml` entry: in the server deployment its
+  only caller is ai-server, and the spec publishes data-server alone (§2.3.4). To
+  reach the ComfyUI UI while debugging, SSH-forward 18188 rather than exposing it —
+  `ssh -p $VAST_TCP_PORT_22 -L 8188:127.0.0.1:18188 root@$PUBLIC_IPADDR`.
 - **Worn-item detector** — `scripts/item_detector.sh`
   (`/opt/supervisor-scripts/item_detector.sh`), runs `item_detector_service.py` on
   `127.0.0.1:18189`. No portal entry needed (internal use only by
@@ -346,18 +347,40 @@ wherever the threshold went, and per-class overrides only traded one failure for
 another. A segmentation model needs no score threshold at all, which removes that
 whole class of tuning problem.
 
-- **Blobs are merged when the gap between them is under 1% of the short side**,
-  because one *item* is not always one blob: a pair of shoes is two, and a bag with
-  its strap coiled beside it can be two. 1% sits between the within-item gap and the
-  between-item one; 3% (what the connected-components version used) was measured
-  merging a shirt into the shorts beside it, only 11 px away on one generation.
+- **One *item* is not always one blob** — a pair of shoes is two, and a bag with its
+  strap coiled beside it can be two. Two things put them back together, in order:
+  blobs closer than 1% of the short side are merged outright, and then, if blobs
+  still outnumber the items the prompt asked for, **they are assigned to the grid
+  cells the prompt dictated** and whatever shares a cell becomes one item.
+
+  The grid is what makes this decidable. A gap threshold alone had run out of road:
+  a pair of sandals sat 11 px apart on one generation, while a shirt and the shorts
+  beside it sat 11 px apart on another — no value separates those two cases. Their
+  difference is not distance but *which cell they occupy*, and the prompt already
+  states the grid (`ceil(n/2)` rows of two, a single centred item in the last row
+  when `n` is odd), so the layout is known before the image is even read. Rows are
+  cut at the widest vertical gaps, each row at the widest horizontal gap. On
+  `result_v4.png` this folds 5 blobs into the 4 items asked for, turning two
+  half-crops of one sandal each back into a single picture of the pair. If the blobs
+  cannot fill the grid — the model dropped a cell — the regrouping is skipped and the
+  count mismatch stays visible instead of being papered over.
 - **Reading order is row-major**, computed by grouping boxes into rows first and then
   sorting each row left-to-right. A plain sort by `y` interleaves the two columns,
   since items in one grid row are never aligned to the pixel.
-- **Crops are square, padded with the sampled background** rather than cut into the
-  garment. The classifier resizes to a fixed 224×224 without preserving aspect ratio,
-  so feeding it a tall garment box directly would squash it horizontally into
-  something its training images never contained.
+- **Each item is lifted out by its alpha matte and re-composited on a background of
+  its own**, rather than cut out as a square region of the grid. A square region has
+  to be as wide as the item is *tall*, so for a narrow upright item it reaches past
+  its own cell and copies whatever is there: on `result_v4.png` the left sandal's
+  crop pulled in the whole right sandal, and both "items" came out as the same
+  picture of the pair. Compositing from the matte makes each image hold exactly one
+  item by construction. The matte is dilated 2 px before use, so the item's
+  anti-aliased rim survives instead of being cut to a hard jagged edge.
+- **Crops are square, centred, padded with the sampled background** rather than cut
+  into the garment. The classifier resizes to a fixed 224×224 without preserving
+  aspect ratio, so feeding it a tall garment box directly would squash it
+  horizontally into something its training images never contained. The rebuilt
+  background is one flat colour, which also drops the faint vignetting the generator
+  leaves behind.
 - **Crops are named after the item the prompt asked for in that cell** — but only when
   the number found matches the number requested. If the model dropped or added a cell,
   the names fall back to positional (`item 1`, `item 2`, …) rather than confidently

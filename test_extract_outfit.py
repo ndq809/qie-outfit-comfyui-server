@@ -9,7 +9,8 @@ Uploads the image to ComfyUI, runs it through the Qwen-Image-Edit-2511 (GGUF Q5_
 + QIE-2511-Extract-Outfit LoRA pipeline, and saves the result next to the input.
 
 The result is a flat-mockup grid of the individual garments, which is then:
-  1. cropped into one square image per item (crop_items), and
+  1. split into one square image per item, each segmented off the grid and
+     re-composited on a clean background of its own (crop_items), and
   2. run through the Magic Eye wardrobe classifier (classify_crops) to get each
      item's type/category/colour/pattern attributes.
 
@@ -105,8 +106,9 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
     except urllib.error.HTTPError as e:
         # The service is up and rejected the request (e.g. no face in the image matches
         # the selfie) - retrying the same work in-process would fail identically.
-        print("Item detection failed:", e.read().decode())
-        sys.exit(1)
+        # Raise rather than exit: ai-server's worker calls this in-process and must be
+        # free to fall back to "largest person in frame" instead of dying.
+        raise RuntimeError(f"item detection failed: {e.read().decode()}") from e
     except (urllib.error.URLError, ConnectionError, OSError):
         print("  (item_detector service unreachable, loading the detector in-process instead)")
         import outfit_items
@@ -325,26 +327,93 @@ def _load_segmenter(device):
     return _segmenter_cache[key]
 
 
-def _reading_order(boxes):
+def _reading_order(items):
     """Group into rows first (two items in the same grid row are never vertically
     aligned to the pixel, so a plain sort by y interleaves the columns), then
-    left-to-right within each row."""
-    boxes = sorted(boxes, key=lambda b: b[1])
+    left-to-right within each row. items carry a "box" key."""
+    items = sorted(items, key=lambda it: it["box"][1])
     rows, current = [], []
-    for b in boxes:
-        if current and b[1] > min(c[3] for c in current):  # starts below every box in the row
+    for it in items:
+        # starts below every box in the row
+        if current and it["box"][1] > min(c["box"][3] for c in current):
             rows.append(current)
             current = []
-        current.append(b)
+        current.append(it)
     if current:
         rows.append(current)
-    return [b for row in rows for b in sorted(row, key=lambda b: b[0])]
+    return [it for row in rows for it in sorted(row, key=lambda it: it["box"][0])]
+
+
+def _split_into(blobs, k, lo, hi):
+    """Cut blobs into k consecutive bands along one axis at the k-1 widest gaps.
+
+    lo/hi pick the axis out of the box: (0, 2) for x, (1, 3) for y. The gap measured is
+    edge-to-edge (next box's near edge minus the widest far edge seen so far), not
+    centre-to-centre, so a tall item beside a short one in the same band doesn't read as
+    a gap. Returns None when there are fewer blobs than bands to fill."""
+    if k <= 1:
+        return [blobs]
+    if len(blobs) < k:
+        return None
+
+    order = sorted(blobs, key=lambda b: b["box"][lo])
+    gaps, edge = [], order[0]["box"][hi]
+    for i in range(1, len(order)):
+        gaps.append((order[i]["box"][lo] - edge, i))
+        edge = max(edge, order[i]["box"][hi])
+
+    cuts = sorted(i for _, i in sorted(gaps, key=lambda g: g[0], reverse=True)[:k - 1])
+    bands, prev = [], 0
+    for c in cuts:
+        bands.append(order[prev:c])
+        prev = c
+    bands.append(order[prev:])
+    return bands
+
+
+def _group_by_prompt_grid(blobs, n):
+    """Fold blobs down to exactly n items using the grid the prompt itself specified.
+
+    The generation prompt does not merely hope for a layout, it dictates one: n items in
+    ceil(n/2) rows of two, with a single centred item in the last row when n is odd (see
+    _grid_positions/_grid_shape_desc). So when more blobs are found than items were asked
+    for, the extra blobs are *parts* of items, and which parts belong together is a
+    question the grid already answers - cut into rows, cut each row into its cells, and
+    whatever lands in one cell is one item.
+
+    This replaces a distance threshold for that decision, which had run out of road: a
+    pair of sandals sat 11px apart on one generation while a shirt and the shorts beside
+    it sat 11px apart on another, so no gap value could separate "two halves of one item"
+    from "two different items". Position in the stated grid separates them exactly,
+    because those two cases differ in which *cell* they occupy, not in how close they are.
+
+    Returns None if the blobs cannot fill the grid (the model dropped a cell), leaving
+    the caller on its threshold-merged result and the item-count mismatch visible."""
+    row_sizes = [2] * (n // 2) + ([1] if n % 2 else [])
+    rows = _split_into(blobs, len(row_sizes), 1, 3)
+    if rows is None:
+        return None
+
+    cells = []
+    for row, size in zip(rows, row_sizes):
+        split = _split_into(row, size, 0, 2)
+        if split is None:
+            return None
+        cells.extend(split)
+
+    if len(cells) != n or any(not c for c in cells):
+        return None
+    return [{"ids": [i for b in cell for i in b["ids"]],
+             "box": (min(b["box"][0] for b in cell), min(b["box"][1] for b in cell),
+                     max(b["box"][2] for b in cell), max(b["box"][3] for b in cell))}
+            for cell in cells]
 
 
 @torch.no_grad()
-def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0.01):
-    """One box per item on the generated flat-mockup, from a class-agnostic
-    foreground segmentation.
+def _segment_items(image, device=None, expected=None, min_area_frac=0.002, merge_gap_frac=0.01):
+    """One (box, alpha) per item on the generated flat-mockup, from a class-agnostic
+    foreground segmentation. The alpha matte is what keeps a neighbouring item out of
+    this item's picture - see _isolate_on_background.
 
     The mockup is exactly the case this suits: plain background, items laid flat,
     never overlapping - so "which pixels are an item" is the whole question, and
@@ -363,25 +432,31 @@ def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0
     BiRefNet scored 9/9 on the same set at 100ms/image on GPU, and needs no score
     threshold at all, which is what removed that whole class of tuning problem.
 
-    merge_gap_frac exists because one *item* is not always one blob: a pair of
-    shoes is two, a bag with its strap coiled beside it can be two. 1% of the
-    short side sits between the within-item gap and the between-item one; 3% (the
-    value the connected-components version used) was measured merging a shirt
-    into the shorts next to it, which sat only 11px away on one generation.
+    One *item* is not always one blob: a pair of shoes is two, a bag with its strap
+    coiled beside it can be two. Two mechanisms put those back together, in order:
+
+      - merge_gap_frac, for blobs almost touching (1% of the short side). Kept
+        deliberately tight, because it cannot tell a split item from two close ones.
+      - expected, the item count the prompt asked for: when blobs still outnumber it,
+        _group_by_prompt_grid assigns them to the grid cells the prompt dictated,
+        which decides the ambiguous cases the gap alone cannot.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, transform = _load_segmenter(device)
 
     pred = model(transform(image).unsqueeze(0).to(device))[-1].sigmoid().cpu()[0, 0]
-    mask = Image.fromarray((pred.numpy() * 255).astype(np.uint8)).resize(image.size)
-    mask = (np.array(mask) > 127).astype(np.uint8)
+    soft = np.asarray(
+        Image.fromarray((pred.numpy() * 255).astype(np.uint8)).resize(image.size),
+        dtype=np.float32) / 255.0
+    binary = (soft > 0.5).astype(np.uint8)
 
-    h, w = mask.shape
-    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    boxes = [
-        (s[cv2.CC_STAT_LEFT], s[cv2.CC_STAT_TOP],
-         s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH], s[cv2.CC_STAT_TOP] + s[cv2.CC_STAT_HEIGHT])
-        for s in (stats[i].tolist() for i in range(1, n))
+    h, w = binary.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    groups = [
+        {"ids": [i], "box": (s[cv2.CC_STAT_LEFT], s[cv2.CC_STAT_TOP],
+                             s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH],
+                             s[cv2.CC_STAT_TOP] + s[cv2.CC_STAT_HEIGHT])}
+        for i, s in ((i, stats[i].tolist()) for i in range(1, n))
         if s[cv2.CC_STAT_AREA] >= min_area_frac * h * w
     ]
 
@@ -389,52 +464,77 @@ def _detect_item_boxes(image, device=None, min_area_frac=0.002, merge_gap_frac=0
     merged = True
     while merged:
         merged = False
-        for i in range(len(boxes)):
-            for j in range(i + 1, len(boxes)):
-                a, b = boxes[i], boxes[j]
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                a, b = groups[i]["box"], groups[j]["box"]
                 dx = max(0, max(a[0], b[0]) - min(a[2], b[2]))
                 dy = max(0, max(a[1], b[1]) - min(a[3], b[3]))
                 if dx <= gap and dy <= gap:
-                    boxes[i] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
-                    del boxes[j]
+                    groups[i] = {
+                        "ids": groups[i]["ids"] + groups[j]["ids"],
+                        "box": (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])),
+                    }
+                    del groups[j]
                     merged = True
                     break
             if merged:
                 break
 
-    return _reading_order(boxes)
+    if expected and len(groups) > expected:
+        regrouped = _group_by_prompt_grid(groups, expected)
+        if regrouped is not None:
+            print(f"  {len(groups)} regions -> {expected} items via the prompt's grid")
+            groups = regrouped
+
+    for g in groups:
+        x0, y0, x1, y1 = g["box"]
+        member = np.isin(labels[y0:y1, x0:x1], g["ids"]).astype(np.uint8)
+        # Grow 2px before applying the soft matte: connectedComponents only labels
+        # pixels over the 0.5 threshold, so an item's anti-aliased rim would be cut
+        # away and leave a hard, jagged edge. Items are laid out far further apart
+        # than this, so it cannot reach a neighbour.
+        member = cv2.dilate(member, np.ones((5, 5), np.uint8))
+        g["alpha"] = soft[y0:y1, x0:x1] * member
+
+    return _reading_order(groups)
 
 
-def _square_crop(img, box, pad_frac=0.08):
-    """Square crop centred on the item, padded with the background colour.
+def _isolate_on_background(img, box, alpha, bg, pad_frac=0.08):
+    """Lift one item off the grid by its alpha matte and re-composite it, centred, on a
+    freshly built background of its own.
 
-    Square because the classifier resizes to a fixed 224x224 without preserving aspect
-    ratio (magic_eye's val transform is a plain Resize((224, 224))): feeding it a tall
-    garment box directly would squash the garment horizontally, which is not what its
-    training images look like. Padding with the sampled background instead of cropping
-    to a square *inside* the item keeps the whole garment in frame and matches the
-    plain studio background the model was trained on."""
+    Cutting a square *region* out of the grid instead - the earlier approach - copies
+    whatever else falls inside that square. The square has to be as wide as the item is
+    tall, so for a narrow upright item it reaches well past the item's own cell: on
+    result_v4.png the left sandal's crop pulled in the entire right sandal, and both
+    "items" came out as a picture of the same pair. Compositing from the matte makes
+    the picture contain exactly one item by construction, whatever the neighbours do.
+
+    Square, and padded rather than cropped tight, because the classifier resizes to a
+    fixed 224x224 without preserving aspect ratio (magic_eye's val transform is a plain
+    Resize((224, 224))): a tall garment fed in at its own aspect ratio would come out
+    squashed horizontally, unlike anything in its training set. The rebuilt background
+    is a single flat colour sampled from the grid's own border, so it also drops the
+    faint vignetting the generator leaves behind."""
     x0, y0, x1, y1 = box
-    side = int(round(max(x1 - x0, y1 - y0) * (1 + 2 * pad_frac)))
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    left, top = int(round(cx - side / 2)), int(round(cy - side / 2))
+    a = alpha[..., None]
+    blended = img[y0:y1, x0:x1].astype(np.float32) * a + bg * (1.0 - a)
 
-    out = np.empty((side, side, 3), dtype=img.dtype)
-    out[:] = _background_color(img).astype(img.dtype)
-    # Intersection of the square with the image, copied into the same spot of the canvas.
-    sx0, sy0 = max(0, left), max(0, top)
-    sx1, sy1 = min(img.shape[1], left + side), min(img.shape[0], top + side)
-    out[sy0 - top:sy1 - top, sx0 - left:sx1 - left] = img[sy0:sy1, sx0:sx1]
-    return Image.fromarray(out)
+    h, w = blended.shape[:2]
+    side = int(round(max(h, w) * (1 + 2 * pad_frac)))
+    out = np.empty((side, side, 3), dtype=np.float32)
+    out[:] = bg
+    top, left = (side - h) // 2, (side - w) // 2
+    out[top:top + h, left:left + w] = blended
+    return Image.fromarray(out.round().clip(0, 255).astype(np.uint8))
 
 
 def crop_items(result_path, out_dir, items=None, device=None):
-    """Crop every item out of the generated grid into its own square PNG.
+    """Lift every item out of the generated grid into its own square PNG.
 
-    Each item's box comes from a class-agnostic foreground segmentation
-    (_detect_item_boxes), sized to that item alone; _square_crop then extends its
-    background out to a standard square so the classifier never sees a squashed
-    garment.
+    Each item is segmented from the grid class-agnostically (_segment_items) and then
+    re-composited, centred, onto a clean background of its own
+    (_isolate_on_background), so one output image holds exactly one item.
 
     items: the phrase list build_prompt() asked for, in grid order, used to name the
     crops. Only trusted when the number of items found matches the number asked for -
@@ -443,12 +543,13 @@ def crop_items(result_path, out_dir, items=None, device=None):
     result_img = Image.open(result_path).convert("RGB")
     img = np.array(result_img)
     t = time.time()
-    boxes = _detect_item_boxes(result_img, device=device)
+    found = _segment_items(result_img, device=device, expected=len(items) if items else None)
     print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
-    if items and len(items) != len(boxes):
-        print(f"  note: prompt asked for {len(items)} items but {len(boxes)} were found "
+    if items and len(items) != len(found):
+        print(f"  note: prompt asked for {len(items)} items but {len(found)} were found "
               f"in the result - falling back to positional names")
         items = None
+    bg = _background_color(img).astype(np.float32)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -459,13 +560,13 @@ def crop_items(result_path, out_dir, items=None, device=None):
         stale.unlink()
 
     crops = []
-    for i, box in enumerate(boxes):
+    for i, item in enumerate(found):
         label = items[i] if items else f"item {i + 1}"
         slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
         path = out_dir / f"{i + 1:02d}_{slug}.png"
-        crop = _square_crop(img, box)
+        crop = _isolate_on_background(img, item["box"], item["alpha"], bg)
         crop.save(path)
-        crops.append({"label": label, "path": path, "box": box, "size": crop.size})
+        crops.append({"label": label, "path": path, "box": item["box"], "size": crop.size})
     return crops
 
 
@@ -607,10 +708,14 @@ def main():
     else:
         print("Detecting worn items (fashion-object-detection + SAM)...")
         t_det = time.time()
-        detected = detect_worn_items(
-            image_path, selfie=selfie, threshold=threshold, face_threshold=face_threshold,
-            save_isolated_to=str(isolated_path),
-        )
+        try:
+            detected = detect_worn_items(
+                image_path, selfie=selfie, threshold=threshold, face_threshold=face_threshold,
+                save_isolated_to=str(isolated_path),
+            )
+        except RuntimeError as e:
+            print(e)
+            sys.exit(1)
         flags = ", ".join(f"{key}={detected.get(key)}" for key, _ in ITEM_PHRASES)
         print(f"  {flags} ({time.time() - t_det:.1f}s on {detected.get('device', '?')})")
         scores = detected.get("scores") or {}
