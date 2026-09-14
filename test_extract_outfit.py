@@ -379,25 +379,23 @@ def _reading_order(items):
     return [it for row in rows for it in sorted(row, key=lambda it: it["box"][0])]
 
 
-def _regions_within(labels, a, b, gap):
-    """True when a's and b's actual pixels come within `gap` of each other.
+def _region_distance(labels, a, b, cap):
+    """Smallest distance between a's and b's actual pixels, or inf past `cap`.
 
-    Measured on the gap between their *bounding boxes* instead, two items laid out
-    diagonally read as touching: on one real generation a shirt (x 39-595) and the
-    trousers beside it (x 545-775) overlapped in both axes, so the box gap was 0 and
-    they were merged into a single "item", even though the nearest pixel of one was
-    49px from the other and the grid was visually perfect. The box gap is a lower
-    bound on the pixel distance, so it still works as a cheap prefilter.
+    Measured between their *bounding boxes* instead, two items laid out diagonally read
+    as touching: a shirt at x 39-595 and the trousers beside it at x 545-775 overlapped
+    in both axes, so the box gap was 0. The box gap is a lower bound on the pixel
+    distance, which makes it a sound prefilter but a bad answer.
     """
     ba, bb = a["box"], b["box"]
     dx = max(0, max(ba[0], bb[0]) - min(ba[2], bb[2]))
     dy = max(0, max(ba[1], bb[1]) - min(ba[3], bb[3]))
-    if dx > gap or dy > gap:
-        return False
+    if dx > cap or dy > cap:
+        return float("inf")
 
     # Only the neighbourhood of the two regions matters, and cropping it keeps the
     # distance transform off the rest of the frame.
-    pad = int(np.ceil(gap)) + 2
+    pad = int(np.ceil(cap)) + 2
     x0 = max(0, min(ba[0], bb[0]) - pad); y0 = max(0, min(ba[1], bb[1]) - pad)
     x1 = min(labels.shape[1], max(ba[2], bb[2]) + pad)
     y1 = min(labels.shape[0], max(ba[3], bb[3]) + pad)
@@ -406,13 +404,74 @@ def _regions_within(labels, a, b, gap):
     mask_a = np.isin(sub, a["ids"])
     mask_b = np.isin(sub, b["ids"])
     if not mask_a.any() or not mask_b.any():
-        return False
+        return float("inf")
     dist = cv2.distanceTransform((~mask_a).astype(np.uint8), cv2.DIST_L2, 3)
-    return float(dist[mask_b].min()) <= gap
+    return float(dist[mask_b].min())
+
+
+def _merge_regions(groups, labels, expected, cap, gap):
+    """Put the pieces of one item back together without welding two items into one.
+
+    No distance alone can do this. Measured on real generations, the gap *within* one
+    item runs 3px (a shoe pair) to 18px (a bag beside its coiled strap), while the gap
+    *between* two different items runs 11px to 16px on the tighter layouts - the two
+    populations overlap, and a bag's own strap sits further away than a shirt does from
+    the trousers next to it.
+
+    What does separate them is how many items the prompt asked for, used as a *budget*:
+    merge the closest pair, and keep going only while there are more regions than items
+    asked for. `cap` still bounds it, so when the generator draws an item nobody asked
+    for, merging stops instead of welding two real garments together - that is the
+    failure an earlier version had, which forced the count by assigning regions to the
+    prompt's grid cells and merged a shirt into a skirt.
+
+    Over the 60 generations of three real jobs this raised the number whose region count
+    matches the prompt from 45 to 52, with none made worse.
+
+    With no expectation to work from (a grid passed in on its own), fall back to merging
+    everything within `gap`.
+    """
+    if not expected:
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(groups)):
+                for j in range(i + 1, len(groups)):
+                    if _region_distance(labels, groups[i], groups[j], gap) <= gap:
+                        groups[i] = _union(groups[i], groups[j])
+                        del groups[j]
+                        merged = True
+                        break
+                if merged:
+                    break
+        return groups
+
+    while len(groups) > expected:
+        best = None
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                d = _region_distance(labels, groups[i], groups[j], cap)
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        if best is None or best[0] > cap:
+            break
+        _, i, j = best
+        groups[i] = _union(groups[i], groups[j])
+        del groups[j]
+    return groups
+
+
+def _union(a, b):
+    ba, bb = a["box"], b["box"]
+    return {
+        "ids": a["ids"] + b["ids"],
+        "box": (min(ba[0], bb[0]), min(ba[1], bb[1]), max(ba[2], bb[2]), max(ba[3], bb[3])),
+    }
 
 
 @torch.no_grad()
-def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02):
+def _segment_items(image, device=None, expected=None, min_area_frac=0.002,
+                   merge_gap_frac=0.02, merge_cap_frac=0.03):
     """One (box, alpha) per item on the generated flat-mockup, from a class-agnostic
     foreground segmentation. The alpha matte is what keeps a neighbouring item out of
     this item's picture - see _isolate_on_background.
@@ -435,23 +494,9 @@ def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02)
     threshold at all, which is what removed that whole class of tuning problem.
 
     One *item* is not always one blob: a pair of shoes is two, a bag with its strap
-    coiled beside it can be two. Blobs whose pixels come within merge_gap_frac of the
-    short side of each other are merged back into one item (_regions_within - the
-    distance is between the regions themselves, not between their bounding boxes).
-    Measured edge-to-edge on six real generations, the two populations do not overlap:
-
-      within one item (shoe pairs)   0.34%, 0.91%, 1.25%
-      between two items (closest)    3.18%, 3.30%, 4.77%, 9.77%, 14.89%
-
-    2% sits between them with ~1.6x margin either way. They separate this cleanly
-    because the prompt demands "a wide gap of clear white space between them", so
-    between-item spacing is deliberate while a split item's is incidental.
-
-    An earlier attempt used the item count from the prompt instead, folding surplus
-    blobs into the grid cells the prompt laid out. That was wrong: the count is what
-    was *asked for*, not what was drawn, and the generator misses and adds items in
-    both directions. On a job where the detector found one garment and the generation
-    drew two, it merged a shirt and a skirt into a single "item".
+    coiled beside it can be two. _merge_regions puts those back together - see there for
+    why the item count the prompt asked for has to do the deciding and a distance
+    threshold cannot.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, transform = _load_segmenter(device)
@@ -472,23 +517,9 @@ def _segment_items(image, device=None, min_area_frac=0.002, merge_gap_frac=0.02)
         if s[cv2.CC_STAT_AREA] >= min_area_frac * h * w
     ]
 
-    gap = merge_gap_frac * min(w, h)
-    merged = True
-    while merged:
-        merged = False
-        for i in range(len(groups)):
-            for j in range(i + 1, len(groups)):
-                if _regions_within(labels, groups[i], groups[j], gap):
-                    a, b = groups[i]["box"], groups[j]["box"]
-                    groups[i] = {
-                        "ids": groups[i]["ids"] + groups[j]["ids"],
-                        "box": (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])),
-                    }
-                    del groups[j]
-                    merged = True
-                    break
-            if merged:
-                break
+    short = min(w, h)
+    groups = _merge_regions(groups, labels, expected,
+                            merge_cap_frac * short, merge_gap_frac * short)
 
     for g in groups:
         x0, y0, x1, y1 = g["box"]
@@ -547,7 +578,8 @@ def crop_items(result_path, out_dir, items=None, device=None):
     result_img = Image.open(result_path).convert("RGB")
     img = np.array(result_img)
     t = time.time()
-    found = _segment_items(result_img, device=device)
+    found = _segment_items(result_img, device=device,
+                           expected=len(items) if items else None)
     print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
     if items and len(items) != len(found):
         print(f"  note: prompt asked for {len(items)} items but {len(found)} were found "
