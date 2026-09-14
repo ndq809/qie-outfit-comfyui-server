@@ -5,6 +5,7 @@ consumes ai-server's results into the database.
 """
 import logging
 import threading
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -24,9 +25,43 @@ app = FastAPI(title="Wardrobe data-server (test)")
 @app.on_event("startup")
 def _startup():
     storage.ensure_buckets()
+    _upload_test_face_fixture()
     t = threading.Thread(target=run_result_consumer, daemon=True)
     t.start()
     log.info("result_consumer thread started")
+
+
+def _upload_test_face_fixture():
+    """wardrobe-system-spec.md §2.3.7. Uploaded rather than read from disk at job time
+    because the consumer is ai-server, which in production sits on another machine and
+    cannot see this filesystem. A missing file is a warning, not a crash — D0b then
+    falls back to the largest person in frame."""
+    configured = get_settings().test_fixed_face_ref_image
+    if not configured:
+        return
+    path = Path(configured)
+    if not path.is_file():
+        log.warning("TEST_FIXED_FACE_REF_IMAGE=%s not found; no shared test face reference", configured)
+        return
+    storage.upload_file(get_settings().minio_raw_bucket, storage.TEST_FIXTURE_FACE_KEY,
+                        path, content_type="image/jpeg")
+    log.info("test face fixture uploaded to %s from %s", storage.TEST_FIXTURE_FACE_KEY, configured)
+
+
+def _test_fixture_face_key() -> Optional[str]:
+    settings = get_settings()
+    if not settings.test_fixed_face_ref_image:
+        return None
+    if not storage.object_exists(settings.minio_raw_bucket, storage.TEST_FIXTURE_FACE_KEY):
+        return None
+    return storage.TEST_FIXTURE_FACE_KEY
+
+
+def _resolve_face_ref_key(account_id: str) -> Optional[str]:
+    """Account's own registration wins, then the shared test fixture, then nothing
+    (wardrobe-system-spec.md §2.3.7) — so configuring the fixture cannot change
+    production behaviour for an account that registered a face."""
+    return db.get_face_ref_key(account_id) or _test_fixture_face_key()
 
 
 # --- auth -------------------------------------------------------------------
@@ -59,6 +94,14 @@ class CreateJobRequest(BaseModel):
     uploadedItems: list[str]
 
 
+class FaceRefPresignRequest(BaseModel):
+    contentType: str = "image/jpeg"
+
+
+class FaceRefRegisterRequest(BaseModel):
+    objectKey: str
+
+
 # --- routes -------------------------------------------------------------------
 
 @app.post("/v1/uploads/presign")
@@ -79,6 +122,40 @@ def presign(req: PresignRequest, identity=Depends(current_account)):
     return {"batchId": batch_id, "items": out_items}
 
 
+@app.post("/v1/face-reference/presign")
+def face_reference_presign(req: FaceRefPresignRequest, identity=Depends(current_account)):
+    settings = get_settings()
+    key = storage.face_object_key(identity["account_id"], req.contentType)
+    return {
+        "objectKey": key,
+        "uploadUrl": storage.presign_put(settings.minio_raw_bucket, key, req.contentType,
+                                         settings.presign_expires_seconds),
+        "expiresAt": _expires_at(settings.presign_expires_seconds),
+    }
+
+
+@app.put("/v1/face-reference")
+def face_reference_register(req: FaceRefRegisterRequest, identity=Depends(current_account)):
+    settings = get_settings()
+    expected = storage.face_object_key(identity["account_id"], "image/jpeg").rsplit(".", 1)[0]
+    if not req.objectKey.startswith(expected):
+        raise HTTPException(status_code=400, detail="objectKey does not belong to this account")
+    # Recorded only once the bytes are actually there, so a failed upload can't leave
+    # every later job pointing at an empty key.
+    if not storage.object_exists(settings.minio_raw_bucket, req.objectKey):
+        raise HTTPException(status_code=400, detail="no object uploaded at that objectKey")
+    db.set_face_ref_key(identity["account_id"], req.objectKey)
+    return {"registered": True, "objectKey": req.objectKey, "source": "account"}
+
+
+@app.get("/v1/face-reference")
+def face_reference_get(identity=Depends(current_account)):
+    own = db.get_face_ref_key(identity["account_id"])
+    key = own or _test_fixture_face_key()
+    source = "account" if own else ("test-fixture" if key else None)
+    return {"registered": key is not None, "objectKey": key, "source": source}
+
+
 @app.post("/v1/jobs")
 def create_job(req: CreateJobRequest, identity=Depends(current_account)):
     rows = db.get_batch_items(req.batchId, req.uploadedItems)
@@ -87,8 +164,9 @@ def create_job(req: CreateJobRequest, identity=Depends(current_account)):
     items = [{"local_id": r["local_id"], "object_key": r["object_key"]} for r in rows]
     job = db.create_job(identity["account_id"], identity["user_id"], req.batchId, items)
     db.mark_job_processing_if_pending(job["jobId"])
+    face_ref_key = _resolve_face_ref_key(identity["account_id"])
     for it in items:
-        queue.push_job(job["jobId"], it["local_id"], it["object_key"])
+        queue.push_job(job["jobId"], it["local_id"], it["object_key"], face_ref_key=face_ref_key)
     return job
 
 

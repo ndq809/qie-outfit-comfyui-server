@@ -10,6 +10,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- D0b's reference face for this account (wardrobe-system-spec.md §2.3.7). NULL means
+-- fall back to TEST_FIXED_FACE_REF_IMAGE, then to "largest person in frame".
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS face_ref_key TEXT;
+
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id UUID NOT NULL REFERENCES accounts(id),

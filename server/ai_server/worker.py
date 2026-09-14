@@ -42,6 +42,7 @@ def run_worker_loop(stop_event=None):
 
 def _handle_ticket(ticket: dict):
     job_id, item_id, object_key = ticket["jobId"], ticket["itemId"], ticket["objectKey"]
+    face_ref_key = ticket.get("faceRefKey")
     retry_count = ticket.get("retryCount", 0)
 
     if queue.is_cancelled(job_id):
@@ -53,26 +54,28 @@ def _handle_ticket(ticket: dict):
     with tempfile.TemporaryDirectory(prefix="wardrobe_") as tmp:
         tmp_dir = Path(tmp)
         try:
-            garments = _process_image(job_id, item_id, object_key, tmp_dir, settings)
+            garments = _process_image(job_id, item_id, object_key, face_ref_key, tmp_dir, settings)
             queue.push_result(job_id, item_id, "success", garments=garments)
             log.info("job %s item %s done: %d garment(s)", job_id, item_id, len(garments))
         except Exception as exc:
             log.exception("processing failed for job %s item %s", job_id, item_id)
             if retry_count < settings.max_job_retries:
                 log.info("requeueing job %s item %s (retry %d)", job_id, item_id, retry_count + 1)
-                queue.push_job(job_id, item_id, object_key, retry_count=retry_count + 1)
+                queue.push_job(job_id, item_id, object_key, face_ref_key=face_ref_key,
+                               retry_count=retry_count + 1)
             else:
                 queue.push_dead(ticket)
                 queue.push_result(job_id, item_id, "failed", error_reason=str(exc)[:500])
 
 
-def _process_image(job_id: str, item_id: str, object_key: str, tmp_dir: Path, settings) -> list[dict]:
+def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str | None,
+                   tmp_dir: Path, settings) -> list[dict]:
     ext = Path(object_key).suffix or ".jpg"
     raw_path = tmp_dir / f"input{ext}"
     storage.download_to(settings.minio_raw_bucket, object_key, raw_path)
 
     isolated_path = tmp_dir / "isolated.png"
-    detected = pipeline.detect_worn_items(str(raw_path), save_isolated_to=str(isolated_path))
+    detected = _detect_with_face_ref(raw_path, face_ref_key, isolated_path, tmp_dir, settings)
     items = pipeline.prompt_items(detected)
     prompt = pipeline.build_prompt(detected)
 
@@ -112,6 +115,33 @@ def _process_image(job_id: str, item_id: str, object_key: str, tmp_dir: Path, se
             "textEmbedding": record["text_embedding"],
         })
     return garments
+
+
+def _detect_with_face_ref(raw_path: Path, face_ref_key: str | None, isolated_path: Path,
+                          tmp_dir: Path, settings) -> dict:
+    """D0b. The ticket carries only a key (wardrobe-system-spec.md §2.3.7) — where it
+    came from, a real registration or the test fixture, is data-server's business.
+
+    A reference that matches nobody in the photo is not a failure: the spec's fallback
+    is "largest person in frame", which is exactly what the detector does with no
+    reference at all, so retry that way rather than failing the ticket."""
+    selfie_path = None
+    if face_ref_key:
+        try:
+            selfie_path = str(storage.download_to(
+                settings.minio_raw_bucket, face_ref_key, tmp_dir / Path(face_ref_key).name))
+        except Exception:
+            log.warning("face reference %s could not be fetched; using largest person in frame",
+                        face_ref_key)
+
+    if selfie_path:
+        try:
+            return pipeline.detect_worn_items(
+                str(raw_path), selfie=selfie_path, save_isolated_to=str(isolated_path))
+        except Exception as exc:
+            log.info("no face matched the reference (%s); using largest person in frame", exc)
+
+    return pipeline.detect_worn_items(str(raw_path), save_isolated_to=str(isolated_path))
 
 
 def _drop_same_image_duplicates(records: list[dict]) -> list[dict]:

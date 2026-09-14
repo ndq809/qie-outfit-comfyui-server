@@ -21,6 +21,11 @@ class Settings(BaseSettings):
 
     # object-storage (MinIO, S3-compatible)
     minio_endpoint: str = "127.0.0.1:9000"
+    # Host:port Mobile reaches storage on. Presigned URLs are signed for this host
+    # (SigV4 covers Host), while both servers keep using minio_endpoint for their own
+    # traffic — on the test box that keeps internal reads off the public edge, which
+    # would reject them for lack of the vast.ai edge token. Empty = same as internal.
+    minio_public_endpoint: str = ""
     minio_access_key: str = ""
     minio_secret_key: str = ""
     minio_raw_bucket: str = "wardrobe-raw"
@@ -47,6 +52,10 @@ class Settings(BaseSettings):
     presign_expires_seconds: int = 900
     read_url_expires_seconds: int = 3600
 
+    # Test-only shared face reference (wardrobe-system-spec.md §2.3.7).
+    # MUST be empty in production.
+    test_fixed_face_ref_image: str = ""
+
     @property
     def postgres_dsn(self) -> str:
         return (
@@ -58,6 +67,10 @@ class Settings(BaseSettings):
     @property
     def minio_url(self) -> str:
         return f"http://{self.minio_endpoint}"
+
+    @property
+    def minio_public_url(self) -> str:
+        return f"http://{self.minio_public_endpoint or self.minio_endpoint}"
 
     @property
     def redis_kwargs(self) -> dict:

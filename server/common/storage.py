@@ -24,6 +24,22 @@ def s3_client():
     )
 
 
+def _to_public(url: str) -> str:
+    """Swap the internal endpoint for the public one in an already-signed URL.
+
+    Deliberately a text swap rather than signing against the public address: the
+    vast.ai Caddy edge in front of storage rewrites Host to its upstream
+    (`header_up Host {upstream_hostport}`), so MinIO verifies SigV4 against the
+    *internal* host no matter what the client sent. Signing for the public address
+    therefore fails with SignatureDoesNotMatch. MINIO_ENDPOINT must match the
+    upstream Caddy dials, host included.
+    """
+    s = get_settings()
+    if not s.minio_public_endpoint:
+        return url
+    return url.replace(s.minio_url, s.minio_public_url, 1)
+
+
 def ensure_buckets():
     s = get_settings()
     client = s3_client()
@@ -36,6 +52,16 @@ def ensure_buckets():
 def raw_object_key(account_id: str, batch_id: str, local_id: str, content_type: str) -> str:
     ext = _ext_from_content_type(content_type)
     return f"raw/{account_id}/{batch_id}/{local_id}{ext}"
+
+
+# Deliberately outside the face/<account_id>/ namespace: this one image is shared by
+# every account in the test environment, so it must never be mistaken for one a real
+# user registered (wardrobe-system-spec.md §2.3.7).
+TEST_FIXTURE_FACE_KEY = "face/_test_fixture/reference.jpg"
+
+
+def face_object_key(account_id: str, content_type: str) -> str:
+    return f"face/{account_id}/reference{_ext_from_content_type(content_type)}"
 
 
 def item_object_key(job_id: str, item_id: str, index: int) -> str:
@@ -56,19 +82,27 @@ def _ext_from_content_type(content_type: str) -> str:
 
 
 def presign_put(bucket: str, key: str, content_type: str, expires: int) -> str:
-    return s3_client().generate_presigned_url(
+    return _to_public(s3_client().generate_presigned_url(
         "put_object",
         Params={"Bucket": bucket, "Key": key, "ContentType": content_type},
         ExpiresIn=expires,
-    )
+    ))
 
 
 def presign_get(bucket: str, key: str, expires: int) -> str:
-    return s3_client().generate_presigned_url(
+    return _to_public(s3_client().generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires,
-    )
+    ))
+
+
+def object_exists(bucket: str, key: str) -> bool:
+    try:
+        s3_client().head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
 
 
 def download_to(bucket: str, key: str, dest: Path) -> Path:

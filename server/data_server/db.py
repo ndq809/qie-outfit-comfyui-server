@@ -41,6 +41,18 @@ def lookup_token(token: str):
         return (str(row[0]), str(row[1])) if row else None
 
 
+def get_face_ref_key(account_id: str) -> str | None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT face_ref_key FROM accounts WHERE id = %s", (account_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_face_ref_key(account_id: str, key: str):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE accounts SET face_ref_key = %s WHERE id = %s", (key, account_id))
+
+
 def create_upload_batch(account_id: str, user_id: str) -> str:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(

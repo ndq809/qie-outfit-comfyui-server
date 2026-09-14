@@ -26,9 +26,10 @@ def redis_client() -> redis.Redis:
     return _client
 
 
-def push_job(job_id: str, item_id: str, object_key: str, retry_count: int = 0):
+def push_job(job_id: str, item_id: str, object_key: str, face_ref_key: str = None, retry_count: int = 0):
     redis_client().lpush(JOB_QUEUE, json.dumps({
         "jobId": job_id, "itemId": item_id, "objectKey": object_key,
+        "faceRefKey": face_ref_key,
         "retryCount": retry_count,
     }))
 

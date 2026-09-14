@@ -3,7 +3,9 @@
 utils=/opt/supervisor-scripts/utils
 . "${utils}/logging.sh"
 . "${utils}/environment.sh"
-. "${utils}/exit_portal.sh" "ComfyUI"
+# No exit_portal guard: in the server deployment ComfyUI is D1's engine, reachable
+# only by ai-server on 127.0.0.1. Only data-server is published externally
+# (wardrobe-system-spec.md §2.3.4), so there is no /etc/portal.yaml entry to gate on.
 
 source /venv/main/bin/activate
 export HF_HOME="${HF_HOME:-${WORKSPACE:-/workspace}/.hf_home}"

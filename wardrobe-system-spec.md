@@ -18,6 +18,7 @@ Lưu ý về ba thay đổi so với thiết kế gốc, đã phản ánh trong 
   - [2.1 Kiến trúc chung](#21-kiến-trúc-chung)
   - [2.2 Triển khai Production](#22-triển-khai-production)
   - [2.3 Triển khai Test (1 máy vast.ai)](#23-triển-khai-test-1-máy-vastai)
+    - [2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)
   - [2.4 Giấy phép model/dữ liệu](#24-giấy-phép-modeldữ-liệu)
 - [Phần 3 — API Spec](#phần-3--api-spec)
   - [3.1 Data server API](#31-data-server-api)
@@ -212,12 +213,15 @@ python3 test_extract_outfit.py --lightning4 --fp8 <ảnh_gốc>
 
 Prompt được sinh tự động từ danh sách của D0b, sắp các món vào lưới đánh số rõ ràng (`row 1 left`, `row 1 right`, ...) kèm khai báo kích thước lưới, để mỗi món nằm gọn một ô với khoảng trắng rộng ở giữa. Các bài học chỉnh prompt (ngắn gọn thắng dài dòng, mô tả thắng mệnh lệnh, không bao giờ nhắc tên loại chưa xác nhận) nằm ở mục "Prompt-tuning notes" của README — nên đọc trước khi sửa prompt.
 
-**D1 — bước crop không cần thêm model.** Vì prompt đã yêu cầu nền trắng phẳng, các món cách xa nhau, không chạm/không chồng nhau, nên chỉ cần phân tích thành phần liên thông trên mặt nạ khác-nền là đủ và chính xác. Bốn điểm đã phải xử lý:
+**D1 — bước crop không cần thêm model.** Vì prompt đã yêu cầu nền trắng phẳng, các món cách xa nhau, không chạm/không chồng nhau, nên chỉ cần phân tích thành phần liên thông trên mặt nạ khác-nền là đủ và chính xác. Bảy điểm đã phải xử lý:
 
 - Nền là gần-trắng chứ không phải `#ffffff` (ảnh mẫu đo được `(245, 245, 244)`), nên màu nền được **lấy mẫu từ viền ảnh**; so với `#ffffff` cứng thì toàn bộ nền bị coi là tiền cảnh.
-- Một *món* không phải lúc nào cũng là một vùng liên thông: đôi dép là hai vùng, túi có quai cuộn bên cạnh cũng có thể là hai. Các vùng cách nhau dưới 3% cạnh ngắn được gộp lại — trên ảnh mẫu, dép-với-dép cách ~14 px trong khi áo-với-quần cách ~50 px và hàng-với-hàng ~124 px, nên ngưỡng này nằm giữa hai thang đo rất rộng.
+- Một *món* không phải lúc nào cũng là một vùng liên thông: đôi dép là hai vùng, túi có quai cuộn bên cạnh cũng có thể là hai. Ghép lại bằng **hai cơ chế nối tiếp**: (1) các vùng cách nhau dưới 1% cạnh ngắn được gộp thẳng; (2) nếu số vùng vẫn nhiều hơn số món prompt yêu cầu thì **gán các vùng vào đúng ô lưới mà prompt đã quy định**, vùng nào chung ô là một món.
+- **Khoảng cách pixel một mình không đủ để quyết định** — đã đo: đôi dép cách nhau 11px ở một lần sinh, còn áo với quần cũng cách nhau đúng 11px ở lần khác, nên không ngưỡng nào tách được hai trường hợp. Khác biệt giữa chúng không nằm ở khoảng cách mà ở **ô lưới**, mà lưới thì prompt đã nói rõ từ trước (`ceil(n/2)` hàng × 2 cột, hàng cuối 1 món ở giữa nếu n lẻ): cắt hàng ở các khe dọc rộng nhất, cắt mỗi hàng ở khe ngang rộng nhất. Trên `result_v4.png`, cách này gộp 5 vùng về đúng 4 món, trả đôi dép về **một tấm ảnh cả đôi** thay vì hai tấm mỗi tấm một chiếc. Nếu số vùng không đủ lấp lưới (model bỏ sót một ô) thì bỏ qua bước gán, để chênh lệch số món hiện ra thay vì che đi.
 - Thứ tự đọc theo hàng (gom hàng trước, rồi trái→phải trong hàng); sắp xếp thẳng theo tọa độ `y` sẽ đan xen hai cột.
-- Crop ra **ảnh vuông, đệm bằng chính màu nền** chứ không cắt vào món đồ, vì D3 resize cứng về 224×224 không giữ tỉ lệ — đưa thẳng box cao vào sẽ bóp méo trang phục theo chiều ngang.
+- **Không cắt một vùng vuông ra khỏi lưới, mà tách món đồ theo mặt nạ rồi dựng lại nền mới.** Cắt theo vùng thì mọi thứ nằm trong ô vuông đó đều bị lấy theo: cạnh ô vuông phải bằng chiều *cao* của món, nên với món cao và hẹp nó với sang tận ô bên cạnh — đo trên `result_v4.png`, crop của chiếc dép trái nuốt trọn chiếc dép phải và cả hai "món" đều ra cùng một tấm ảnh đôi dép. Tách theo mặt nạ thì mỗi ảnh chứa đúng một món, bất kể hàng xóm nằm sát đến đâu.
+- Ảnh ra là **hình vuông, món đồ nằm giữa, nền đệm bằng chính màu nền đã lấy mẫu**, vì D3 resize cứng về 224×224 không giữ tỉ lệ — đưa thẳng box cao vào sẽ bóp méo trang phục theo chiều ngang. Nền dựng lại là một màu phẳng nên cũng xoá luôn vệt tối nhẹ ở rìa mà model sinh ảnh để lại.
+- Mặt nạ được **nở thêm 2px trước khi nhân với mặt nạ mềm**: thành phần liên thông chỉ gán nhãn cho pixel vượt ngưỡng 0.5, bỏ nguyên viền răng cưa của món đồ, cắt thẳng sẽ ra mép cứng và gãy. Các món cách nhau xa hơn thế rất nhiều nên 2px không thể chạm sang món bên cạnh.
 
 Nếu số món tìm được **khác** số món prompt yêu cầu, tên crop lùi về đánh số theo vị trí thay vì gán nhãn sai. Worker nên **log lại chênh lệch này**: đó là tín hiệu chất lượng cho biết lần sinh ảnh đó có vấn đề (thiếu món hoặc thừa món), hữu ích để quyết định thử lại với seed khác.
 
@@ -346,8 +350,51 @@ Không có autoscale GPU thật vì chỉ có một máy; nếu muốn giả l�
 4. Khởi tạo lần lượt postgres-db, object-storage, queue — gán đúng IP tĩnh cho từng container, kiểm tra từng dịch vụ chạy healthy trước khi sang bước tiếp theo.
 5. Build và chạy ai-server, cấu hình trỏ tới IP của object-storage và queue theo bảng 2.3.2; xác nhận container nhận diện đúng GPU của máy. Image của ai-server cần có sẵn: ComfyUI + các checkpoint/LoRA của D1, bộ nhận diện của D0b, và bộ trọng số phân loại của D3 (`models/magic_eye/`, lấy qua `git lfs pull` lúc build — nếu quên, file `.pt` chỉ là con trỏ LFS và bước D3 sẽ báo lỗi rõ ràng). Danh sách đầy đủ ở mục "Models required" của [README.md](README.md). Nếu chỉ có một GPU dùng chung cho D1 và D0b, đặt `OUTFIT_ITEMS_DEVICE=cpu` cho bộ nhận diện để không tranh VRAM với ComfyUI.
 6. Build và chạy data-server, cấu hình trỏ tới IP của postgres-db, object-storage, queue; map port ra IP public của vast.ai.
-7. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
-8. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
+7. Đặt `TEST_FIXED_FACE_REF_IMAGE` trỏ tới ảnh khuôn mặt dùng chung cho môi trường test ([2.3.7](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)); xác nhận log khởi động của data-server báo đã nạp được, và `GET /v1/face-reference` trả `source: "test-fixture"`. Bỏ qua bước này nếu muốn test đúng luồng đăng ký khuôn mặt của Production.
+8. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
+9. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
+
+#### 2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)
+
+D0b cần một ảnh khuôn mặt tham chiếu để biết người nào trong ảnh nhóm là chủ tài khoản
+(xem [2.1](#21-kiến-trúc-chung), bước D0b). Ở Production ảnh này do chính user cung cấp
+lúc đăng ký khuôn mặt. Ở môi trường Test, để rút ngắn vòng lặp thử nghiệm, **server cố
+định sẵn một ảnh dùng chung cho mọi account** — client không cần upload ảnh khuôn mặt,
+và bắt đầu thẳng từ `POST /v1/uploads/presign`.
+
+Cấu hình bằng một biến môi trường duy nhất của data-server:
+
+```
+TEST_FIXED_FACE_REF_IMAGE=/workspace/qie-outfit-comfyui-server/face-image/selfie.jpg
+```
+
+Cách hoạt động:
+
+1. Lúc khởi động, data-server đọc file này và **upload lên object-storage** một lần vào
+   key cố định `face/_test_fixture/reference.jpg`. Phải upload chứ không đọc thẳng từ đĩa
+   lúc chạy job, vì bên tiêu thụ là ai-server — ở Production nó nằm trên máy khác, không
+   nhìn thấy filesystem của data-server.
+2. Khi tạo job, data-server lấy `face_ref_key` theo thứ tự ưu tiên:
+   **ảnh của chính account** (nếu đã đăng ký qua `/v1/face-reference`) → **ảnh cố định
+   này** → không có gì. Giá trị chọn được gắn vào trường `faceRefKey` của vé việc như
+   bình thường (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
+3. ai-server không biết và không cần biết ảnh đó từ đâu ra — nó chỉ thấy một `faceRefKey`
+   trong vé việc và tải về từ object-storage, **đúng như luồng Production**. Không có
+   nhánh code riêng cho Test ở phía ai-server.
+
+Ba điểm cần lưu ý:
+
+- **Key nằm ngoài namespace `face/<account_id>/`** vì ảnh này không thuộc account nào và
+  được mọi account dùng chung — để không bao giờ bị nhầm là ảnh do user thật đăng ký.
+- **Ảnh của account vẫn thắng.** Biến này chỉ là giá trị lùi, nên hành vi Production
+  không đổi khi không cấu hình nó. `GET /v1/face-reference` trả thêm trường `source`
+  (`"account"` / `"test-fixture"` / `null`) để biết cái nào đang thực sự có hiệu lực.
+- **File thiếu không làm sập server**: chỉ ghi cảnh báo vào log rồi bỏ qua, D0b lùi về
+  suy đoán "người lớn nhất khung hình" — cùng hành vi như khi không cấu hình gì.
+
+**Bắt buộc bỏ trống `TEST_FIXED_FACE_REF_IMAGE` ở Production.** Để nguyên nghĩa là mọi
+user chưa đăng ký khuôn mặt đều bị đối chiếu với khuôn mặt của một người lạ, và wardrobe
+sẽ chứa quần áo của người đó.
 
 ### 2.4 Giấy phép model/dữ liệu
 
