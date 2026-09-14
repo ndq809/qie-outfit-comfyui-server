@@ -16,6 +16,14 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from PIL import Image
+
+# The page shows a downscaled copy and links to the file itself. A phone original is
+# ~7MB, so a dozen photos would otherwise be a ~100MB page for images displayed a few
+# hundred pixels wide.
+PREVIEW_MAX_PX = 1000
+THUMB_SUFFIX = ".preview.jpg"
+
 STAGE_ORIGINAL = "01_original"
 STAGE_ISOLATED = "02_isolated.png"
 STAGE_GRID = "03_grid.png"
@@ -32,11 +40,11 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
     out = Path(report_dir) / job_id / _safe(item_id)
     (out / ITEMS_DIR).mkdir(parents=True, exist_ok=True)
 
-    shutil.copyfile(original, out / f"{STAGE_ORIGINAL}{original.suffix.lower() or '.jpg'}")
+    _keep(original, out / f"{STAGE_ORIGINAL}{original.suffix.lower() or '.jpg'}")
     if isolated is not None and isolated.exists():
-        shutil.copyfile(isolated, out / STAGE_ISOLATED)
+        _keep(isolated, out / STAGE_ISOLATED)
     if grid.exists():
-        shutil.copyfile(grid, out / STAGE_GRID)
+        _keep(grid, out / STAGE_GRID)
 
     by_name = {r["image_name"]: r for r in records}
     items = []
@@ -70,6 +78,22 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
     return out
 
 
+def _keep(src: Path, dest: Path):
+    """Store the file as-is, plus a downscaled JPEG beside it for the page to display."""
+    shutil.copyfile(src, dest)
+    try:
+        with Image.open(src) as im:
+            im = im.convert("RGB")
+            im.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX))
+            im.save(dest.with_suffix(dest.suffix + THUMB_SUFFIX), quality=82, optimize=True)
+    except Exception:
+        pass  # page falls back to the full file
+
+
+def _preview_or_self(dir_path: Path, name: str) -> str:
+    return name + THUMB_SUFFIX if (dir_path / (name + THUMB_SUFFIX)).exists() else name
+
+
 def _safe(name: str) -> str:
     return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)[:120]
 
@@ -85,11 +109,16 @@ def build_index(report_dir: str) -> Path:
             data = json.loads(rec_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        data["_dir"] = rec_path.parent.relative_to(root).as_posix()
+        here = rec_path.parent
+        data["_dir"] = here.relative_to(root).as_posix()
         data["_original"] = next(
-            (p.name for p in sorted(rec_path.parent.glob(f"{STAGE_ORIGINAL}.*"))), None)
-        data["_isolated"] = STAGE_ISOLATED if (rec_path.parent / STAGE_ISOLATED).exists() else None
-        data["_grid"] = STAGE_GRID if (rec_path.parent / STAGE_GRID).exists() else None
+            (p.name for p in sorted(here.glob(f"{STAGE_ORIGINAL}.*"))
+             if not p.name.endswith(THUMB_SUFFIX)), None)
+        data["_isolated"] = STAGE_ISOLATED if (here / STAGE_ISOLATED).exists() else None
+        data["_grid"] = STAGE_GRID if (here / STAGE_GRID).exists() else None
+        for key in ("_original", "_isolated", "_grid"):
+            data[key + "_preview"] = (
+                _preview_or_self(here, data[key]) if data.get(key) else None)
         photos.append(data)
 
     photos.sort(key=lambda d: (d.get("at") or "", d["_dir"]), reverse=True)
@@ -186,13 +215,11 @@ def _photo_card(p: dict) -> str:
     if asked:
         chips.append(_chip("asked", f'{len(asked)} &rarr; got {len(p.get("items", []))}'))
 
-    isolated = (f'<img src="{d}/{p["_isolated"]}" alt="isolated subject" loading="lazy">'
-                if p.get("_isolated") else
-                '<div class="na">not isolated<br>(single person in frame)</div>')
-    grid = (f'<img src="{d}/{p["_grid"]}" alt="generated grid" loading="lazy">'
-            if p.get("_grid") else '<div class="na">no grid</div>')
-    original = (f'<img src="{d}/{p["_original"]}" alt="original photo" loading="lazy">'
-                if p.get("_original") else '<div class="na">no original</div>')
+    isolated = _stage_img(d, p, "_isolated", "isolated subject") or \
+        '<div class="na">not isolated<br>(single person in frame)</div>'
+    grid = _stage_img(d, p, "_grid", "generated grid") or '<div class="na">no grid</div>'
+    original = _stage_img(d, p, "_original", "original photo") or \
+        '<div class="na">no original</div>'
 
     items = "".join(_item_tile(d, it) for it in p.get("items", [])) or \
         '<div class="na">no items extracted</div>'
@@ -212,6 +239,16 @@ def _photo_card(p: dict) -> str:
 <div class="chips">{"".join(chips)}</div>
 <details><summary>D1 prompt</summary><pre>{html.escape(p.get("prompt") or "")}</pre></details>
 </section>"""
+
+
+def _stage_img(d: str, p: dict, key: str, alt: str) -> str:
+    """Displayed small, linked to the file itself for a full-size look."""
+    full = p.get(key)
+    if not full:
+        return ""
+    shown = p.get(key + "_preview") or full
+    return (f'<a href="{d}/{full}" target="_blank" rel="noopener">'
+            f'<img src="{d}/{shown}" alt="{alt}" loading="lazy"></a>')
 
 
 def _item_tile(d: str, it: dict) -> str:

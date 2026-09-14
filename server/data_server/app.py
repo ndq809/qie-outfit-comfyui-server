@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from server.common import queue, storage
@@ -22,10 +23,38 @@ log = logging.getLogger("data-server")
 app = FastAPI(title="Wardrobe data-server (test)")
 
 
+def _mount_test_report():
+    """Serve WARDROBE_REPORT_DIR at /report (test only).
+
+    It has to be served from here rather than read off disk through some other service:
+    the page is HTML with relative <img> paths, and a browser sends no Authorization
+    header for those, so whatever serves it must authorise them another way. Behind the
+    vast.ai Caddy edge that works out - one visit to /report/?token=... makes Caddy set
+    the instance auth cookie, and every image request then carries it. (Jupyter's
+    /files/ endpoint cannot do this: it sends `Content-Security-Policy: sandbox`, which
+    puts the page in an opaque origin where no cookie is sent, so every image 302s to
+    its login page.)
+
+    No app bearer token is required, for the same reason - an <img> cannot send one. The
+    edge token is the only thing gating it, which is why this stays test-only: the
+    report contains the user's original photos.
+    """
+    configured = get_settings().wardrobe_report_dir
+    if not configured:
+        return
+    path = Path(configured)
+    if not path.is_dir():
+        log.warning("WARDROBE_REPORT_DIR=%s does not exist yet; /report not mounted", configured)
+        return
+    app.mount("/report", StaticFiles(directory=path, html=True), name="report")
+    log.info("test extraction report mounted at /report from %s", configured)
+
+
 @app.on_event("startup")
 def _startup():
     storage.ensure_buckets()
     _upload_test_face_fixture()
+    _mount_test_report()
     t = threading.Thread(target=run_result_consumer, daemon=True)
     t.start()
     log.info("result_consumer thread started")

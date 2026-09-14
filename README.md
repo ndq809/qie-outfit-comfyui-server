@@ -158,9 +158,18 @@ instead, with an HTML page rebuilt after each photo:
 
 ```bash
 echo 'WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_out' >> ${WORKSPACE:-/workspace}/.env
-supervisorctl restart ai-server
-# then run a job; open <dir>/index.html
+supervisorctl restart ai-server data-server
+# then run a job and open, on the data-server port:
+#   http://$PUBLIC_IPADDR:$VAST_TCP_PORT_10100/report/?token=$OPEN_BUTTON_TOKEN
 ```
+
+data-server serves it at `/report` when the variable is set, and that is the only route
+that works: the page uses relative `<img>` paths, and a browser sends no `Authorization`
+header for those. Visiting `/report/?token=…` once makes the Caddy edge set the instance
+auth cookie, which every image request then carries. Opening the same file through
+Jupyter's `/files/` endpoint looks like it works but every image 302s to its login page —
+Jupyter sends `Content-Security-Policy: sandbox`, which puts the page in an opaque origin
+where no cookie is sent.
 
 Each photo gets a card showing **original → SAM-isolated subject → generated grid →
 per-item crops**, plus what the detector found, the subject's gender, the face-match
