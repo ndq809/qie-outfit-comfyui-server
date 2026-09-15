@@ -222,7 +222,29 @@ def _box_inside_frac(box, person_box):
     return inter / area if area > 0 else 0.0
 
 
-def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes):
+def _owned_by_subject(item_box, target_box, person_boxes):
+    """Món này có phải của chủ thể không, khi nhiều người cùng chứa nó.
+
+    "Nằm >= 80% trong box chủ thể" một mình là không đủ: trong ảnh selfie, người chụp ở
+    tiền cảnh có box choán 42% khung hình và NUỐT TRỌN người đứng sau. Đo trên ảnh thật,
+    chiếc áo polo của người phía sau nằm 100% trong box chủ thể - nên bị hợp vào mask,
+    sống sót qua bước bôi xám, và D1 vẽ lại áo của NGƯỜI KHÁC vào tủ đồ của chủ thể.
+
+    Chủ sở hữu là người có box NHỎ NHẤT còn chứa được món đồ - cùng nguyên tắc
+    "box ôm sát nhất thắng" mà match_face_to_person_box() dùng. Cái áo polo đó nằm 91.5%
+    trong box của người kia (17% khung hình), nhỏ hơn hẳn box chủ thể, nên thuộc về anh
+    ta; còn áo và túi của chính chủ thể chỉ đạt 24-27% trong box người kia nên không bị
+    cướp.
+    """
+    owners = [b for b in person_boxes
+              if _box_inside_frac(item_box, b) >= ITEM_INSIDE_PERSON_FRAC]
+    if not owners:
+        return False
+    return min(owners, key=_box_area) == target_box
+
+
+def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
+                  person_boxes=None):
     """Pixel mask of the subject INCLUDING the things they are wearing/carrying.
 
     SAM prompted with a person box returns only the PERSON. Anything carried is a
@@ -235,16 +257,16 @@ def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes):
     isolated image against 0.6758 on the original.
 
     Fix: the caller runs the garment detector on the ORIGINAL image first and
-    passes its boxes in here. Every box that lies inside the subject's person box
-    is segmented too, and those masks are unioned into the person's - so the bag
-    survives the background paint. Boxes belonging to someone else fail the
-    containment test and are left out.
+    passes its boxes in here. Every box the subject owns (_owned_by_subject) is
+    segmented too and unioned into the person's mask - so the bag survives the
+    background paint, while another person's clothes do not.
 
     All the prompts go in a single batched SAM call: the expensive part is the ViT
     image encoder over the whole frame, and the mask decoder per extra box is
     cheap. Measured (CPU, 3024x4032): 1 box 2.46s, 5 boxes batched 2.78s, but 5
     boxes as separate calls 12.25s."""
-    inside = [b for b in item_boxes if _box_inside_frac(b, target_box) >= ITEM_INSIDE_PERSON_FRAC]
+    people = person_boxes or [target_box]
+    inside = [b for b in item_boxes if _owned_by_subject(b, target_box, people)]
     masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE)
     mask = binary_fill_holes(masks[0])
     for item_mask in masks[1:]:
@@ -322,7 +344,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         timing["fashion_detect_locate"] = time.time() - t
         t = time.time()
         mask = _subject_mask(sam_model, sam_processor, image, target_box,
-                             [d["box"] for d in pre])
+                             [d["box"] for d in pre], person_boxes)
         timing["sam_segment"] = time.time() - t
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
