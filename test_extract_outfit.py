@@ -173,14 +173,14 @@ def prompt_items(detected):
     """The item list the prompt asks for, in grid order (row-major). Split out of
     build_prompt() because the crop step needs the same list to label the crops it
     cuts out of the result: cell k of the generated grid holds items[k]."""
-    items = [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
-    if not items:
-        # The detector localised nothing at all (bad crop, heavy occlusion, threshold
-        # too high). Emitting a prompt with an empty item list would be malformed, so
-        # fall back to the two garments any clothed person is wearing - this is the one
-        # place presence is assumed rather than detected.
-        items = [dict(ITEM_PHRASES)["top"], dict(ITEM_PHRASES)["bottom"]]
-    return items
+    # No fallback that invents an outfit. This used to assume "top + bottom" whenever
+    # the detector found nothing, and on 47 real photos all 5 that hit it came back with
+    # a pair of jeans nobody was wearing - every one of them a head-and-shoulders
+    # portrait with no lower body in frame at all. The detector is right to return
+    # nothing there; clothing.py now offers its best below-threshold upper-body
+    # candidate instead (_last_resort_upper_body), and if even that is empty the honest
+    # answer is no items, which callers must handle.
+    return [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
 
 
 def build_prompt(detected):
@@ -762,6 +762,9 @@ def main():
         if d0b_timing:
             print("  [D0b model timing] " + ", ".join(f"{k}={v}s" for k, v in d0b_timing.items()))
         items = prompt_items(detected)
+        if not items:
+            print("  no garment detected on the subject - nothing to extract")
+            sys.exit(0)
         prompt = build_prompt(detected)
 
         # More than one person in the photo: the extraction model would otherwise see

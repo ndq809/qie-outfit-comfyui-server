@@ -78,6 +78,12 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
     isolated_path = tmp_dir / "isolated.png"
     detected = _detect_with_face_ref(raw_path, face_ref_key, isolated_path, tmp_dir, settings)
     items = pipeline.prompt_items(detected)
+    if not items:
+        # Nothing was found on the subject - a head-and-shoulders portrait, or a crop
+        # where no garment is visible. Reporting no garments is the honest answer, and
+        # it saves ~20s of generation that would only invent an outfit.
+        log.info("job %s item %s: no garment detected, nothing to extract", job_id, item_id)
+        return []
     prompt = pipeline.build_prompt(detected)
 
     generation_image_path = str(raw_path)

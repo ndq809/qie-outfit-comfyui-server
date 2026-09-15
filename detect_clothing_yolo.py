@@ -123,6 +123,8 @@ DRESS_PAIR_FLOOR = 0.35
 # được 0.337, trượt cả AMBIGUOUS_FLOOR=0.35 đúng 0.013.
 # Cộng lại là cách dựng lại xác suất "vùng này LÀ một món đồ", trước khi so ngưỡng.
 POOLED_LABEL_GROUP = ("top", "outer", "dress")
+# Món quần áo thật sự, khác với phụ kiện (bag/shoes/hat).
+GARMENT_LABELS = ("top", "outer", "dress", "bottom")
 # Cộng điểm chỉ xảy ra khi model ĐANG PHÂN VÂN - mọi nhãn đều thấp và chia đều nhau -
 # nên trong vùng đó cái argmax chỉ là nhiễu: đo trên ảnh thật, "outer" thắng "top"
 # đúng 0.04 trên một chiếc sơ mi, và "dress" thắng "top" đúng 0.03 trên một chiếc áo
@@ -390,6 +392,42 @@ def _pooled_garment_clusters(candidates: dict):
     return clusters
 
 
+def _last_resort_upper_body(candidates: dict):
+    """Khi KHÔNG nhãn nào sống sót: lấy bằng chứng thân trên tốt nhất mà detector thật sự
+    nhìn thấy, thay vì để phía trên giả định cả một bộ đồ.
+
+    Ảnh chân dung nửa người hoặc cận mặt không có thân dưới trong khung hình, nên
+    detector ra rỗng là ĐÚNG. Trước đây chỗ này rơi vào nhánh dự phòng giả định
+    "top + bottom", và trên 47 ảnh thật, cả **5/5** ảnh rơi vào đó đều bị vẽ thêm một cái
+    quần jean không hề tồn tại. Nhưng ở cả 5 ảnh, detector VẪN thấy một món thân trên,
+    chỉ là dưới ngưỡng (dress 0.34-0.40, top 0.29-0.30).
+
+    Nên chỉ nhận đúng MỘT món thân trên, không bao giờ nhận `bottom` một mình: thân dưới
+    mới là thứ hay nằm ngoài khung, và cũng chính là thứ bị bịa ra.
+    Tên gọi theo cùng quy tắc với _pooled_winner (mặc định "top").
+    """
+    pool = [{"label": label, "index": i, "score": c["score"], "box": c["box"]}
+            for label in POOLED_LABEL_GROUP
+            for i, c in enumerate(candidates.get(label, []))]
+    if not pool:
+        return []
+    best_per_label = {}
+    for c in pool:
+        if c["score"] > best_per_label.get(c["label"], {"score": 0})["score"]:
+            best_per_label[c["label"]] = c
+    # Luôn gọi là "top". Ở dải điểm này (0.25-0.40) model không phân biệt nổi thứ gì,
+    # nên argmax chỉ là nhiễu - và trong prompt, "upper-body garment" là cách gọi đúng
+    # cho cả áo sơ mi, áo khoác lẫn nửa trên của một chiếc đầm, còn "dress"/"jacket"
+    # sai thì đổi hẳn cấu trúc bộ đồ.
+    winner = max(best_per_label.values(), key=lambda c: c["score"])
+    return [{
+        "label": POOLED_DEFAULT_LABEL,
+        "score": round(winner["score"], 4),
+        "box": winner["box"],
+        "last_resort": True,
+    }]
+
+
 def _rescue_by_pooling(candidates: dict, threshold: float, already: list):
     """Cứu vùng mà MỌI luật khác đã bỏ trắng, bằng cách cộng điểm các nhãn cùng mô tả
     nó (POOLED_LABEL_GROUP) rồi mới so ngưỡng.
@@ -498,6 +536,11 @@ def resolve_ambiguous_pairs(candidates: dict, threshold: float):
             })
 
     resolved += _rescue_by_pooling(candidates, threshold, resolved)
+    # "Không có món quần áo nào", chứ không phải "không có gì": một cái túi hay đôi giày
+    # sống sót không làm nên bộ đồ, mà vẫn chặn mất đường chót - đo được một ảnh chỉ ra
+    # mỗi ['bag'] trong khi chiếc áo sọc đang thấy rõ (dress 0.26 / outer 0.25).
+    if not any(d["label"] in GARMENT_LABELS for d in resolved):
+        resolved += _last_resort_upper_body(candidates)
     return resolved
 
 

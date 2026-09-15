@@ -205,6 +205,12 @@ python3 test_extract_outfit.py --lightning4 --fp8 <ảnh_gốc>
 
 Không có `bottom` thì không có bằng chứng màu để cân, nên lùi về **chính độ tự tin của detector**: bên nào điểm cao hơn thì thắng. Ràng buộc này áp ở tầng cờ nên cũng đỡ luôn trường hợp đủ ba nhãn mà phân xử vẫn bỏ qua (khi box chồng nhau quá ít). Trên 60 ảnh đo được đúng **1 ảnh** dính lỗi này. `scores` vẫn báo cáo đầy đủ mọi nhãn detector thấy, chỉ cờ mới bị chặn — để trang báo cáo còn giải thích được quyết định.
 
+**D0b — không bao giờ giả định cả một bộ đồ khi không nhận ra gì.** Trước đây nếu detector ra rỗng thì `prompt_items()` lùi về giả định `top + bottom`. Đo trên 47 ảnh thật: **5/5 ảnh** rơi vào nhánh đó đều bị **vẽ thêm một cái quần jean không hề tồn tại** — và cả 5 đều là **ảnh chân dung nửa người hoặc cận mặt, không có thân dưới trong khung hình**. Detector ra rỗng là đúng; cái sai là phần giả định.
+
+Nay bỏ hẳn giả định đó. Thay vào đó, khi **không món quần áo nào** sống sót (phụ kiện như túi/giày không tính — đo được một ảnh chỉ ra mỗi `bag` trong khi chiếc áo sọc thấy rõ), detector nhận **đúng một món thân trên** từ bằng chứng dưới ngưỡng mà nó thật sự nhìn thấy (`dress 0.26–0.40` hoặc `top 0.29–0.30` ở 5 ảnh trên). Món đó **luôn được gọi là `top`**: ở dải điểm 0.25–0.40 model không phân biệt nổi thứ gì nên argmax chỉ là nhiễu, mà `upper-body garment` lại đúng cho cả áo sơ mi, áo khoác lẫn nửa trên của một chiếc đầm. **Không bao giờ nhận `bottom` một mình** — thân dưới mới là thứ hay nằm ngoài khung và cũng chính là thứ bị bịa ra.
+
+Nếu đến thế vẫn không có gì thì câu trả lời trung thực là **không có món nào**: worker trả về 0 garment và bỏ qua luôn bước sinh ảnh (~20s). Đo trên 47 ảnh: số ảnh xin `lower-body garment` giảm **15 → 10**, 2 ảnh được nhận thêm món áo trước đây bị bỏ sót, và **không ảnh nào** mất món hợp lệ hay ra rỗng.
+
 **D0b — cộng điểm các nhãn cùng mô tả một vùng trước khi so ngưỡng.** Detector có 3 tên gọi cho cùng một món che thân trên (`top`, `outer`, `dress`). Khi nó phân vân, **điểm bị chia ra** chứ không phải vật thể mờ nhạt — đo trên một ảnh selfie góc rộng: cùng một chiếc sơ mi ăn `top=0.295`, `dress=0.329`, `outer=0.337`, **cộng lại 0.96** mà không nhãn nào vượt nổi ngưỡng 0.4, nên cái áo biến mất hẳn khỏi prompt và tủ đồ chỉ nhận được cái túi. Cách cũ lấy **max** (0.337) còn trượt cả sàn cứu hộ `AMBIGUOUS_FLOOR=0.35` đúng **0.013**.
 
 Nay các ứng viên thuộc 3 nhãn đó đè lên cùng một vùng được **gom cụm và cộng điểm**, rồi so tổng với ngưỡng. Ba ràng buộc quan trọng:
