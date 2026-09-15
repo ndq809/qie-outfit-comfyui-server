@@ -85,11 +85,22 @@ def load_sam(device: str):
 
 
 def get_all_person_boxes(person_model, person_pre, image: Image.Image):
+    return [b for _, b in scored_person_boxes(person_model, person_pre, image,
+                                              clothing.PERSON_SCORE_THRESHOLD)]
+
+
+def scored_person_boxes(person_model, person_pre, image: Image.Image, min_score: float):
+    """[(score, box)] cho moi vung 'person' tren min_score, diem giam dan.
+
+    Tach rieng de goi y co the ha san khi CAN bang chung khac - xem
+    outfit_items._rescue_person_box_for_face()."""
     x = person_pre(image).unsqueeze(0)
     with torch.no_grad():
         out = person_model(x)[0]
-    mask = (out["labels"] == 1) & (out["scores"] > clothing.PERSON_SCORE_THRESHOLD)
-    return out["boxes"][mask].tolist()
+    mask = (out["labels"] == 1) & (out["scores"] > min_score)
+    pairs = list(zip(out["scores"][mask].tolist(), out["boxes"][mask].tolist()))
+    pairs.sort(key=lambda sb: -sb[0])
+    return pairs
 
 
 _ref_embedding_cache = {}

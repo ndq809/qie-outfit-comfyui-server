@@ -230,6 +230,10 @@ Một cái túi giả không chỉ thêm một món rác vào tủ. Ở ảnh 76
 
 Túi đạt ≥ ngưỡng chính vẫn nhận bình thường (kiểm 4 ảnh: 0.45–0.80 đều giữ nguyên).
 
+**D0b — nhận lại box người bị loại khi nó ôm khuôn mặt chủ thể sát hơn.** Người đứng sau trong ảnh selfie hay bị detector người chấm dưới ngưỡng `PERSON_SCORE_THRESHOLD = 0.5` vì bị che. Đo trên ảnh thật: chủ tài khoản đứng sau chấm **0.4346** nên bị loại, chỉ còn box của người phụ nữ phía trước (**0.9996**) — mà khuôn mặt anh ta lại **nằm gọn trong box đó**, nên bước gán mặt→người không có lựa chọn nào khác. Kết quả: `persons=1`, **không cô lập gì**, và tủ đồ nhận `tank tops & camisoles` + `short skirts` của cô ấy.
+
+Khuôn mặt đã khớp là bằng chứng độc lập và mạnh hơn hẳn điểm của detector người, nên khi có một box bị loại vừa **chứa khuôn mặt đó** vừa **nhỏ hơn** box đang thắng thì nhận nó lại (sàn `PERSON_RESCUE_FLOOR = 0.30`: người bị che đo được 0.4346, các box nhiễu trong cùng ảnh đều ≤ 0.24). Đo trên 59 ảnh của 3 job: **đúng 1 ảnh** thoả điều kiện — chính ảnh hỏng — không ảnh nào khác bị đụng. Sau khi sửa, ảnh đó ra `persons=2`, có cô lập, và cho ra áo phông trắng của **chính chủ tài khoản**.
+
 **D0b — món đồ thuộc về người có box ôm sát nhất, không phải ai chứa được nó.** Quy tắc cũ "box món đồ nằm ≥80% trong box chủ thể thì hợp vào mask" sập trong ảnh selfie: người chụp ở tiền cảnh có box choán **42% khung hình** và **nuốt trọn** người đứng sau. Đo trên ảnh thật 5 người: chiếc áo polo của người phía sau nằm **100%** trong box chủ thể nên được hợp vào mask, sống sót qua bước bôi xám, và D1 vẽ lại **áo của người khác** vào tủ đồ của chủ thể.
 
 Sửa bằng đúng nguyên tắc "box ôm sát nhất thắng" đã dùng ở bước gán khuôn mặt: trong số các box người chứa món đồ ≥80%, **box nhỏ nhất** là chủ sở hữu. Chiếc polo đó nằm 91.5% trong box của người kia (17% khung hình) — nhỏ hơn hẳn — nên thuộc về anh ta; còn áo và túi của chính chủ thể chỉ đạt 24–27% trong box người kia nên không bị cướp. Kiểm trên 7 ảnh nhiều người: sửa đúng ca hỏng, 6 ca còn lại không đổi; ảnh đó từ chỗ ra `polos` (áo đen người khác) chuyển thành `shirts` xám/trắng cổ bẻ — đúng chiếc áo của chủ tài khoản.

@@ -128,6 +128,11 @@ CLASS_THRESHOLDS = {"hat": 0.55}
 # drew, so 0.8 would throw them away.
 SUBJECT_ITEM_MIN_FRAC = 0.5
 
+# Sàn để NHẬN LẠI một box người đã bị PERSON_SCORE_THRESHOLD loại, và chỉ khi khuôn mặt
+# chủ thể nằm trong nó (xem _rescue_person_box_for_face). Người bị che trong ảnh selfie
+# đo được 0.4346; các box nhiễu trong cùng ảnh đó đều <= 0.24, nên 0.30 nằm giữa.
+PERSON_RESCUE_FLOOR = 0.30
+
 
 _clothing_models = None
 _sam = None
@@ -220,6 +225,39 @@ def _box_inside_frac(box, person_box):
     inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
     area = (box[2] - box[0]) * (box[3] - box[1])
     return inter / area if area > 0 else 0.0
+
+
+def _box_contains(outer, inner, tol):
+    return (outer[0] <= inner[0] + tol and outer[1] <= inner[1] + tol
+            and outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
+
+
+def _rescue_person_box_for_face(person_model, person_pre, image, person_boxes, face_bbox):
+    """Nhận lại box người bị loại vì điểm thấp, khi nó ôm khuôn mặt chủ thể sát hơn mọi
+    box còn sống.
+
+    Người đứng sau trong ảnh selfie hay bị chấm dưới PERSON_SCORE_THRESHOLD=0.5 vì bị
+    che. Đo trên ảnh thật: chủ tài khoản đứng sau chấm 0.4346 nên bị loại, chỉ còn box
+    của người phụ nữ phía trước (0.9996) - mà khuôn mặt anh ta lại nằm gọn trong box đó,
+    nên bước gán mặt→người không có lựa chọn nào khác, `persons` ra 1, không cô lập gì,
+    và tủ đồ nhận `tank tops` + `short skirts` của cô ấy.
+
+    Khuôn mặt đã khớp là bằng chứng độc lập và mạnh hơn hẳn điểm của detector người, nên
+    khi có một box bị loại vừa chứa khuôn mặt đó vừa NHỎ HƠN box đang thắng, nhận nó lại.
+    Đo trên 59 ảnh của 3 job: đúng **1** ảnh thoả - chính ảnh hỏng - không ảnh nào khác
+    bị đụng.
+    """
+    tol = 0.05 * (face_bbox[3] - face_bbox[1])
+    current = sorted((b for b in person_boxes if _box_contains(b, face_bbox, tol)),
+                     key=_box_area)
+    tighter = [
+        b for score, b in byface.scored_person_boxes(person_model, person_pre, image,
+                                                     PERSON_RESCUE_FLOOR)
+        if score <= clothing.PERSON_SCORE_THRESHOLD
+        and _box_contains(b, face_bbox, tol)
+        and (not current or _box_area(b) < _box_area(current[0]))
+    ]
+    return min(tighter, key=_box_area) if tighter else None
 
 
 def _owned_by_subject(item_box, target_box, person_boxes):
@@ -318,6 +356,10 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
                 f"No face in {image_path} matches the selfie "
                 f"(best similarity={face_similarity:.3f}, need >= {face_match_threshold})"
             )
+        rescued = _rescue_person_box_for_face(person_model, person_pre, image,
+                                              person_boxes, face.bbox.tolist())
+        if rescued is not None:
+            person_boxes = person_boxes + [rescued]
         target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)
     elif len(person_boxes) > 1:
         # No reference face: assume the subject of an outfit-extraction photo is
