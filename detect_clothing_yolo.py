@@ -116,6 +116,21 @@ DRESS_PAIR_FLOOR = 0.35
 # duy nhất: lấy nhãn có score cao hơn, so với AMBIGUOUS_FLOOR thay vì
 # --threshold thông thường (vì nếu bắt cả 2 độc lập vượt threshold thì hay
 # bị mất - vd áo len dày: top=0.44, outer=0.48, cả 2 đều dưới 0.5).
+# Ba tên gọi cho CÙNG một món che thân trên. Khi model phân vân giữa chúng, nó chia
+# điểm ra chứ không phải nhìn thấy mờ nhạt - đo trên một ảnh selfie góc rộng: cùng một
+# chiếc áo sơ mi ăn top=0.295, dress=0.329, outer=0.337, cộng lại 0.96 mà KHÔNG nhãn
+# nào vượt nổi --threshold=0.4, nên cái áo biến mất khỏi prompt. Lấy max (cách cũ) chỉ
+# được 0.337, trượt cả AMBIGUOUS_FLOOR=0.35 đúng 0.013.
+# Cộng lại là cách dựng lại xác suất "vùng này LÀ một món đồ", trước khi so ngưỡng.
+POOLED_LABEL_GROUP = ("top", "outer", "dress")
+# Cộng điểm chỉ xảy ra khi model ĐANG PHÂN VÂN - mọi nhãn đều thấp và chia đều nhau -
+# nên trong vùng đó cái argmax chỉ là nhiễu: đo trên ảnh thật, "outer" thắng "top"
+# đúng 0.04 trên một chiếc sơ mi, và "dress" thắng "top" đúng 0.03 trên một chiếc áo
+# phông của đàn ông. Mặc định về "top" (món thân trên là trường hợp áp đảo), bắt
+# "dress"/"outer" phải dẫn ít nhất ngần này mới được lấy tên - vì hai cách đọc đó
+# đổi hẳn cấu trúc prompt và sai thì đắt hơn nhiều.
+POOLED_LABEL_MARGIN = 0.1
+POOLED_DEFAULT_LABEL = "top"
 AMBIGUOUS_LABEL_PAIRS = [("top", "outer")]
 AMBIGUOUS_OVERLAP_THRESHOLD = 0.5
 # Ngưỡng sàn khi 2 nhãn cạnh tranh - PHẢI thấp hơn --threshold để có tác
@@ -327,6 +342,49 @@ def run_scales(model, processors, image: Image.Image, device: str, offset=(0, 0)
     return torch.cat(boxes_list), torch.cat(scores_list), torch.cat(labels_list)
 
 
+def _pooled_garment_clusters(candidates: dict):
+    """Gom các ứng viên thuộc POOLED_LABEL_GROUP đè lên cùng một vùng thành từng cụm.
+
+    Tham lam theo điểm giảm dần: lấy ứng viên mạnh nhất chưa dùng làm hạt nhân, hút mọi
+    ứng viên NHÃN KHÁC còn lại đè lên nó >= AMBIGUOUS_OVERLAP_THRESHOLD. Mỗi nhãn chỉ
+    góp một lần vào một cụm, nên điểm cộng không bị thổi phồng bởi nhiều box cùng nhãn.
+    """
+    pool = [
+        {"label": label, "index": i, "score": cand["score"], "box": cand["box"]}
+        for label in POOLED_LABEL_GROUP
+        for i, cand in enumerate(candidates.get(label, []))
+    ]
+    pool.sort(key=lambda c: -c["score"])
+
+    used, clusters = set(), []
+    for seed in pool:
+        key = (seed["label"], seed["index"])
+        if key in used:
+            continue
+        cluster = [seed]
+        used.add(key)
+        for other in pool:
+            okey = (other["label"], other["index"])
+            if okey in used or other["label"] == seed["label"]:
+                continue
+            if any(o["label"] == other["label"] for o in cluster):
+                continue
+            if _box_iou(seed["box"], other["box"]) >= AMBIGUOUS_OVERLAP_THRESHOLD:
+                cluster.append(other)
+                used.add(okey)
+        clusters.append(cluster)
+    return clusters
+
+
+def _pooled_winner(cluster):
+    """Tên gọi cho cụm: mặc định "top", trừ khi nhãn khác dẫn đủ POOLED_LABEL_MARGIN."""
+    leader = max(cluster, key=lambda c: c["score"])
+    default = next((c for c in cluster if c["label"] == POOLED_DEFAULT_LABEL), None)
+    if default is None or leader["label"] == POOLED_DEFAULT_LABEL:
+        return leader
+    return leader if leader["score"] - default["score"] >= POOLED_LABEL_MARGIN else default
+
+
 def resolve_ambiguous_pairs(candidates: dict, threshold: float):
     """candidates: label -> list[{"score","box"}], đã NMS trong từng class
     nhưng CHƯA lọc theo threshold. Với các cặp nhãn trong AMBIGUOUS_LABEL_PAIRS
@@ -336,6 +394,35 @@ def resolve_ambiguous_pairs(candidates: dict, threshold: float):
     nào) vẫn theo luật threshold bình thường."""
     consumed = {label: set() for label in candidates}
     resolved = []
+
+    # Cộng điểm các nhãn cùng mô tả một vùng TRƯỚC khi so ngưỡng. Chỉ xét cụm có từ 2
+    # nhãn khác nhau trở lên - một nhãn đứng một mình không có gì để cộng, cứ theo luật
+    # ngưỡng thường ở vòng cuối hàm này.
+    for cluster in _pooled_garment_clusters(candidates):
+        if len({c["label"] for c in cluster}) < 2:
+            continue
+        # Chỉ CỨU vùng mà không nhãn nào tự vượt ngưỡng, không GHI ĐÈ lên vùng đã đạt:
+        # đo được một chiếc áo khoác có outer=0.471 (trên ngưỡng) bị cụm đổi tên thành
+        # "top" chỉ vì nó không dẫn "top" đủ biên.
+        if any(c["score"] >= threshold for c in cluster):
+            continue
+        pooled = sum(c["score"] for c in cluster)
+        winner = _pooled_winner(cluster)
+        # OR chứ không thay thế: giữ nguyên luật cũ (max so với AMBIGUOUS_FLOOR) để
+        # cách tính mới chỉ có thể cứu thêm, không cướp đi cái gì đang chạy đúng.
+        if pooled < threshold and winner["score"] < AMBIGUOUS_FLOOR:
+            continue
+        for c in cluster:
+            consumed[c["label"]].add(c["index"])
+        resolved.append({
+            "label": winner["label"],
+            "score": round(winner["score"], 4),
+            "box": winner["box"],
+            "pooled": {
+                "score": round(pooled, 4),
+                "labels": {c["label"]: round(c["score"], 4) for c in cluster},
+            },
+        })
 
     for label_a, label_b in AMBIGUOUS_LABEL_PAIRS:
         for i, cand_a in enumerate(candidates.get(label_a, [])):

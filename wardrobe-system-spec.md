@@ -205,6 +205,16 @@ python3 test_extract_outfit.py --lightning4 --fp8 <ảnh_gốc>
 
 Không có `bottom` thì không có bằng chứng màu để cân, nên lùi về **chính độ tự tin của detector**: bên nào điểm cao hơn thì thắng. Ràng buộc này áp ở tầng cờ nên cũng đỡ luôn trường hợp đủ ba nhãn mà phân xử vẫn bỏ qua (khi box chồng nhau quá ít). Trên 60 ảnh đo được đúng **1 ảnh** dính lỗi này. `scores` vẫn báo cáo đầy đủ mọi nhãn detector thấy, chỉ cờ mới bị chặn — để trang báo cáo còn giải thích được quyết định.
 
+**D0b — cộng điểm các nhãn cùng mô tả một vùng trước khi so ngưỡng.** Detector có 3 tên gọi cho cùng một món che thân trên (`top`, `outer`, `dress`). Khi nó phân vân, **điểm bị chia ra** chứ không phải vật thể mờ nhạt — đo trên một ảnh selfie góc rộng: cùng một chiếc sơ mi ăn `top=0.295`, `dress=0.329`, `outer=0.337`, **cộng lại 0.96** mà không nhãn nào vượt nổi ngưỡng 0.4, nên cái áo biến mất hẳn khỏi prompt và tủ đồ chỉ nhận được cái túi. Cách cũ lấy **max** (0.337) còn trượt cả sàn cứu hộ `AMBIGUOUS_FLOOR=0.35` đúng **0.013**.
+
+Nay các ứng viên thuộc 3 nhãn đó đè lên cùng một vùng được **gom cụm và cộng điểm**, rồi so tổng với ngưỡng. Ba ràng buộc quan trọng:
+
+- **Chỉ cứu, không ghi đè**: nếu trong cụm đã có nhãn tự vượt ngưỡng thì bỏ qua — đo được một áo khoác `outer=0.471` (trên ngưỡng) bị cụm đổi tên thành `top` chỉ vì không dẫn đủ biên.
+- **Mặc định về `top`**, bắt `dress`/`outer` phải dẫn ít nhất **0.1** mới được lấy tên. Trong vùng điểm thấp chia đều, argmax chỉ là nhiễu: đo được `outer` thắng `top` đúng 0.04 trên một chiếc sơ mi, và `dress` thắng `top` đúng 0.03 trên một chiếc **áo phông của đàn ông**. Đây cũng là lý do cách gọi theo vùng cơ thể ở D1 quan trọng: gọi một chiếc áo khoác là `top` vẫn ra prompt `upper-body garment` — đúng cho cả sơ mi lẫn áo khoác; còn gọi một chiếc sơ mi là `outer` thì ra `jacket/outerwear`, sai hẳn.
+- Giữ nguyên luật cũ (max so với `AMBIGUOUS_FLOOR`) song song, nên cách mới **chỉ có thể cứu thêm**.
+
+Đo trên 60 ảnh thật: **4 ảnh đổi**, đều là cứu được món áo trước đây mất trắng; số ảnh không có cờ nào giảm 5 → 4. Các ảnh có `outer` hoặc `dress` thật, đã vượt ngưỡng, không bị đụng.
+
 **D0b — ảnh chỉ có 1 người: lọc theo box người thay vì cô lập bằng SAM.** Ảnh 1 người không có ai để bôi xám, nhưng **hậu cảnh vẫn có vật** mà detector sẵn sàng báo là đồ đang mặc — đo được một đôi giày nằm dưới nền phía sau chủ thể bị tính thành giày của chủ thể. Giải pháp: **bỏ mọi detection không nằm trên chủ thể**, tức box của món phải phủ ít nhất **50%** vào box người.
 
 Đã đo cả phương án cô lập bằng SAM cho ảnh 1 người và **nó thua**: bôi xám hậu cảnh làm điểm số lệch đủ để **đổi bộ cờ ở 12/25 ảnh**, đánh mất cả đồ thật (một cái áo `0.642`, một cái đầm `0.494`, một ảnh mất sạch nhãn) chứ không chỉ đôi giày giả. Lọc theo box chỉ đổi **1/25 ảnh** — đúng cái sai — và không đụng tới một pixel nào của ảnh. Đây chính là lý do comment cũ trong code cảnh báo "bôi xám làm lệch điểm detector": cảnh báo đó đúng.
