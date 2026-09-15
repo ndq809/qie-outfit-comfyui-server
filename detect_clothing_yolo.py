@@ -152,7 +152,21 @@ AMBIGUOUS_FLOOR = 0.35
 # loãng bởi diện tích áo lớn hơn nhiều, cho kết quả thấp giả tạo (đã đo được thực
 # tế: 1 box bag nằm 100% trong box top nhưng IoU chỉ ra 0.447, dưới ngưỡng 0.5).
 BAG_OVERLAP_THRESHOLD = 0.5
+# Ý tưởng trên đúng về nguyên tắc nhưng đo trên 60 ảnh thật thì tỉ lệ sai
+# quá đắt: trong dải 0.15-0.30 có 8 ảnh được cứu, gán nhãn bằng mắt ra **7 sai / 1
+# đúng** - bó hoa, vòng tay, thắt lưng, và những ảnh không hề có túi. Tệ hơn, cái đúng
+# duy nhất (túi đeo chéo thật) lại ở điểm THẤP NHẤT 0.1518, dưới cả 7 cái sai
+# (0.1633-0.2969), nên không ngưỡng nào tách được hai nhóm.
+#
+# Và một cái túi giả không chỉ thêm rác: ở ảnh 766 nó khiến D1 vẽ một BÓ HOA vào ô
+# "bag", bó hoa đó chạm vào cái áo, BiRefNet gộp thành một vùng liên thông (nâng ngưỡng
+# mask lên 0.8 vẫn dính) nên ảnh áo trong tủ dính luôn bó hoa - hỏng cả món đúng.
+#
+# Túi đạt >= --threshold vẫn đi đường bình thường, không ảnh hưởng.
+# Giữ nguyên giá trị sàn vì run_scales() còn dùng nó làm ngưỡng thu thập ứng viên;
+# chỉ tắt riêng bước cứu hộ.
 BAG_OVERLAP_FLOOR = 0.15
+BAG_WORN_OVER_TOP_ENABLED = False
 
 
 def _box_iou(a, b):
@@ -501,6 +515,8 @@ def resolve_bag_worn_over_top(candidates: dict, threshold: float):
     BAG_OVERLAP_FLOOR thay vì --threshold chính. Bag đã đủ điểm qua --threshold
     chính thì bỏ qua ở đây (đã được resolve_ambiguous_pairs thêm vào rồi, tránh
     trùng lặp)."""
+    if not BAG_WORN_OVER_TOP_ENABLED:
+        return []
     bag_list = candidates.get("bag", [])
     top_list = candidates.get("top", [])
     if not bag_list or not top_list:
