@@ -209,11 +209,12 @@ Không có `bottom` thì không có bằng chứng màu để cân, nên lùi v�
 
 Nay các ứng viên thuộc 3 nhãn đó đè lên cùng một vùng được **gom cụm và cộng điểm**, rồi so tổng với ngưỡng. Ba ràng buộc quan trọng:
 
-- **Chỉ cứu, không ghi đè**: nếu trong cụm đã có nhãn tự vượt ngưỡng thì bỏ qua — đo được một áo khoác `outer=0.471` (trên ngưỡng) bị cụm đổi tên thành `top` chỉ vì không dẫn đủ biên.
+- **Chạy CUỐI CÙNG và chỉ cứu vùng bị bỏ trắng**, không bao giờ ghi đè lên vùng các luật khác đã xử lý được. Bản đầu chạy trước và cướp việc của chúng, đo được 2 lỗi: áo khoác `outer=0.471` (trên ngưỡng) bị đổi tên thành `top`; và áo khoác đen `outer=0.353` vốn đã được `AMBIGUOUS_FLOOR` cứu đúng cũng bị đổi tên, khiến prompt chuyển từ `jacket/outerwear` sang `upper-body garment` và **model vẽ ra áo polo thay vì áo khoác** — tức là chữ trong prompt *có* lái model, không vô hại như tôi tưởng.
+- **Loại theo vùng đã dùng, xét cả kiểu lồng nhau** (`containment`, không chỉ `IoU`): NMS để lại những box `top` nhỏ nằm gọn trong box đã emit, IoU thấp nên lọt qua và cùng một chiếc áo bị đếm thành **hai** món trong prompt.
 - **Mặc định về `top`**, bắt `dress`/`outer` phải dẫn ít nhất **0.1** mới được lấy tên. Trong vùng điểm thấp chia đều, argmax chỉ là nhiễu: đo được `outer` thắng `top` đúng 0.04 trên một chiếc sơ mi, và `dress` thắng `top` đúng 0.03 trên một chiếc **áo phông của đàn ông**. Đây cũng là lý do cách gọi theo vùng cơ thể ở D1 quan trọng: gọi một chiếc áo khoác là `top` vẫn ra prompt `upper-body garment` — đúng cho cả sơ mi lẫn áo khoác; còn gọi một chiếc sơ mi là `outer` thì ra `jacket/outerwear`, sai hẳn.
 - Giữ nguyên luật cũ (max so với `AMBIGUOUS_FLOOR`) song song, nên cách mới **chỉ có thể cứu thêm**.
 
-Đo trên 60 ảnh thật: **4 ảnh đổi**, đều là cứu được món áo trước đây mất trắng; số ảnh không có cờ nào giảm 5 → 4. Các ảnh có `outer` hoặc `dress` thật, đã vượt ngưỡng, không bị đụng.
+Đo trên 60 ảnh thật: **3 ảnh đổi**, cả ba đều là cứu thuần tuý một món áo trước đây mất trắng — không ảnh nào bị đổi tên hay đếm trùng; số ảnh không có cờ nào giảm 5 → 4. Các ảnh có `outer` hoặc `dress` thật, đã vượt ngưỡng, không bị đụng.
 
 **D0b — ảnh chỉ có 1 người: lọc theo box người thay vì cô lập bằng SAM.** Ảnh 1 người không có ai để bôi xám, nhưng **hậu cảnh vẫn có vật** mà detector sẵn sàng báo là đồ đang mặc — đo được một đôi giày nằm dưới nền phía sau chủ thể bị tính thành giày của chủ thể. Giải pháp: **bỏ mọi detection không nằm trên chủ thể**, tức box của món phải phủ ít nhất **50%** vào box người.
 

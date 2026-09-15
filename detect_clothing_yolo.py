@@ -376,6 +376,48 @@ def _pooled_garment_clusters(candidates: dict):
     return clusters
 
 
+def _rescue_by_pooling(candidates: dict, threshold: float, already: list):
+    """Cứu vùng mà MỌI luật khác đã bỏ trắng, bằng cách cộng điểm các nhãn cùng mô tả
+    nó (POOLED_LABEL_GROUP) rồi mới so ngưỡng.
+
+    Chạy CUỐI CÙNG và bỏ qua vùng đã có detection, vì bản trước chạy đầu và cướp việc
+    của các luật sẵn có - đo được: một áo khoác đen `outer=0.353` vốn đã được
+    AMBIGUOUS_FLOOR cứu đúng, bị đổi tên thành "top", prompt chuyển từ
+    "jacket/outerwear" sang "upper-body garment", và model vẽ ra áo polo thay vì áo
+    khoác. NMS còn để lại nhiều box "top" cho cùng một người, nên nếu không loại theo
+    vùng đã dùng thì cùng một chiếc áo bị đếm hai lần và prompt xin thừa một món.
+    """
+    rescued = []
+    for cluster in _pooled_garment_clusters(candidates):
+        if len({c["label"] for c in cluster}) < 2:
+            continue
+        if any(c["score"] >= threshold for c in cluster):
+            continue
+        seed = max(cluster, key=lambda c: c["score"])
+        # Chồng lấn phải xét cả kiểu LỒNG NHAU, không chỉ IoU: NMS để lại những box
+        # "top" nhỏ nằm gọn trong box đã emit, IoU thấp nên lọt qua, và cùng một chiếc
+        # áo bị đếm thành hai món trong prompt.
+        if any(max(_box_iou(seed["box"], d["box"]),
+                   _box_containment(seed["box"], d["box"]),
+                   _box_containment(d["box"], seed["box"])) >= AMBIGUOUS_OVERLAP_THRESHOLD
+               for d in already + rescued):
+            continue
+        pooled = sum(c["score"] for c in cluster)
+        if pooled < threshold:
+            continue
+        winner = _pooled_winner(cluster)
+        rescued.append({
+            "label": winner["label"],
+            "score": round(winner["score"], 4),
+            "box": winner["box"],
+            "pooled": {
+                "score": round(pooled, 4),
+                "labels": {c["label"]: round(c["score"], 4) for c in cluster},
+            },
+        })
+    return rescued
+
+
 def _pooled_winner(cluster):
     """Tên gọi cho cụm: mặc định "top", trừ khi nhãn khác dẫn đủ POOLED_LABEL_MARGIN."""
     leader = max(cluster, key=lambda c: c["score"])
@@ -394,35 +436,6 @@ def resolve_ambiguous_pairs(candidates: dict, threshold: float):
     nào) vẫn theo luật threshold bình thường."""
     consumed = {label: set() for label in candidates}
     resolved = []
-
-    # Cộng điểm các nhãn cùng mô tả một vùng TRƯỚC khi so ngưỡng. Chỉ xét cụm có từ 2
-    # nhãn khác nhau trở lên - một nhãn đứng một mình không có gì để cộng, cứ theo luật
-    # ngưỡng thường ở vòng cuối hàm này.
-    for cluster in _pooled_garment_clusters(candidates):
-        if len({c["label"] for c in cluster}) < 2:
-            continue
-        # Chỉ CỨU vùng mà không nhãn nào tự vượt ngưỡng, không GHI ĐÈ lên vùng đã đạt:
-        # đo được một chiếc áo khoác có outer=0.471 (trên ngưỡng) bị cụm đổi tên thành
-        # "top" chỉ vì nó không dẫn "top" đủ biên.
-        if any(c["score"] >= threshold for c in cluster):
-            continue
-        pooled = sum(c["score"] for c in cluster)
-        winner = _pooled_winner(cluster)
-        # OR chứ không thay thế: giữ nguyên luật cũ (max so với AMBIGUOUS_FLOOR) để
-        # cách tính mới chỉ có thể cứu thêm, không cướp đi cái gì đang chạy đúng.
-        if pooled < threshold and winner["score"] < AMBIGUOUS_FLOOR:
-            continue
-        for c in cluster:
-            consumed[c["label"]].add(c["index"])
-        resolved.append({
-            "label": winner["label"],
-            "score": round(winner["score"], 4),
-            "box": winner["box"],
-            "pooled": {
-                "score": round(pooled, 4),
-                "labels": {c["label"]: round(c["score"], 4) for c in cluster},
-            },
-        })
 
     for label_a, label_b in AMBIGUOUS_LABEL_PAIRS:
         for i, cand_a in enumerate(candidates.get(label_a, [])):
@@ -470,6 +483,7 @@ def resolve_ambiguous_pairs(candidates: dict, threshold: float):
                 "box": cand["box"],
             })
 
+    resolved += _rescue_by_pooling(candidates, threshold, resolved)
     return resolved
 
 
