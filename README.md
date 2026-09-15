@@ -172,10 +172,15 @@ Jupyter sends `Content-Security-Policy: sandbox`, which puts the page in an opaq
 where no cookie is sent.
 
 Each photo gets a card showing **original → SAM-isolated subject → generated grid →
-per-item crops**, plus what the detector found, the subject's gender, the face-match
-similarity, how many items the prompt asked for versus how many were found, the exact D1
-prompt, and each crop's tags. Crops dropped by D2 as duplicates are still shown, outlined
-and labelled — that is usually the answer to "why is this item missing from my wardrobe".
+per-item crops**, plus what the detector found, the face-match similarity, how many items
+the prompt asked for versus how many were found, the exact D1 prompt, and each crop's
+tags. Crops dropped by D2 as duplicates are still shown, outlined and labelled — that is
+usually the answer to "why is this item missing from my wardrobe".
+
+Cards are grouped by job, newest first, with only the newest expanded. The search box at
+the top filters by photo id **across every job at once**, which is how a change gets
+judged: type `197` and you get that photo from each run in turn. A flat chronological
+list stopped being usable once the same photos had been re-run a dozen times.
 
 Leave it empty in production: it retains the user's original photo, which the spec
 requires deleting once extraction is done.

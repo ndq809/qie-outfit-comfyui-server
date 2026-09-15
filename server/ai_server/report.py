@@ -127,11 +127,46 @@ def build_index(report_dir: str) -> Path:
     return out
 
 
+def _group_by_job(photos: list):
+    """Newest job first, photos inside it by id. A flat list stopped working once the
+    same photos had been re-run a dozen times: the question being asked of this page is
+    always "what did photo N look like in run X", never "what happened at 14:52"."""
+    jobs = {}
+    for p in photos:
+        jobs.setdefault(p.get("jobId") or p["_dir"].split("/")[0], []).append(p)
+    ordered = sorted(jobs.items(),
+                     key=lambda kv: max(x.get("at") or "" for x in kv[1]), reverse=True)
+    return [(job, sorted(group, key=lambda x: _photo_sort_key(x.get("itemId", ""))))
+            for job, group in ordered]
+
+
+def _photo_sort_key(name: str):
+    return (0, int(name)) if name.isdigit() else (1, name)
+
+
 def _render(photos: list) -> str:
     total_items = sum(len(p.get("items", [])) for p in photos)
     total_dupes = sum(1 for p in photos for i in p.get("items", []) if i.get("duplicate"))
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    body = "\n".join(_photo_card(p) for p in photos) or (
+    groups = _group_by_job(photos)
+
+    sections = []
+    for index, (job, group) in enumerate(groups):
+        when = max(x.get("at") or "" for x in group)[:16].replace("T", " ")
+        mismatched = sum(1 for x in group
+                         if len(x.get("askedItems") or []) != len(x.get("items") or []))
+        chips = " ".join(
+            f'<a class="jump" href="#p-{html.escape(job[:8])}-{html.escape(str(x.get("itemId")))}">'
+            f'{html.escape(str(x.get("itemId")))}</a>' for x in group)
+        cards = "\n".join(_photo_card(x, job) for x in group)
+        sections.append(f"""<details class="job"{' open' if index == 0 else ''}>
+<summary><b>{html.escape(job[:8])}</b> <span class="meta">{html.escape(when)} &middot;
+{len(group)} photos &middot; {mismatched} with an item-count mismatch</span></summary>
+<div class="jump-row">{chips}</div>
+{cards}
+</details>""")
+
+    body = "\n".join(sections) or (
         '<p class="empty">No photos recorded yet. Run a job with WARDROBE_REPORT_DIR set, '
         'then reload.</p>')
     return f"""<title>Wardrobe Extraction Report</title>
@@ -186,19 +221,69 @@ summary{{cursor:pointer;font-size:12px;color:var(--accent)}}
 pre{{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:10px;
   font-size:11.5px;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}}
 .empty{{color:var(--muted)}}
+details.job{{border:1px solid var(--line);border-radius:12px;margin-bottom:16px;
+  background:var(--card);padding:6px 12px 2px}}
+details.job > summary{{cursor:pointer;font-size:14px;padding:8px 2px;color:var(--ink);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
+details.job > summary .meta{{font-family:inherit}}
+details.job .card{{background:var(--bg)}}
+.jump-row{{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 14px}}
+.jump{{font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--chip);border:1px solid var(--line);border-radius:6px;
+  padding:2px 7px;color:var(--muted);text-decoration:none}}
+.jump:hover{{color:var(--ink);border-color:var(--accent)}}
+.toolbar{{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 0 12px;
+  margin-bottom:6px;border-bottom:1px solid var(--line);display:flex;gap:10px;
+  align-items:center;flex-wrap:wrap}}
+.toolbar input{{font:inherit;padding:7px 11px;border-radius:8px;border:1px solid var(--line);
+  background:var(--card);color:var(--ink);min-width:220px}}
+.toolbar .hint{{color:var(--muted);font-size:12px}}
+.card:target{{outline:2px solid var(--accent);outline-offset:3px}}
 @media (max-width:560px){{ .stages{{grid-template-columns:1fr}} }}
 </style>
 <h1>Wardrobe Extraction Report</h1>
 <p class="sub">Every stage of each photo, in pipeline order: original &rarr; isolated subject
-&rarr; generated grid &rarr; per-item crops. &nbsp;<b>{len(photos)}</b> photos &middot;
-<b>{total_items}</b> crops &middot; <b>{total_dupes}</b> dropped as duplicates &middot;
-built {generated}</p>
+&rarr; generated grid &rarr; per-item crops. &nbsp;<b>{len(photos)}</b> photos across
+<b>{len(groups)}</b> jobs &middot; <b>{total_items}</b> crops &middot;
+<b>{total_dupes}</b> dropped as duplicates &middot; built {generated}</p>
+<div class="toolbar">
+  <input id="q" type="search" placeholder="Photo id, e.g. 197" autocomplete="off">
+  <span class="hint" id="qhint">Shows that photo from every job, so runs can be compared.</span>
+</div>
 {body}
+<script>
+// Filter by photo id across jobs. Typing an id opens every job that has it and hides
+// everything else, which is the comparison this page is actually used for.
+const q = document.getElementById('q'), hint = document.getElementById('qhint');
+const jobs = [...document.querySelectorAll('details.job')];
+const openState = new WeakMap();
+q.addEventListener('input', () => {{
+  const term = q.value.trim().toLowerCase();
+  jobs.forEach(job => {{
+    if (!openState.has(job)) openState.set(job, job.open);
+    const cards = [...job.querySelectorAll('.card')];
+    let shown = 0;
+    cards.forEach(c => {{
+      const hit = !term || (c.dataset.photo || '').toLowerCase().includes(term);
+      c.hidden = !hit;
+      if (hit) shown++;
+    }});
+    job.querySelector('.jump-row').hidden = !!term;
+    job.hidden = term && shown === 0;
+    job.open = term ? shown > 0 : openState.get(job);
+  }});
+  const total = jobs.reduce((n, j) => n + [...j.querySelectorAll('.card')].filter(c => !c.hidden).length, 0);
+  hint.textContent = term ? `${{total}} match${{total === 1 ? '' : 'es'}} across jobs`
+                          : 'Shows that photo from every job, so runs can be compared.';
+}});
+</script>
 """
 
 
-def _photo_card(p: dict) -> str:
+def _photo_card(p: dict, job: str = "") -> str:
     d = p["_dir"]
+    photo_id = str(p.get("itemId", "?"))
+    anchor = f"p-{job[:8]}-{photo_id}" if job else f"p-{photo_id}"
     det = p.get("detected") or {}
     flags = [k for k in ("headwear", "outer", "one_piece", "top", "bottom", "bag", "footwear")
              if det.get(k)]
@@ -224,9 +309,9 @@ def _photo_card(p: dict) -> str:
     items = "".join(_item_tile(d, it) for it in p.get("items", [])) or \
         '<div class="na">no items extracted</div>'
 
-    return f"""<section class="card">
+    return f"""<section class="card" id="{html.escape(anchor)}" data-photo="{html.escape(photo_id)}">
 <header>
-  <h2>{html.escape(str(p.get("itemId", "?")))}</h2>
+  <h2>{html.escape(photo_id)}</h2>
   <span class="meta">job {html.escape(str(p.get("jobId", "?"))[:8])} &middot; {html.escape(str(p.get("at", "")))}</span>
 </header>
 <div class="stages">
