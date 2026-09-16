@@ -22,15 +22,15 @@ Nguyên tắc cần nhớ trước khi đọc chi tiết:
 
 | Môi trường | Base URL |
 |---|---|
-| Test (máy vast.ai hiện tại) | `http://182.53.151.59:51051` |
+| Test (máy vast.ai hiện tại) | `http://216.71.194.147:60835` |
 | Production | domain thật của data-server |
 
 Đặt giá trị này trong config build, **không hard-code** — chuyển Test ↔ Production chỉ
 nên là đổi một hằng số.
 
-> Port `51051` là port public mà vast.ai map cho container port `10100`. Nếu instance
+> Port `60835` là port public mà vast.ai map cho container port `10100`. Nếu instance
 > được tạo lại, con số này đổi — đọc lại bằng `vast-capabilities` trên máy chủ, đừng coi
-> `51051` là cố định.
+> `60835` là cố định.
 
 ### 1.2 Hai lớp token (chỉ môi trường Test)
 
@@ -47,7 +47,7 @@ Vì sao edge token đi ở **query param** chứ không phải header: cả hai 
 edge, header để dành cho token ứng dụng.
 
 ```
-GET http://182.53.151.59:51051/v1/wardrobe/items?token=<EDGE_TOKEN>
+GET http://216.71.194.147:60835/v1/wardrobe/items?token=<EDGE_TOKEN>
 Authorization: Bearer <APP_TOKEN>
 ```
 
@@ -176,7 +176,7 @@ Xin đường dẫn upload cho cả lô ảnh trong một lần gọi.
     {
       "localId":   "asset-IMG_9652",
       "objectKey": "raw/67180bc0-.../5245fa0b-.../asset-IMG_9652.jpg",
-      "uploadUrl": "http://182.53.151.59:51098/wardrobe-raw/raw/...?X-Amz-Algorithm=...",
+      "uploadUrl": "http://216.71.194.147:60768/wardrobe-raw/raw/...?X-Amz-Algorithm=...",
       "expiresAt": "2026-09-11T05:00:00+00:00"
     }
   ]
@@ -195,9 +195,9 @@ vì xin một lần rồi upload dần quá hạn.
 `PUT` thẳng vào `uploadUrl`, body là **raw bytes** của file (không multipart, không form).
 
 ```http
-PUT http://182.53.151.59:51098/wardrobe-raw/raw/...?X-Amz-Algorithm=...
+PUT http://216.71.194.147:60768/wardrobe-raw/raw/...?X-Amz-Algorithm=...
 Content-Type: image/jpeg
-Cookie: C.50970346_auth_token=<EDGE_TOKEN>
+Cookie: C.51195809_auth_token=<EDGE_TOKEN>
 
 <bytes ảnh>
 ```
@@ -210,7 +210,7 @@ Ba điểm bắt buộc, sai một cái là `403 SignatureDoesNotMatch`:
    số `X-Amz-*` đều nằm trong chữ ký.
 3. **Edge token ở môi trường Test phải đi bằng Cookie, không phải query param** — thêm
    `?token=` vào URL sẽ phá chữ ký. Tên cookie là `<VAST_CONTAINERLABEL>_auth_token`,
-   trên instance hiện tại là `C.50970346_auth_token`. Production không cần cookie này.
+   trên instance hiện tại là `C.51195809_auth_token`. Production không cần cookie này.
 
 Thành công trả `200` (body rỗng). Upload **4 ảnh song song** — mỗi lần upload chủ yếu là
 chờ mạng chứ không tốn CPU, chạy tuần tự chỉ cộng dồn độ trễ.
@@ -315,7 +315,7 @@ index cục bộ. Ảnh `failed` **không** được thêm, để lần quét sa
 {
   "items": [
     {
-      "imageUrl": "http://182.53.151.59:51098/wardrobe-items/items/...?X-Amz-Algorithm=...",
+      "imageUrl": "http://216.71.194.147:60768/wardrobe-items/items/...?X-Amz-Algorithm=...",
       "jobId": "e1f0b194-2110-4278-8462-1d6e5e9bee48",
       "tags": {
         "type": "shirts",
@@ -435,10 +435,10 @@ bản test dùng bearer token tĩnh seed sẵn trong database.
 ### 9.1 curl
 
 ```bash
-BASE=http://182.53.151.59:51051
+BASE=http://216.71.194.147:60835
 EDGE=<EDGE_TOKEN>
 APP=$(grep TEST_BEARER_TOKEN ${WORKSPACE:-/workspace}/.env | cut -d= -f2)
-COOKIE="C.50970346_auth_token=$EDGE"
+COOKIE="C.51195809_auth_token=$EDGE"
 
 # 0) health
 curl -s "$BASE/v1/health?token=$EDGE"
@@ -477,10 +477,10 @@ curl -s "$BASE/v1/wardrobe/items?jobId=$JID&token=$EDGE" -H "Authorization: Bear
 class WardrobeApi {
   WardrobeApi({required this.baseUrl, required this.appToken, this.edgeToken, this.edgeCookie});
 
-  final String baseUrl;       // http://182.53.151.59:51051
+  final String baseUrl;       // http://216.71.194.147:60835
   final String appToken;      // bearer token của user
   final String? edgeToken;    // chỉ Test; Production để null
-  final String? edgeCookie;   // 'C.50970346_auth_token'
+  final String? edgeCookie;   // 'C.51195809_auth_token'
 
   Uri _u(String path, [Map<String, String> q = const {}]) => Uri.parse('$baseUrl$path').replace(
         queryParameters: {...q, if (edgeToken != null) 'token': edgeToken!},

@@ -157,7 +157,7 @@ hard to explain after the fact. Set `WARDROBE_REPORT_DIR` and every stage is kep
 instead, with an HTML page rebuilt after each photo:
 
 ```bash
-echo 'WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_out' >> ${WORKSPACE:-/workspace}/.env
+echo 'WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_test' >> ${WORKSPACE:-/workspace}/.env
 supervisorctl restart ai-server data-server
 # then run a job and open, on the data-server port:
 #   http://$PUBLIC_IPADDR:$VAST_TCP_PORT_10100/report/?token=$OPEN_BUTTON_TOKEN
@@ -170,6 +170,11 @@ auth cookie, which every image request then carries. Opening the same file throu
 Jupyter's `/files/` endpoint looks like it works but every image 302s to its login page —
 Jupyter sends `Content-Security-Policy: sandbox`, which puts the page in an opaque origin
 where no cookie is sent.
+
+The page is built by `server/common/report.py`: ai-server writes each photo's stages,
+and data-server adds, per crop, whether wardrobe-level D2 put it in the wardrobe or dropped
+it as a duplicate of an item already owned (with the similarity) — a dropped garment is
+never stored in postgres, so this is the only record of it.
 
 Each photo gets a card showing **original → SAM-isolated subject → generated grid →
 per-item crops**, plus what the detector found, the face-match similarity, how many items
@@ -184,6 +189,33 @@ list stopped being usable once the same photos had been re-run a dozen times.
 
 Leave it empty in production: it retains the user's original photo, which the spec
 requires deleting once extraction is done.
+
+### Driving the whole flow like the app does
+
+`scripts/mobile_flow_test.py` calls the public data-server exactly as
+[MOBILE_CLIENT_API.md](MOBILE_CLIENT_API.md) describes (edge token, bearer token, presign,
+4 parallel PUTs, job, polling, wardrobe) and prints each step:
+
+```bash
+source /venv/main/bin/activate
+python scripts/mobile_flow_test.py --storage-host localhost:10200 test-images
+```
+
+`--storage-host` is only for running it **on the server itself**: a PUT from inside the
+container to its own public IP hairpins through vast.ai's NAT at ~5 KB/s and times out on
+a phone photo. It sends the same signed URL and edge cookie to the same Caddy edge, just
+via its local address. A real client off the box needs no flag.
+
+### Object storage binary
+
+MinIO's community server is archived and `dl.min.io` now answers `410 Gone` for every
+release, so `/opt/minio/minio` has to be built from the archived source:
+
+```bash
+curl -sSL https://go.dev/dl/go1.25.4.linux-amd64.tar.gz | tar -C /usr/local -xz
+git clone --depth 1 --branch RELEASE.2025-10-15T17-29-55Z https://github.com/minio/minio.git /opt/src/minio
+cd /opt/src/minio && CGO_ENABLED=0 /usr/local/go/bin/go build -trimpath -ldflags "-s -w" -o /opt/minio/minio .
+```
 
 ## Usage
 
