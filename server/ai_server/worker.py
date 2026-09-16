@@ -19,8 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for t
 
 import test_extract_outfit as pipeline  # noqa: E402
 
-from server.ai_server import report  # noqa: E402
-from server.common import queue, storage  # noqa: E402
+from server.common import queue, report, storage  # noqa: E402
 from server.common.config import get_settings  # noqa: E402
 from server.common.embeddings import cosine_similarity  # noqa: E402
 
@@ -83,6 +82,8 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
         # where no garment is visible. Reporting no garments is the honest answer, and
         # it saves ~20s of generation that would only invent an outfit.
         log.info("job %s item %s: no garment detected, nothing to extract", job_id, item_id)
+        _write_report(job_id, item_id, raw_path, isolated_path, tmp_dir / "result.png",
+                      [], [], [], detected, items, "", settings)
         return []
     prompt = pipeline.build_prompt(detected)
 
@@ -138,7 +139,8 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
             original=raw_path,
             isolated=isolated_path if detected.get("isolated_by_sam") else None,
             grid=result_path, crops=crops, records=records,
-            kept_names={r["image_name"] for r in kept},
+            object_keys={r["image_name"]: storage.item_object_key(job_id, item_id, idx)
+                         for idx, r in enumerate(kept, start=1)},
             detected={**detected, "_asked_items": items}, prompt=prompt,
         )
         report.build_index(settings.wardrobe_report_dir)
