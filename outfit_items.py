@@ -232,7 +232,8 @@ def _box_contains(outer, inner, tol):
             and outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
 
 
-def _rescue_person_box_for_face(person_model, person_pre, image, person_boxes, face_bbox):
+def _rescue_person_box_for_face(person_model, person_pre, image, person_boxes, face_bbox,
+                                other_face_bboxes=()):
     """Nhận lại box người bị loại vì điểm thấp, khi nó ôm khuôn mặt chủ thể sát hơn mọi
     box còn sống.
 
@@ -246,10 +247,21 @@ def _rescue_person_box_for_face(person_model, person_pre, image, person_boxes, f
     khi có một box bị loại vừa chứa khuôn mặt đó vừa NHỎ HƠN box đang thắng, nhận nó lại.
     Đo trên 59 ảnh của 3 job: đúng **1** ảnh thoả - chính ảnh hỏng - không ảnh nào khác
     bị đụng.
+
+    Chỉ cứu khi box đang thắng CHỨA THÊM khuôn mặt của người khác - đó mới là dấu hiệu nó
+    thuộc về người đứng trước. Nếu nó chỉ chứa mỗi khuôn mặt chủ thể thì nó đã là box của
+    chủ thể, và một box điểm thấp nhỏ hơn thường chỉ là mảnh vỡ của CHÍNH người đó: ảnh
+    0646, box đúng [0,1976,871,3586] (0.969) bị thay bằng mảnh [208,1999,872,2942] (0.350)
+    cụt vai và thân dưới, SAM chỉ lấy được mặt và bàn tay, D1 vẽ ra đầu người làm "áo".
+    Ca gốc (9668) vẫn được cứu: box người phụ nữ chứa cả khuôn mặt cô ấy.
     """
     tol = 0.05 * (face_bbox[3] - face_bbox[1])
     current = sorted((b for b in person_boxes if _box_contains(b, face_bbox, tol)),
                      key=_box_area)
+    if current and not any(
+            _box_contains(current[0], other, 0.05 * (other[3] - other[1]))
+            for other in other_face_bboxes):
+        return None
     tighter = [
         b for score, b in byface.scored_person_boxes(person_model, person_pre, image,
                                                      PERSON_RESCUE_FLOOR)
@@ -349,15 +361,17 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         ref_embedding = byface.find_reference_embedding(face_app, Path(selfie_path))
         timing["face_ref_embed"] = time.time() - t
         t = time.time()
-        face, face_similarity = byface.match_face_in_group(face_app, image, ref_embedding)
+        face, face_similarity, all_faces = byface.match_face_in_group(
+            face_app, image, ref_embedding, return_all=True)
         timing["face_match_group"] = time.time() - t
         if face is None or face_similarity < face_match_threshold:
             raise ValueError(
                 f"No face in {image_path} matches the selfie "
                 f"(best similarity={face_similarity:.3f}, need >= {face_match_threshold})"
             )
-        rescued = _rescue_person_box_for_face(person_model, person_pre, image,
-                                              person_boxes, face.bbox.tolist())
+        rescued = _rescue_person_box_for_face(
+            person_model, person_pre, image, person_boxes, face.bbox.tolist(),
+            [f.bbox.tolist() for f in all_faces if f is not face])
         if rescued is not None:
             person_boxes = person_boxes + [rescued]
         target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)

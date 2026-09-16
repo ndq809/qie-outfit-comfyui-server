@@ -280,7 +280,8 @@ function apply(){{
   try{{history.replaceState(null,'',term?'#id='+encodeURIComponent(q.value.trim()):location.pathname+location.search)}}catch(e){{}}
 }}
 q.addEventListener('input',apply);
-const m=location.hash.match(/^#id=(.+)$/);if(m){{q.value=decodeURIComponent(m[1]);apply();}}
+function fromHash(){{const m=location.hash.match(/^#id=(.+)$/);if(m){{q.value=decodeURIComponent(m[1]);apply();}}}}
+fromHash();window.addEventListener('hashchange',fromHash);
 </script>
 </body></html>
 """

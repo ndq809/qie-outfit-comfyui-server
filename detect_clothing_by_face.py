@@ -125,18 +125,19 @@ def find_reference_embedding(face_app, selfie_path: Path):
     return _ref_embedding_cache[key]
 
 
-def match_face_in_group(face_app, group_image: Image.Image, ref_embedding):
+def match_face_in_group(face_app, group_image: Image.Image, ref_embedding, return_all=False):
+    """Best-matching face and its similarity; with return_all, also every face found."""
     img = np.array(group_image.convert("RGB"))[:, :, ::-1]
     faces = face_app.get(img)
     if not faces:
-        return None, 0.0
+        return (None, 0.0, []) if return_all else (None, 0.0)
 
     best_face, best_sim = None, -1.0
     for face in faces:
         sim = float(np.dot(face.normed_embedding, ref_embedding))
         if sim > best_sim:
             best_face, best_sim = face, sim
-    return best_face, best_sim
+    return (best_face, best_sim, faces) if return_all else (best_face, best_sim)
 
 
 def match_face_to_person_box(face_bbox, person_boxes):
