@@ -64,8 +64,13 @@ ITEM_PHRASES = [
     # the README's prompt-tuning notes say not to do. It was also drawing skirts on male
     # subjects. "garment" has to stay in the phrase though: with a bare "top"/"bottom"
     # the model drew bags and pouches instead of clothes (see build_prompt).
-    ("top", "upper-body garment"),
-    ("bottom", "lower-body garment"),
+    # The flat-lay state each garment should render in is folded into the phrase
+    # itself rather than added as a separate trailing sentence - it only ever needs
+    # to appear when the item itself does, which naming it here gets for free (see
+    # prompt_items()'s detected-key filter) instead of a second conditional in
+    # build_prompt() doing the same gating twice.
+    ("top", "upper-body garment in symmetric flat lay"),
+    ("bottom", "lower-body garment with both legs visible"),
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
@@ -205,32 +210,14 @@ def build_prompt(detected):
     items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))
-    item_word = "item" if n == 1 else "items"
-    parts = [
-        f"Arrange in {_grid_shape_desc(n)}, exactly {n} {item_word} total, one item per "
-        f"cell: {placements}. Plain white background, each item placed separately with a "
-        "wide gap of clear white space between them, no touching, no overlapping, nothing "
-        "else in the frame."
-    ]
+    parts = [f"Arrange in {_grid_shape_desc(n)}: {placements}. Plain white background, no overlapping."]
     # Only describe how the bag should be laid out when a bag was actually detected -
     # naming/describing a category that isn't confirmed present (even to say how it
     # should look) measurably increases the chance the model draws one anyway (see
     # README "Prompt-tuning notes"). This line used to be unconditional, which is why
     # a bag kept appearing in results even when detected["bag"] was False.
     if detected.get("bag"):
-        parts.append(
-            "The bag lies flat on its own with its strap coiled neatly beside it, not "
-            "worn or draped over any other item."
-        )
-    # D1 was drawing tops two ways (symmetric flat lay, or one side folded/draped over)
-    # and pants two ways (both legs spread flat, or one leg folded under the other) -
-    # only one of each is wanted, named as short states rather than described, same as
-    # the bag clause above. Gated on detection for the same reason the bag clause is:
-    # naming a category that isn't present risks drawing it.
-    if detected.get("top") or detected.get("outer"):
-        parts.append("Tops: symmetric flat lay.")
-    if detected.get("bottom"):
-        parts.append("Pants: spread flat lay, both legs visible.")
+        parts.append("The bag lies flat on its own with no strap.")
     parts.append("Professional flat mockup photography.")
     return " ".join(parts)
 
