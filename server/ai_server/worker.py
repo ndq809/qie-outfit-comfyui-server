@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for t
 
 import test_extract_outfit as pipeline  # noqa: E402
 
-from server.common import queue, report, storage  # noqa: E402
+from server.common import params, queue, report, storage  # noqa: E402
 from server.common.config import get_settings  # noqa: E402
 from server.common.embeddings import cosine_similarity  # noqa: E402
 
@@ -75,7 +75,10 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
     storage.download_to(settings.minio_raw_bucket, object_key, raw_path)
 
     isolated_path = tmp_dir / "isolated.png"
+    t0 = time.perf_counter()
     detected = _detect_with_face_ref(raw_path, face_ref_key, isolated_path, tmp_dir, settings)
+    stages = [params.detect_stage(detected, raw_path, time.perf_counter() - t0)]
+
     items = pipeline.prompt_items(detected)
     if not items:
         # Nothing was found on the subject - a head-and-shoulders portrait, or a crop
@@ -83,7 +86,7 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
         # it saves ~20s of generation that would only invent an outfit.
         log.info("job %s item %s: no garment detected, nothing to extract", job_id, item_id)
         _write_report(job_id, item_id, raw_path, isolated_path, tmp_dir / "result.png",
-                      [], [], [], detected, items, "", settings)
+                      [], [], [], detected, items, "", stages, settings)
         return []
     prompt = pipeline.build_prompt(detected)
 
@@ -92,16 +95,36 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
         generation_image_path = str(isolated_path)
 
     result_path = tmp_dir / "result.png"
-    _run_comfyui(generation_image_path, prompt, result_path)
+    t0 = time.perf_counter()
+    d1_timing = {}
+    workflow = _run_comfyui(generation_image_path, prompt, result_path, timing=d1_timing)
+    stages.append(params.generate_stage(
+        workflow, generation_image_path == str(isolated_path), result_path,
+        time.perf_counter() - t0, d1_timing))
 
+    # crop_items + classify_crops rather than extract_and_classify, so the report can
+    # time the segmenter and the classifier separately - they are different models.
     crop_dir = tmp_dir / "items"
-    crops, records = pipeline.extract_and_classify(
-        result_path, crop_dir, items=items, classify=True, device=None,
-    )
+    t0 = time.perf_counter()
+    crop_timing = {}
+    crops = pipeline.crop_items(result_path, crop_dir, items=items, device=None,
+                                timing=crop_timing)
+    stages.append(params.crop_stage(items, crops, time.perf_counter() - t0, crop_timing))
+
+    t0 = time.perf_counter()
+    classify_timing = {}
+    records = (pipeline.classify_crops(crop_dir, device=None, timing=classify_timing)
+               if crops else [])
+    stages.append(params.classify_stage(records, time.perf_counter() - t0, classify_timing))
+
+    t0 = time.perf_counter()
     kept = _drop_same_image_duplicates(records) if records else []
+    stages.append(params.dedup_stage(records, kept, SAME_IMAGE_DEDUP_THRESHOLD,
+                                     settings.wardrobe_dedup_threshold,
+                                     time.perf_counter() - t0))
 
     _write_report(job_id, item_id, raw_path, isolated_path, result_path,
-                  crops, records, kept, detected, items, prompt, settings)
+                  crops, records, kept, detected, items, prompt, stages, settings)
     if not records:
         return []
 
@@ -128,7 +151,7 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
 
 
 def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
-                  crops, records, kept, detected, items, prompt, settings):
+                  crops, records, kept, detected, items, prompt, stages, settings):
     """Test-only (WARDROBE_REPORT_DIR). Wrapped so a reporting problem can never fail a
     job whose extraction actually worked."""
     if not settings.wardrobe_report_dir:
@@ -142,6 +165,7 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
             object_keys={r["image_name"]: storage.item_object_key(job_id, item_id, idx)
                          for idx, r in enumerate(kept, start=1)},
             detected={**detected, "_asked_items": items}, prompt=prompt,
+            stages=stages,
         )
         report.build_index(settings.wardrobe_report_dir)
     except Exception:
@@ -189,10 +213,19 @@ def _drop_same_image_duplicates(records: list[dict]) -> list[dict]:
     return kept
 
 
-def _run_comfyui(image_path: str, prompt: str, result_path: Path, seed: int = 42):
+def _run_comfyui(image_path: str, prompt: str, result_path: Path, seed: int = 42,
+                 timing: dict | None = None) -> dict:
+    """Returns the workflow that produced the image, so the report can state the
+    generation settings it actually ran with instead of restating the defaults.
+
+    timing: optional dict, filled with where the wall time went - uploading the photo,
+    ComfyUI's own execution (taken from its history timestamps, so it excludes this
+    loop's 2s polling granularity), and fetching the result."""
     settings = get_settings()
     comfy_url = settings.comfyui_url
+    t = time.perf_counter()
     image_name = pipeline.upload_image(image_path)
+    upload_s = time.perf_counter() - t
     workflow = pipeline.build_workflow(image_name, prompt, seed=seed, lightning_steps=4, fp8=True)
 
     client_id = uuid.uuid4().hex
@@ -216,9 +249,24 @@ def _run_comfyui(image_path: str, prompt: str, result_path: Path, seed: int = 42
                 saved = [img["filename"] for out in outputs.values() for img in out.get("images", [])]
                 if not saved:
                     raise RuntimeError("ComfyUI produced no image output")
+                t = time.perf_counter()
                 pipeline.download_output(saved[0], result_path)
-                return
+                if timing is not None:
+                    timing.update({"tải ảnh lên ComfyUI": round(upload_s, 3),
+                                   "ComfyUI thực thi": _execution_seconds(status),
+                                   "tải ảnh grid về": round(time.perf_counter() - t, 3)})
+                return workflow
             if status.get("status_str") == "error":
                 raise RuntimeError(f"ComfyUI generation failed: {json.dumps(status)}")
         time.sleep(2)
     raise RuntimeError(f"ComfyUI generation timed out for prompt_id={prompt_id}")
+
+
+def _execution_seconds(status: dict) -> float | None:
+    """How long ComfyUI itself spent on the graph, from the millisecond timestamps it
+    records in /history. Measured there rather than here so the number is the model's
+    time, not the model's time plus however late this loop's next poll happened to be."""
+    stamps = {m[0]: m[1].get("timestamp") for m in status.get("messages", [])
+              if isinstance(m, (list, tuple)) and len(m) == 2 and isinstance(m[1], dict)}
+    start, end = stamps.get("execution_start"), stamps.get("execution_success")
+    return round((end - start) / 1000, 3) if start and end else None

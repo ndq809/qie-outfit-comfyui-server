@@ -442,6 +442,23 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     result["timing"] = {k: round(v, 3) for k, v in timing.items()}
     if face_similarity is not None:
         result["face_similarity"] = round(float(face_similarity), 4)
+    # Reported rather than re-derived by the caller: the thresholds below are the ones
+    # this call actually ran with, including a per-request override and OUTFIT_ITEMS_DEVICE.
+    result["params"] = {
+        "detector_model": clothing.MODEL_NAME,
+        "person_model": "torchvision fasterrcnn_mobilenet_v3_large_320_fpn (CPU)",
+        "sam_model": byface.SAM_MODEL_NAME,
+        "face_model": f"insightface {byface.FACE_MODEL_PACK} (ArcFace)",
+        "threshold": threshold,
+        "class_thresholds": CLASS_THRESHOLDS,
+        "person_score_threshold": clothing.PERSON_SCORE_THRESHOLD,
+        "face_match_threshold": face_match_threshold,
+        "multi_scale_tta": MULTI_SCALE,
+        "person_crop_tta": True,
+        "subject_item_min_frac": SUBJECT_ITEM_MIN_FRAC,
+        "item_inside_person_frac": ITEM_INSIDE_PERSON_FRAC,
+        "device": DEVICE,
+    }
     return result
 
 

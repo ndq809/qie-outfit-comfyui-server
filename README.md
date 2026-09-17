@@ -182,6 +182,16 @@ the prompt asked for versus how many were found, the exact D1 prompt, and each c
 tags. Crops dropped by D2 as duplicates are still shown, outlined and labelled — that is
 usually the answer to "why is this item missing from my wardrobe".
 
+Under each card is one panel per model the photo went through (D0b detector, D1
+generation, D3a crop segmenter, D3b classifier, D2 dedup), with the settings that run
+used and its own timing — the detector's thresholds, D1's steps/cfg/sampler/seed and
+every checkpoint and LoRA filename, the segmenter's area and merge fractions, the dedup
+similarity floors. These are read back from what ran (`server/common/params.py`): the
+detector reports the thresholds it was called with, and D1's settings come out of the
+workflow ComfyUI actually executed, so the page cannot quietly show a stale default. It
+is the other half of the answer to "why did this photo come out like this" — a garment
+goes missing because a threshold sat above its score, which no picture shows.
+
 Cards are grouped by job, newest first, with only the newest expanded. The search box at
 the top filters by photo id **across every job at once**, which is how a change gets
 judged: type `197` and you get that photo from each run in turn. A flat chronological

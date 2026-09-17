@@ -564,7 +564,7 @@ def _isolate_on_background(img, box, alpha, bg, pad_frac=0.08):
     return Image.fromarray(out.round().clip(0, 255).astype(np.uint8))
 
 
-def crop_items(result_path, out_dir, items=None, device=None):
+def crop_items(result_path, out_dir, items=None, device=None, timing=None):
     """Lift every item out of the generated grid into its own square PNG.
 
     Each item is segmented from the grid class-agnostically (_segment_items) and then
@@ -574,13 +574,18 @@ def crop_items(result_path, out_dir, items=None, device=None):
     items: the phrase list build_prompt() asked for, in grid order, used to name the
     crops. Only trusted when the number of items found matches the number asked for -
     if the model dropped or added a cell, positional names are used instead of
-    mislabelling e.g. a bag as "footwear"."""
+    mislabelling e.g. a bag as "footwear".
+    timing: optional dict, filled with the seconds the segmenter itself took, apart
+    from the compositing around it."""
     result_img = Image.open(result_path).convert("RGB")
     img = np.array(result_img)
     t = time.time()
     found = _segment_items(result_img, device=device,
                            expected=len(items) if items else None)
-    print(f"  [crop-segmenter model timing] birefnet={time.time() - t:.3f}s")
+    birefnet = time.time() - t
+    if timing is not None:
+        timing["birefnet"] = round(birefnet, 3)
+    print(f"  [crop-segmenter model timing] birefnet={birefnet:.3f}s")
     if items and len(items) != len(found):
         print(f"  note: prompt asked for {len(items)} items but {len(found)} were found "
               f"in the result - falling back to positional names")
@@ -608,7 +613,7 @@ def crop_items(result_path, out_dir, items=None, device=None):
 
 # --- Step 2: classify each crop with the Magic Eye model -------------------------
 
-def classify_crops(crop_dir, bundle=MAGIC_EYE_BUNDLE, device=None):
+def classify_crops(crop_dir, bundle=MAGIC_EYE_BUNDLE, device=None, timing=None):
     """Run every crop through the Magic Eye wardrobe classifier and write
     wardrobe_index.json next to them.
 
@@ -620,7 +625,7 @@ def classify_crops(crop_dir, bundle=MAGIC_EYE_BUNDLE, device=None):
     import wardrobe_classifier
 
     records = wardrobe_classifier.classify_images(
-        Path(crop_dir), bundle_dir=Path(bundle), device=device)
+        Path(crop_dir), bundle_dir=Path(bundle), device=device, timing=timing)
     out_json = Path(crop_dir) / "wardrobe_index.json"
     out_json.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
     return records

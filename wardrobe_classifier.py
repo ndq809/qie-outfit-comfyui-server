@@ -177,11 +177,22 @@ def _check_bundle(bundle_dir: Path):
             f"actual weights. Run `git lfs install` (once per machine) and `git lfs pull`.")
 
 
+_models_cache = {}
+
+
 def load_models(bundle_dir=BUNDLE_DIR, device=None, backbone_name=BACKBONE_NAME):
+    """Lazy singleton per (bundle, device, backbone), like the crop segmenter's cache in
+    test_extract_outfit. The ai-server worker classifies a fresh batch of crops for every
+    photo, and re-reading phase2.pt + phase3.pt each time was measured at ~2s per photo -
+    more than the classification itself, which runs in ~0.02s once the weights are warm."""
     bundle_dir = Path(bundle_dir)
     _check_bundle(bundle_dir)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    key = (str(bundle_dir), str(device), backbone_name)
+    if key in _models_cache:
+        return _models_cache[key]
 
     taxonomy = load_taxonomy(bundle_dir / "taxonomy.json")
 
@@ -214,16 +225,21 @@ def load_models(bundle_dir=BUNDLE_DIR, device=None, backbone_name=BACKBONE_NAME)
         T.ToTensor(),
         T.Normalize(proc.image_mean, proc.image_std),
     ])
-    return model_p2, model_p3, taxonomy, transform, device
+    _models_cache[key] = (model_p2, model_p3, taxonomy, transform, device)
+    return _models_cache[key]
 
 
 @torch.no_grad()
 def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
-                    multi_label_threshold=0.5, verbose=True):
+                    multi_label_threshold=0.5, verbose=True, timing=None):
     """Classify a list of image paths (or every image in a folder).
 
     Returns one record per image, in the wardrobe_index.json shape: the eight
-    attributes, a generated description, and the visual/text embeddings."""
+    attributes, a generated description, and the visual/text embeddings.
+
+    timing: optional dict, filled with the per-model seconds this call spent
+    (load / phase2 / phase3) so a caller can report them rather than only read
+    them off the log line below."""
     bundle_dir = Path(bundle_dir)
     if isinstance(images, (str, Path)):
         images = scan_images(Path(images))
@@ -296,6 +312,9 @@ def classify_images(images, bundle_dir=BUNDLE_DIR, device=None, batch_size=16,
                 "visual_embedding": visual_cpu[i].tolist(),
                 "text_embedding": text_cpu[i].tolist(),
             })
+    if timing is not None:
+        timing.update({"load": round(load_time, 3), "phase2": round(phase2_time, 3),
+                       "phase3": round(phase3_time, 3)})
     if verbose:
         print(f"  [D3 model timing] load={load_time:.3f}s phase2={phase2_time:.3f}s "
               f"phase3={phase3_time:.3f}s (n={len(results)} crops)")

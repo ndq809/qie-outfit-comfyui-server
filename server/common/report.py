@@ -8,6 +8,10 @@ grid was split. With WARDROBE_REPORT_DIR set, every stage is kept side by side i
 
     original photo -> SAM-isolated subject -> generated garment grid -> per-item crops
 
+Beside them: the prompt D1 was given, and what every model in the chain ran with
+(server.common.params) - a garment goes missing because a threshold sat above its
+score or because the generation ran at 4 steps, neither of which the pictures show.
+
 Keep it empty in production: it retains the user's original photo on disk.
 """
 import html
@@ -36,7 +40,8 @@ WARDROBE = "wardrobe.json"
 
 def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
                 isolated: Path | None, grid: Path, crops: list, records: list,
-                object_keys: dict, detected: dict, prompt: str) -> Path:
+                object_keys: dict, detected: dict, prompt: str,
+                stages: list | None = None) -> Path:
     """Copy one photo's four stages into <report_dir>/<job_id>/<item_id>/ and write the
     metadata the page needs beside them. Never raises into the worker: a broken report
     must not fail a job that otherwise succeeded."""
@@ -74,8 +79,10 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
         "jobId": job_id, "itemId": item_id,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "detected": {k: v for k, v in detected.items()
-                     if k not in ("timing",) and not k.startswith("_")},
+                     if k not in ("timing", "params") and not k.startswith("_")},
         "prompt": prompt,
+        # What every model in the pipeline ran with (server.common.params).
+        "stages": stages or [],
         "askedItems": detected.get("_asked_items"),
         "items": items,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -171,6 +178,11 @@ def _render(photos: list) -> str:
                       (i.get("wardrobe") or {}).get("added") is False)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     groups = _group_by_job(photos)
+    # The same photo id usually appears in several jobs; the filter is how they get
+    # compared, so offer the ids instead of making the tester remember them.
+    ids = sorted({str(p.get("itemId")) for p in photos}, key=_photo_sort_key)
+    ids_options = "".join(f'<option value="{html.escape(i)}">' for i in ids)
+    sample_id = ids[0] if ids else "9652"
 
     sections = []
     for job, group in groups:
@@ -245,6 +257,30 @@ figure.dupe{{outline:2px solid var(--warn);outline-offset:-2px;opacity:.75}}
 .prompt h4{{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 4px}}
 pre{{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:10px;margin:0;
   font-size:12px;white-space:pre-wrap;word-break:break-word}}
+.params{{margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card)}}
+.params>summary{{cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--muted);font-weight:600;list-style:none}}
+.params>summary::-webkit-details-marker{{display:none}}
+.params>summary::before{{content:"▸ ";color:var(--accent)}}
+.params[open]>summary::before{{content:"▾ "}}
+.pgrid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:10px}}
+.panel{{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}}
+.panel h5{{margin:0 0 6px;font-size:12px;display:flex;justify-content:space-between;gap:8px;align-items:baseline}}
+.panel .secs{{font-family:ui-monospace,monospace;color:var(--accent);font-weight:600;flex:none}}
+.panel dl{{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 8px;font-size:11.5px}}
+.panel dt{{color:var(--muted);min-width:0;overflow-wrap:anywhere}}
+.panel dd{{margin:0;font-family:ui-monospace,monospace;overflow-wrap:anywhere}}
+.panel dd.m{{color:var(--accent)}}
+.panel .note{{margin:6px 0 0;font-size:11px;color:var(--soft);line-height:1.4}}
+.timing{{margin-top:8px;border-top:1px dashed var(--line);padding-top:6px}}
+.timing h6{{margin:0 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--muted);font-weight:600}}
+.trow{{position:relative;display:flex;gap:8px;align-items:baseline;justify-content:space-between;
+  font-size:11px;padding:2px 4px;border-radius:4px;margin-bottom:1px;overflow:hidden}}
+.trow span{{color:var(--ink);overflow-wrap:anywhere;position:relative}}
+.trow i{{position:absolute;left:0;top:0;bottom:0;background:var(--accent);opacity:.18;
+  border-radius:4px}}
+.trow b{{font-family:ui-monospace,monospace;font-weight:600;position:relative;flex:none}}
 .toolbar{{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 0;margin-bottom:10px;
   display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line)}}
 .toolbar input{{font:inherit;padding:7px 11px;border-radius:8px;border:1px solid var(--line);
@@ -256,11 +292,13 @@ pre{{background:var(--chip);border:1px solid var(--line);border-radius:8px;paddi
 </style></head><body>
 <h1>Wardrobe — luồng xử lý ảnh</h1>
 <p class="sub">Mỗi ảnh theo đúng thứ tự pipeline: ảnh gốc &rarr; ảnh isolate (SAM) &rarr; ảnh grid trang phục (D1)
-&rarr; từng trang phục tách ra + phân loại (D3). &nbsp;<b>{len(photos)}</b> ảnh &middot; <b>{len(groups)}</b> job &middot;
+&rarr; từng trang phục tách ra + phân loại (D3). Dưới mỗi ảnh là prompt đã dùng và thông số
+từng model đã chạy. &nbsp;<b>{len(photos)}</b> ảnh &middot; <b>{len(groups)}</b> job &middot;
 <b>{total_items}</b> trang phục tách ra &middot; <b>{total_added}</b> vào tủ đồ &middot;
 <b>{total_dupes}</b> bị loại vì trùng (D2) &middot; tạo lúc {generated}</p>
 <div class="toolbar">
-  <input id="q" type="search" placeholder="Lọc theo id ảnh, ví dụ 9652" autocomplete="off">
+  <input id="q" type="search" list="ids" placeholder="Lọc theo id ảnh, ví dụ {html.escape(sample_id)}" autocomplete="off">
+  <datalist id="ids">{ids_options}</datalist>
   <span class="hint" id="qhint">Nhập id để chỉ hiện ảnh đó (ở mọi job).</span>
 </div>
 {body}
@@ -328,7 +366,65 @@ def _photo_card(p: dict, job: str = "") -> str:
 <div class="chips">{"".join(chips)}</div>
 <div class="prompt"><h4>Prompt đã dùng để tách trang phục</h4>
 <pre>{html.escape(prompt) if prompt else "(không gọi D1 — không có trang phục để tách)"}</pre></div>
+{_stage_params(p)}
 </article>"""
+
+
+def _stage_params(p: dict) -> str:
+    """Every model the photo went through, with the settings it ran with. Pipeline
+    order, so the panels read left to right the same way the four images above do."""
+    stages = p.get("stages") or []
+    if not stages:
+        return ""
+    timed = [s for s in stages if s.get("seconds") is not None]
+    total = sum(s["seconds"] for s in timed)
+    panels = "".join(_stage_panel(s) for s in stages)
+    slowest = max(timed, key=lambda s: s["seconds"], default=None)
+    worst = (f' &middot; chậm nhất {html.escape(slowest["title"].split(" ·")[0])} '
+             f'{_secs(slowest["seconds"])}') if slowest else ""
+    return f"""<details class="params" open>
+<summary>Thông số &amp; thời gian chạy model &middot; {len(stages)} bước &middot;
+tổng {total:.1f}s{worst}</summary>
+<div class="pgrid">{panels}</div></details>"""
+
+
+def _stage_panel(s: dict) -> str:
+    sec = s.get("seconds")
+    secs = f'<span class="secs">{_secs(sec)}</span>' if sec is not None else ""
+    rows = "".join(_param_row(k, v, cls="m") for k, v in (s.get("models") or {}).items())
+    rows += "".join(_param_row(k, v) for k, v in (s.get("params") or {}).items())
+    note = f'<p class="note">{html.escape(s["note"])}</p>' if s.get("note") else ""
+    return (f'<div class="panel"><h5>{html.escape(s.get("title", ""))}{secs}</h5>'
+            f'<dl>{rows}</dl>{_timing_block(s)}{note}</div>')
+
+
+def _timing_block(s: dict) -> str:
+    """Where this stage's seconds went, longest first, with a bar per row. A stage is
+    one number in the header; this is the only place that says which model spent it."""
+    timing = {k: v for k, v in (s.get("timing") or {}).items() if isinstance(v, (int, float))}
+    if not timing:
+        return ""
+    widest = max(timing.values()) or 1
+    rows = "".join(
+        f'<div class="trow"><span>{html.escape(str(k))}</span>'
+        f'<i style="width:{max(2, round(v / widest * 100))}%"></i>'
+        f'<b>{_secs(v)}</b></div>'
+        for k, v in sorted(timing.items(), key=lambda kv: kv[1], reverse=True))
+    return f'<div class="timing"><h6>Thời gian chạy</h6>{rows}</div>'
+
+
+def _secs(v: float) -> str:
+    return f"{v:.2f}s" if v >= 0.1 else f"{v:.3f}s"
+
+
+def _param_row(key, value, cls: str = "") -> str:
+    if isinstance(value, dict):
+        value = ", ".join(f"{k} {v}" for k, v in value.items())
+    elif isinstance(value, bool):
+        value = "có" if value else "không"
+    attr = f' class="{cls}"' if cls else ""
+    return (f"<dt>{html.escape(str(key))}</dt>"
+            f"<dd{attr}>{html.escape(str(value))}</dd>")
 
 
 def _stage_img(d: str, p: dict, key: str, alt: str) -> str:
