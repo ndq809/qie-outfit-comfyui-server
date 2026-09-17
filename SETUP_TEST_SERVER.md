@@ -150,8 +150,38 @@ import insightface, onnxruntime, cv2, boto3, redis, psycopg2, fastapi
 print('imports ok, cuda =', torch.cuda.is_available())"
 ```
 
-**Kỳ vọng:** `imports ok, cuda = True`. **Không** cài lại/nâng cấp `torch` (image đã có
-bản khớp driver).
+**Kỳ vọng:** `imports ok, cuda = True`. **Không đổi phiên bản** `torch` (image đã có bản
+khớp driver) — chỉ đổi *bản dựng CUDA* như ngay dưới đây.
+
+### Bước 5b — Đổi torch sang bản dựng cu130 (nếu `driver_max_cuda` ≥ 13.0)
+
+ComfyUI chỉ bật backend CUDA tối ưu của `comfy_kitchen` khi torch được dựng với cu130
+trở lên; với cu128 nó ghi `WARNING: You need pytorch with cu130 or higher to use
+optimized CUDA operations` rồi rơi về backend `eager` chậm hơn. Đây **không** phải nâng
+cấp torch: giữ nguyên số phiên bản, chỉ đổi bản dựng CUDA, nên không kéo theo thay đổi
+API nào.
+
+```bash
+nvidia-smi --query-gpu=driver_version --format=csv,noheader   # cần driver hỗ trợ CUDA >= 13.0
+source /venv/main/bin/activate
+python -c "import torch,torchvision;print(torch.__version__,torchvision.__version__)"  # đọc phiên bản đang có
+# Thay <T>/<V>/<A>/<C> bằng đúng các phiên bản vừa in ra — KHÔNG nâng số phiên bản.
+uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+    --reinstall-package torch --reinstall-package torchvision \
+    --reinstall-package torchaudio --reinstall-package torchcodec \
+    "torch==<T>+cu130" "torchvision==<V>+cu130" "torchaudio==<A>+cu130" "torchcodec==<C>+cu130"
+supervisorctl restart comfyui item_detector ai-server data-server
+grep -o "backend cuda: {'available': [A-Za-z]*, 'disabled': [A-Za-z]*" /var/log/portal/comfyui.log | tail -1
+```
+
+**Kỳ vọng:** `backend cuda: {'available': True, 'disabled': False` và log không còn dòng
+`You need pytorch with cu130`. Đo trên RTX 6000 Ada: D1 giảm từ ~9.3s xuống ~8.6s mỗi
+ảnh (-7%), cả job 10 ảnh từ 165s xuống 150s. Ảnh grid sinh ra **không** trùng từng pixel
+với bản cu128 (kernel khác thì quỹ đạo khuếch tán lệch nhẹ) nhưng cùng số món, cùng bố
+cục, và D3a/D3b cho ra cùng crop + cùng phân loại.
+
+Nếu instance dùng driver cũ hơn (`driver_max_cuda` < 13.0) thì bỏ qua bước này — giữ
+nguyên bản dựng của image.
 
 ## Bước 6 — Tạo `/workspace/.env`
 
