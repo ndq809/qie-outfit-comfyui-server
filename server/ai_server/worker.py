@@ -258,7 +258,10 @@ def _run_comfyui(image_path: str, prompt: str, result_path: Path, seed: int = 42
                 return workflow
             if status.get("status_str") == "error":
                 raise RuntimeError(f"ComfyUI generation failed: {json.dumps(status)}")
-        time.sleep(2)
+        # A generation takes ~9.5s, so a 2s poll left an average 0.5s of it already
+        # finished but not yet noticed - measurable next to the generation itself once
+        # the report started timing this. /history on a known id is a dict lookup.
+        time.sleep(0.25)
     raise RuntimeError(f"ComfyUI generation timed out for prompt_id={prompt_id}")
 
 
