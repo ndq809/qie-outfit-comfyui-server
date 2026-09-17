@@ -71,14 +71,23 @@ ITEM_PHRASES = [
     # build_prompt() doing the same gating twice.
     ("top", "upper-body garment in symmetric flat lay"),
     # "with both legs visible" alone let D1 render pants with one leg folded diagonally
-    # across the other (real photo, job 05../9652) - technically both leg openings were
-    # still "visible" in that pose, so the wording didn't rule it out. Swapping in "not
-    # crossed" is what fixed it; tried it appended after "both legs visible" first and
-    # that combination still crossed the legs, so this phrase replaces rather than
-    # extends the old one. Re-verified on two photos that already rendered pants
-    # correctly before this change (jobs 464b.../49, cc38.../658) - still two clean,
-    # parallel legs, no regression.
-    ("bottom", "lower-body garment, legs straight and parallel, not crossed"),
+    # across the other on some photos (e.g. job 05../9652) - both leg openings are
+    # technically still "visible" in that pose, so the wording didn't rule it out. The
+    # word that reliably fixes it is "straight" ("legs straight and parallel, not
+    # crossed") - but it comes with a worse side effect: on 9652 the actual garment is
+    # shorts (confirmed against the source photo), and every phrasing that included
+    # "straight" rendered them as full-length trousers instead, regardless of step
+    # count (tried lightning_steps=8 too) or adding an explicit "same length as
+    # original"/"unchanged length" clause (ignored, or it broke "not crossed" entirely
+    # if placed before it). 17 wordings tried in total. Every phrasing *without*
+    # "straight" kept the correct shorts length but did not fix the crossing.
+    # Decided in favor of correct garment length over uncrossed legs - a fabricated
+    # garment length is wrong data (what gets stored/shown for the item), a crossed
+    # flat-lay is a cosmetic pose issue. So this stays "both legs visible", not
+    # "straight" - crossed legs on a hard photo like 9652 is a known, accepted
+    # limitation until a non-wording fix (e.g. LoRA strength, more steps with a
+    # different sampler) is found.
+    ("bottom", "lower-body garment with both legs visible, not crossed"),
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
