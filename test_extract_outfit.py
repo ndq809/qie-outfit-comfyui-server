@@ -210,7 +210,8 @@ def build_prompt(detected):
     items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))
-    parts = [f"Arrange in {_grid_shape_desc(n)}: {placements}. Plain white background, no overlapping."]
+    parts = [f"Arrange in {_grid_shape_desc(n)}: {placements}. Plain white background, "
+             "no overlapping between each item."]
     # Only describe how the bag should be laid out when a bag was actually detected -
     # naming/describing a category that isn't confirmed present (even to say how it
     # should look) measurably increases the chance the model draws one anyway (see
