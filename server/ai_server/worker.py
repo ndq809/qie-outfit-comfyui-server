@@ -172,6 +172,31 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
         log.exception("could not write the extraction report for %s/%s", job_id, item_id)
 
 
+_FACE_REF_DIR = Path(tempfile.gettempdir()) / "wardrobe_face_refs"
+
+
+def _cached_face_ref(face_ref_key: str, settings) -> Path:
+    """The reference photo on disk, at a path that is stable while its content is.
+
+    It used to land in the ticket's own temp dir, so every photo re-downloaded the same
+    file - and, worse, handed the detector a path it had never seen. The ArcFace
+    embedding cache is keyed on (path, mtime, size), so a fresh path every time meant it
+    never hit and the selfie was re-embedded per photo (measured ~0.15s each; that
+    cache's own comment reports 216-391ms on other machines).
+
+    Named by ETag, not by key: face_object_key() is stable per account, so re-registering
+    a different selfie reuses the key and a key-named cache would keep serving the old
+    face forever. The ETag is the object's content hash, so new content is a new path and
+    both caches miss exactly when they should. The HEAD costs ~1ms against local MinIO."""
+    head = storage.s3_client().head_object(Bucket=settings.minio_raw_bucket, Key=face_ref_key)
+    etag = "".join(c for c in head["ETag"] if c.isalnum() or c == "-")
+    dest = _FACE_REF_DIR / f"{etag}{Path(face_ref_key).suffix or '.jpg'}"
+    if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        storage.download_to(settings.minio_raw_bucket, face_ref_key, dest)
+    return dest
+
+
 def _detect_with_face_ref(raw_path: Path, face_ref_key: str | None, isolated_path: Path,
                           tmp_dir: Path, settings) -> dict:
     """D0b. The ticket carries only a key (wardrobe-system-spec.md §2.3.7) — where it
@@ -183,8 +208,7 @@ def _detect_with_face_ref(raw_path: Path, face_ref_key: str | None, isolated_pat
     selfie_path = None
     if face_ref_key:
         try:
-            selfie_path = str(storage.download_to(
-                settings.minio_raw_bucket, face_ref_key, tmp_dir / Path(face_ref_key).name))
+            selfie_path = str(_cached_face_ref(face_ref_key, settings))
         except Exception:
             log.warning("face reference %s could not be fetched; using largest person in frame",
                         face_ref_key)
