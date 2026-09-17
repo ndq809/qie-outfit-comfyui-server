@@ -210,8 +210,17 @@ def build_prompt(detected):
     items = prompt_items(detected)
     n = len(items)
     placements = ", ".join(f"{item} in {pos}" for item, pos in zip(items, _grid_positions(n)))
+    # "no overlapping" alone wasn't enough gap for the crop segmenter to always split
+    # items placed side by side into separate crops - it left the shirt and pants in one
+    # real photo (job cc5.../0168) close enough to be found as a single merged blob (1
+    # crop instead of 2). Measured 3 short endings on that photo plus 2 more real 2-item
+    # photos, checking whether crop_items() actually segmented them apart (not just
+    # visual inspection): "wide gap between items, no overlapping" split all 3/3; "items
+    # far apart, no overlapping" split only 2/3 (still merged one); "no touching, no
+    # overlapping" and "large gap ... not touching" both still merged the one they were
+    # meant to fix.
     parts = [f"Arrange in {_grid_shape_desc(n)}: {placements}. Plain white background, "
-             "no overlapping between each item."]
+             "wide gap between items, no overlapping."]
     # Only describe how the bag should be laid out when a bag was actually detected -
     # naming/describing a category that isn't confirmed present (even to say how it
     # should look) measurably increases the chance the model draws one anyway (see
