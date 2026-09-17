@@ -57,7 +57,7 @@ def _mark_report(job_id: str, local_id: str, outcomes: dict, settings):
         return
     try:
         report.mark_wardrobe(settings.wardrobe_report_dir, job_id, local_id, outcomes)
-        report.build_index(settings.wardrobe_report_dir)
+        report.build_index_debounced(settings.wardrobe_report_dir)
     except Exception:
         log.exception("could not update the extraction report for %s/%s", job_id, local_id)
 

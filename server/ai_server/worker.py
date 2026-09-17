@@ -167,7 +167,7 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
             detected={**detected, "_asked_items": items}, prompt=prompt,
             stages=stages,
         )
-        report.build_index(settings.wardrobe_report_dir)
+        report.build_index_debounced(settings.wardrobe_report_dir)
     except Exception:
         log.exception("could not write the extraction report for %s/%s", job_id, item_id)
 

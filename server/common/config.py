@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     # photo, which §"Bảo mật và vòng đời dữ liệu" requires deleting once extraction is
     # done. Empty = nothing is written.
     wardrobe_report_dir: str = ""
+    # build_index() rescans every job ever kept under wardrobe_report_dir on every
+    # call, so on an instance that stays up across many real batches this is what keeps
+    # a 60-photo upload from turning into an O(months of history) disk/CPU spike.
+    # Oldest job directories beyond this count are deleted (by mtime) before each scan.
+    wardrobe_report_max_jobs: int = 30
+    # build_index() is called once per photo from ai-server (worker.py) and again from
+    # data-server's result_consumer thread — a burst upload otherwise triggers a full
+    # rescan-and-rewrite twice per photo, back to back, in the same process serving the
+    # public API. Calls within this window collapse into a single trailing rebuild.
+    wardrobe_report_debounce_seconds: float = 5.0
 
     @property
     def postgres_dsn(self) -> str:

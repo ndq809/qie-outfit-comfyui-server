@@ -17,10 +17,14 @@ Keep it empty in production: it retains the user's original photo on disk.
 import html
 import json
 import shutil
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
+
+from .config import get_settings
 
 # The page shows a downscaled copy and links to the file itself. A phone original is
 # ~7MB, so a dozen photos would otherwise be a ~100MB page for images displayed a few
@@ -120,9 +124,24 @@ def _safe(name: str) -> str:
 
 # --- the page ----------------------------------------------------------------------
 
+def _prune_old_jobs(root: Path, keep: int):
+    """Delete the oldest job directories beyond `keep`, newest-mtime first. Cheap
+    (one stat per top-level job dir, no file reads) — what makes build_index()'s cost
+    bounded by `keep` instead of by how long the instance has been running."""
+    if keep <= 0:
+        return
+    job_dirs = [p for p in root.iterdir() if p.is_dir()]
+    if len(job_dirs) <= keep:
+        return
+    job_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in job_dirs[keep:]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
 def build_index(report_dir: str) -> Path:
     root = Path(report_dir)
     root.mkdir(parents=True, exist_ok=True)
+    _prune_old_jobs(root, get_settings().wardrobe_report_max_jobs)
     photos = []
     for rec_path in sorted(root.glob(f"*/*/{RECORD}")):
         try:
@@ -151,6 +170,44 @@ def build_index(report_dir: str) -> Path:
     out = root / "index.html"
     out.write_text(_render(photos), encoding="utf-8")
     return out
+
+
+_debounce_state: dict[str, dict] = {}
+_debounce_lock = threading.Lock()
+
+
+def build_index_debounced(report_dir: str, min_interval: float | None = None) -> None:
+    """Same effect as build_index(), but collapses calls that land within
+    `min_interval` seconds of each other (per process) into a single trailing
+    rebuild instead of one full rescan-and-rewrite per call. Callers on the hot path
+    (one call per processed photo, from two different processes) should use this
+    instead of calling build_index() directly."""
+    interval = (get_settings().wardrobe_report_debounce_seconds
+                if min_interval is None else min_interval)
+    do_build = False
+    with _debounce_lock:
+        state = _debounce_state.setdefault(report_dir, {"last": 0.0, "timer": None})
+        now = time.monotonic()
+        if now - state["last"] >= interval:
+            state["last"] = now
+            do_build = True
+        elif state["timer"] is None:
+            delay = interval - (now - state["last"])
+            t = threading.Timer(delay, _flush_debounced, args=(report_dir,))
+            t.daemon = True
+            state["timer"] = t
+            t.start()
+    if do_build:
+        build_index(report_dir)
+
+
+def _flush_debounced(report_dir: str) -> None:
+    with _debounce_lock:
+        state = _debounce_state.get(report_dir)
+        if state is not None:
+            state["last"] = time.monotonic()
+            state["timer"] = None
+    build_index(report_dir)
 
 
 def _group_by_job(photos: list):
