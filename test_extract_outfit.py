@@ -70,7 +70,15 @@ ITEM_PHRASES = [
     # prompt_items()'s detected-key filter) instead of a second conditional in
     # build_prompt() doing the same gating twice.
     ("top", "upper-body garment in symmetric flat lay"),
-    ("bottom", "lower-body garment with both legs visible"),
+    # "with both legs visible" alone let D1 render pants with one leg folded diagonally
+    # across the other (real photo, job 05../9652) - technically both leg openings were
+    # still "visible" in that pose, so the wording didn't rule it out. Swapping in "not
+    # crossed" is what fixed it; tried it appended after "both legs visible" first and
+    # that combination still crossed the legs, so this phrase replaces rather than
+    # extends the old one. Re-verified on two photos that already rendered pants
+    # correctly before this change (jobs 464b.../49, cc38.../658) - still two clean,
+    # parallel legs, no regression.
+    ("bottom", "lower-body garment, legs straight and parallel, not crossed"),
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
