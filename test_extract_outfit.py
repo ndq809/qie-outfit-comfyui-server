@@ -83,11 +83,12 @@ ITEM_PHRASES = [
     # "straight" kept the correct shorts length but did not fix the crossing.
     # Decided in favor of correct garment length over uncrossed legs - a fabricated
     # garment length is wrong data (what gets stored/shown for the item), a crossed
-    # flat-lay is a cosmetic pose issue. So this stays "both legs visible", not
-    # "straight" - crossed legs on a hard photo like 9652 is a known, accepted
-    # limitation until a non-wording fix (e.g. LoRA strength, more steps with a
-    # different sampler) is found.
-    ("bottom", "lower-body garment with both legs visible, not crossed"),
+    # flat-lay is a cosmetic pose issue. Dropped "not crossed" entirely rather than
+    # keep it as a no-op: it never fixed 9652's crossing without "straight" alongside
+    # it. Crossed legs on a hard photo like 9652 stays a known, accepted limitation
+    # until a non-wording fix (e.g. LoRA strength, more steps with a different
+    # sampler) is found.
+    ("bottom", "lower-body garment with both legs visible"),
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
