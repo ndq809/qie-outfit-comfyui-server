@@ -145,28 +145,17 @@ def _grid_positions(n):
 
 
 def _grid_shape_desc(n):
-    """State the grid's actual size up front (e.g. "a 2x2 grid") instead of leaving the
-    model to infer it purely from the per-item position labels. Tried a "do not repeat
-    any item" instruction first (measured: zero effect on a real regression - a 1-item
-    result still came back with 2 extra hallucinated copies of a bag visible in the
-    reference photo) - the model was filling a grid shape it assumed by itself rather
-    than disobeying an explicit "don't repeat" instruction, so telling it the shape
-    directly should remove the assumption instead of fighting its output after the fact.
-
-    An EVEN item count fills an n/2 x 2 grid exactly (no partial row), so a plain "RxC
-    grid" statement is accurate on its own.
-    An ODD item count has no rectangle that fits exactly - stating a fixed RxC here would
-    require either padding an existing cell or leaving one unlabeled (the exact bug
-    _grid_positions() above already fixes for the per-item labels). So the shape is
-    spelled out row by row instead: full rows of 2 side by side, then one final row of
-    exactly 1 item - the stated cell count always matches len(items), never more."""
-    if n == 1:
-        return "a single centered item (no grid)"
-    rows, remainder = divmod(n, 2)
-    if not remainder:
-        return f"a {rows}x2 grid"
-    row_word = "row" if rows == 1 else "rows"
-    return f"a grid: {rows} {row_word} of 2 items side by side, then 1 final row with exactly 1 item centered"
+    """2025-09-17: simplified from a spelled-out row-by-row shape (e.g. "a grid: 2 rows
+    of 2 items side by side, then 1 final row with exactly 1 item centered") down to a
+    plain "a grid" at the user's request. That detailed form was itself a measured fix
+    (see git history / this function's prior docstring): a vaguer "do not repeat any
+    item" instruction had zero effect on a real regression where a 1-item result still
+    came back with 2 hallucinated copies of a bag from the reference photo - stating the
+    grid's shape explicitly is what fixed it, because the model was filling a shape it
+    assumed by itself rather than disobeying a "don't repeat" instruction. Reverting to
+    "a grid" reopens that failure mode; if duplicated/hallucinated items reappear in the
+    D1 grid output, restore the row-by-row description this replaced."""
+    return "a single centered item (no grid)" if n == 1 else "a grid"
 
 
 def prompt_items(detected):
