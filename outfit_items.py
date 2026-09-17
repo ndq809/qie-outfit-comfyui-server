@@ -46,7 +46,6 @@ them warm across requests (see that file).
 """
 
 import os
-import tempfile
 import time
 from pathlib import Path
 
@@ -343,8 +342,10 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     )
 
     cloth_model, procs_full, procs_crop, person_model, person_pre = load_clothing_models()
-    image = Image.open(image_path).convert("RGB")
     timing = {}
+    t = time.time()
+    image = Image.open(image_path).convert("RGB")
+    timing["decode_image"] = time.time() - t
 
     t = time.time()
     person_boxes = byface.get_all_person_boxes(person_model, person_pre, image)
@@ -395,7 +396,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         t = time.time()
         pre = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
-            Path(image_path), DEVICE, threshold, resolve_dress=True,
+            image, DEVICE, threshold, resolve_dress=True,
         )
         timing["fashion_detect_locate"] = time.time() - t
         t = time.time()
@@ -404,21 +405,20 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         timing["sam_segment"] = time.time() - t
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
-            isolated.save(save_isolated_to)
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir) / "isolated.png"
-            isolated.save(tmp_path)
             t = time.time()
-            detections = clothing.predict_image(
-                cloth_model, procs_full, procs_crop, person_model, person_pre,
-                tmp_path, DEVICE, threshold, resolve_dress=True,
-            )
-            timing["fashion_detect_final"] = time.time() - t
+            isolated.save(save_isolated_to)
+            timing["save_isolated"] = time.time() - t
+        t = time.time()
+        detections = clothing.predict_image(
+            cloth_model, procs_full, procs_crop, person_model, person_pre,
+            isolated, DEVICE, threshold, resolve_dress=True,
+        )
+        timing["fashion_detect_final"] = time.time() - t
     else:
         t = time.time()
         detections = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
-            Path(image_path), DEVICE, threshold, resolve_dress=True,
+            image, DEVICE, threshold, resolve_dress=True,
         )
         timing["fashion_detect_final"] = time.time() - t
         # Nobody to paint out here, but the background still holds objects the

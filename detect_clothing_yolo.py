@@ -302,12 +302,16 @@ def load_model(device: str, multi_scale: bool, person_crop: bool):
     person_model = person_pre = None
     if person_crop:
         weights = FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT
-        # torchvision cài trong môi trường này là bản CPU-only (mismatch với
-        # build CUDA của torch) nên model người phải chạy trên CPU. Dùng biến
-        # thể "_320_" (resize nội bộ 320/640 thay vì 800/1333) vì chỉ cần bbox
-        # thô để crop, không cần độ chính xác pixel - đã đo được nhanh hơn
+        # Dùng biến thể "_320_" (resize nội bộ 320/640 thay vì 800/1333) vì chỉ cần
+        # bbox thô để crop, không cần độ chính xác pixel - đã đo được nhanh hơn
         # 2-3 lần (0.4-0.6s -> 0.07-0.24s/ảnh) mà vẫn detect đúng 100%.
-        person_model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=weights).eval()
+        #
+        # Chạy trên `device` như mọi model khác. Trước đây bị ép CPU vì torchvision
+        # trong image là bản CPU-only, không khớp build CUDA của torch; từ khi đổi
+        # sang bản dựng cu130 (SETUP_TEST_SERVER.md bước 5b) torchvision có CUDA
+        # thật, và model này đo được 0.097s trên CPU so với 0.010s trên GPU. Nó chạy
+        # 3 lần mỗi ảnh (dò người + person-crop TTA của cả hai vòng detect).
+        person_model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=weights).eval().to(device)
         person_pre = weights.transforms()
 
     return model, processors_full, processors_crop, person_model, person_pre
@@ -315,7 +319,7 @@ def load_model(device: str, multi_scale: bool, person_crop: bool):
 
 @torch.no_grad()
 def get_person_crop(person_model, person_pre, image: Image.Image):
-    x = person_pre(image).unsqueeze(0)
+    x = person_pre(image).unsqueeze(0).to(next(person_model.parameters()).device)
     out = person_model(x)[0]
     person_idx = 1  # "person" trong COCO
     mask = (out["labels"] == person_idx) & (out["scores"] > PERSON_SCORE_THRESHOLD)
@@ -581,8 +585,12 @@ def resolve_bag_worn_over_top(candidates: dict, threshold: float):
 
 @torch.no_grad()
 def predict_image(model, processors_full, processors_crop, person_model, person_pre,
-                   image_path: Path, device: str, threshold: float, resolve_dress: bool):
-    image = Image.open(image_path).convert("RGB")
+                   image_path, device: str, threshold: float, resolve_dress: bool):
+    # Accepts an already-decoded PIL image as well as a path. outfit_items has the
+    # SAM-isolated subject in memory already; making it write a full-resolution PNG
+    # just so this could re-open it cost ~0.9s of every photo on a 12MP phone frame.
+    image = (image_path if isinstance(image_path, Image.Image)
+             else Image.open(image_path).convert("RGB"))
 
     boxes, scores, labels = run_scales(model, processors_full, image, device)
 

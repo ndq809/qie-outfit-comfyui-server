@@ -94,7 +94,7 @@ def scored_person_boxes(person_model, person_pre, image: Image.Image, min_score:
 
     Tach rieng de goi y co the ha san khi CAN bang chung khac - xem
     outfit_items._rescue_person_box_for_face()."""
-    x = person_pre(image).unsqueeze(0)
+    x = person_pre(image).unsqueeze(0).to(next(person_model.parameters()).device)
     with torch.no_grad():
         out = person_model(x)[0]
     mask = (out["labels"] == 1) & (out["scores"] > min_score)

@@ -52,7 +52,8 @@ def detect_stage(detected: dict, original: Path, seconds: float) -> dict:
     if not detected.get("isolated_by_sam"):
         note = ("Chỉ 1 người trong ảnh nên không cô lập bằng SAM — lọc theo box người "
                 "(rẻ hơn và không đụng vào pixel nào).")
-    labels = {"person_detect": "dò người (Faster R-CNN)",
+    labels = {"decode_image": "giải mã ảnh gốc", "save_isolated": "ghi ảnh isolate (PNG)",
+              "person_detect": "dò người (Faster R-CNN)",
               "face_load": "nạp ArcFace", "face_ref_embed": "embed ảnh mặt tham chiếu",
               "face_match_group": "so khớp khuôn mặt",
               "sam_load": "nạp SAM", "sam_segment": "SAM tách nền",
