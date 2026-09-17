@@ -222,6 +222,15 @@ def build_prompt(detected):
             "The bag lies flat on its own with its strap coiled neatly beside it, not "
             "worn or draped over any other item."
         )
+    # D1 was drawing tops two ways (symmetric flat lay, or one side folded/draped over)
+    # and pants two ways (both legs spread flat, or one leg folded under the other) -
+    # only one of each is wanted, named as short states rather than described, same as
+    # the bag clause above. Gated on detection for the same reason the bag clause is:
+    # naming a category that isn't present risks drawing it.
+    if detected.get("top") or detected.get("outer"):
+        parts.append("Tops: symmetric flat lay.")
+    if detected.get("bottom"):
+        parts.append("Pants: spread flat lay, both legs visible.")
     parts.append("Professional flat mockup photography.")
     return " ".join(parts)
 
