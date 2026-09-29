@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from server.common import queue, storage
+from server.common import queue, report, storage
 from server.common.config import get_settings
 from server.data_server import db
 from server.data_server.result_consumer import run_result_consumer
@@ -48,6 +49,19 @@ def _mount_test_report():
         return
     app.mount("/report", StaticFiles(directory=path, html=True), name="report")
     log.info("test extraction report mounted at /report from %s", configured)
+
+
+@app.get("/report", include_in_schema=False)
+@app.get("/report/", include_in_schema=False)
+@app.get("/report/index.html", include_in_schema=False)
+def report_index():
+    """The report page, rendered when it is opened rather than after every processed
+    photo (server.common.report.render_index). Declared as a route so it wins over the
+    static mount below, which then only serves the pictures."""
+    configured = get_settings().wardrobe_report_dir
+    if not configured or not Path(configured).is_dir():
+        raise HTTPException(status_code=404, detail="report not configured")
+    return HTMLResponse(report.render_index(configured), headers={"Cache-Control": "no-cache"})
 
 
 @app.on_event("startup")

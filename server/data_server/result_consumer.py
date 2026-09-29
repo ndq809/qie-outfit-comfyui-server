@@ -57,7 +57,6 @@ def _mark_report(job_id: str, local_id: str, outcomes: dict, settings):
         return
     try:
         report.mark_wardrobe(settings.wardrobe_report_dir, job_id, local_id, outcomes)
-        report.build_index_debounced(settings.wardrobe_report_dir)
     except Exception:
         log.exception("could not update the extraction report for %s/%s", job_id, local_id)
 
@@ -65,11 +64,13 @@ def _mark_report(job_id: str, local_id: str, outcomes: dict, settings):
 def _insert_garment(account_id: str, user_id: str, job_id: str, job_item_id: str, garment: dict,
                     settings) -> dict:
     visual_embedding = garment["visualEmbedding"]
-    garment_type = (garment.get("tags") or {}).get("type")
-    candidates = db.wardrobe_candidates_for_dedup(account_id, garment_type)
-    match_id, score = most_similar(visual_embedding, candidates)
+    match_id, score = None, 0.0
+    if settings.wardrobe_dedup_enabled:
+        garment_type = (garment.get("tags") or {}).get("type")
+        candidates = db.wardrobe_candidates_for_dedup(account_id, garment_type)
+        match_id, score = most_similar(visual_embedding, candidates)
 
-    duplicate_of = match_id if score >= settings.wardrobe_dedup_threshold else None
+    duplicate_of = match_id if match_id and score >= settings.wardrobe_dedup_threshold else None
     if duplicate_of:
         log.info("garment deduped against %s (score=%.4f)", duplicate_of, score)
         # spec: data-server skips creating a new record for a confirmed duplicate

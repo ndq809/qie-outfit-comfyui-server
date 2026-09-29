@@ -20,5 +20,7 @@ cd "${WORKSPACE:-/workspace}/ComfyUI"
 # put its activations (measured: every item of a 10-photo job failed this way).
 # ComfyUI's normal mode already keeps the weights resident while there is room for
 # them; --reserve-vram is what tells it how much room the other two need.
-pty python main.py --listen 127.0.0.1 --port 18188 --preview-method auto \
+# Below sshd and the API in CPU and disk priority: on other instances a job burst
+# starved the SSH session until it dropped. Thread caps are in ${WORKSPACE}/.env.
+pty nice -n 10 ionice -c2 -n7 python main.py --listen 127.0.0.1 --port 18188 --preview-method none \
     ${COMFYUI_VRAM_ARGS} 2>&1

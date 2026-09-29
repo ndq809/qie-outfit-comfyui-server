@@ -225,11 +225,20 @@ COMFYUI_URL=http://127.0.0.1:18188
 ITEM_DETECTOR_URL=http://127.0.0.1:18189
 OUTFIT_ITEMS_DEVICE=cuda
 
+WARDROBE_DEDUP_ENABLED=false
 WARDROBE_DEDUP_THRESHOLD=0.90
 MAX_JOB_RETRIES=3
 
+OMP_NUM_THREADS=8
+MKL_NUM_THREADS=8
+OPENBLAS_NUM_THREADS=8
+NUMEXPR_MAX_THREADS=8
+OMP_WAIT_POLICY=PASSIVE
+
 TEST_FIXED_FACE_REF_IMAGE=/workspace/qie-outfit-comfyui-server/face-image/selfie.jpg
 WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_test
+WARDROBE_REPORT_MAX_JOBS=10
+WARDROBE_REPORT_PAGE_JOBS=5
 
 TEST_ACCOUNT_ID=
 TEST_USER_ID=
@@ -240,6 +249,20 @@ print("wrote /workspace/.env, MINIO_PUBLIC_ENDPOINT =", public_storage)
 EOF
 mkdir -p /workspace/qie-outfit-comfyui-server/wardrobe_report_test
 ```
+
+Trên card 48 GB thêm `COMFYUI_VRAM_ARGS="--reserve-vram 8"` vào `.env` (xem
+`scripts/comfyui.sh`); card 24 GB để trống.
+
+Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạt ảnh:
+
+- `OMP_NUM_THREADS`… giới hạn thread CPU của torch/onnxruntime/OpenCV. Không có chúng,
+  mỗi process ML mở một thread cho mỗi core (instance thường 64–128 core) và OpenMP
+  spin-wait chiếm hết CPU, sshd không còn lượt chạy.
+- `comfyui`, `item_detector`, `ai-server` chạy dưới `nice -n 10 ionice -c2 -n7`.
+- `WARDROBE_DEDUP_ENABLED=false`: tắt D2 (cả so trùng trong cùng ảnh lẫn so với tủ
+  đồ). Đặt `true` nếu cần.
+- Report chỉ lưu JPEG thu nhỏ của từng bước và trang `/report/` chỉ render khi có
+  người mở (có cache), không còn rebuild sau mỗi ảnh.
 
 Hai lưu ý bắt buộc:
 
@@ -367,7 +390,7 @@ Client thật ở ngoài máy không cần.
 - `face-reference {'registered': True, ..., 'source': 'test-fixture'}`
 - `upload 9/9 ok`
 - `completed processed 9/9 failed 0`
-- `wardrobe N item(s)` với N > 0 (lần đo gần nhất: 17), và `imageUrl GET 200`
+- `wardrobe N item(s)` với N > 0, và `imageUrl GET 200`
 
 Kiểm thử huỷ job (spec §2.3.6 bước 8):
 
@@ -455,7 +478,8 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 | Job đứng ở `processing`, log ai-server có `ComfyUI rejected workflow` | Thiếu/sai tên file model | So tên file ở Bước 10 với bảng "Models required" trong README |
 | CUDA OOM ở ai-server hoặc ComfyUI | GPU < 24 GB dùng chung cho detector và ComfyUI | Đặt `OUTFIT_ITEMS_DEVICE=cpu` trong `.env`, restart `item_detector ai-server` (D0b chậm hơn ~4 lần) |
 | Ảnh đen / NaN | Có ai thêm `--use-sage-attention` vào ComfyUI | Bỏ cờ đó khỏi `scripts/comfyui.sh` |
-| Wardrobe ít item hơn số crop trong report | D2 loại món trùng với đồ đã có trong tủ (ngưỡng 0.90) | Không phải lỗi — report ghi rõ "trùng đồ đã có trong tủ (sim …)" |
+| Wardrobe ít item hơn số crop trong report | D2 loại món trùng với đồ đã có trong tủ (ngưỡng 0.90) — chỉ khi `WARDROBE_DEDUP_ENABLED=true` | Không phải lỗi — report ghi rõ "trùng đồ đã có trong tủ (sim …)" |
+| SSH lag/rớt kết nối khi đang chạy job | Thread CPU không giới hạn, hoặc service ML chạy cùng độ ưu tiên với sshd | Kiểm tra `.env` có `OMP_NUM_THREADS`/`OMP_WAIT_POLICY` và script dùng `nice`; `supervisorctl restart comfyui item_detector ai-server` |
 | Log service | — | `tail -f /var/log/portal/<service>.log` |
 
 ## Thay đổi code/cấu hình về sau

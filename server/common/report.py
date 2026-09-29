@@ -13,12 +13,16 @@ Beside them: the prompt D1 was given, and what every model in the chain ran with
 score or because the generation ran at 4 steps, neither of which the pictures show.
 
 Keep it empty in production: it retains the user's original photo on disk.
+
+Cheap by construction, because it runs on the same box as the pipeline and the SSH
+session: every stage is stored once, as a downscaled JPEG (no full-size copies of a
+~7MB phone photo or a PNG grid), and the page is rendered only when someone opens it
+(data-server GET /report/), never once per processed photo.
 """
 import html
 import json
 import shutil
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,15 +30,15 @@ from PIL import Image
 
 from .config import get_settings
 
-# The page shows a downscaled copy and links to the file itself. A phone original is
-# ~7MB, so a dozen photos would otherwise be a ~100MB page for images displayed a few
-# hundred pixels wide.
+# Only a downscaled copy is kept. A phone original is ~7MB, so a dozen photos would
+# otherwise be a ~100MB page (and as much disk write per job) for images displayed a
+# few hundred pixels wide.
 PREVIEW_MAX_PX = 1000
-THUMB_SUFFIX = ".preview.jpg"
+CROP_MAX_PX = 400
 
-STAGE_ORIGINAL = "01_original"
-STAGE_ISOLATED = "02_isolated.png"
-STAGE_GRID = "03_grid.png"
+STAGE_ORIGINAL = "01_original.jpg"
+STAGE_ISOLATED = "02_isolated.jpg"
+STAGE_GRID = "03_grid.jpg"
 ITEMS_DIR = "items"
 RECORD = "record.json"
 # Written by data-server once it has run wardrobe-level D2 on this photo's garments:
@@ -52,7 +56,7 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
     out = Path(report_dir) / job_id / _safe(item_id)
     (out / ITEMS_DIR).mkdir(parents=True, exist_ok=True)
 
-    _keep(original, out / f"{STAGE_ORIGINAL}{original.suffix.lower() or '.jpg'}")
+    _keep(original, out / STAGE_ORIGINAL)
     if isolated is not None and isolated.exists():
         _keep(isolated, out / STAGE_ISOLATED)
     if grid.exists():
@@ -62,10 +66,11 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
     items = []
     for crop in crops:
         name = crop["path"].name
-        shutil.copyfile(crop["path"], out / ITEMS_DIR / name)
+        shown = Path(name).with_suffix(".jpg").name
+        _keep(crop["path"], out / ITEMS_DIR / shown, CROP_MAX_PX)
         rec = by_name.get(name, {})
         items.append({
-            "file": f"{ITEMS_DIR}/{name}",
+            "file": f"{ITEMS_DIR}/{shown}",
             "label": crop.get("label"),
             "box": crop.get("box"),
             # A crop the generator drew twice: classified, then dropped before the
@@ -102,20 +107,18 @@ def mark_wardrobe(report_dir: str, job_id: str, item_id: str, outcomes: dict):
         (out / WARDROBE).write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
 
 
-def _keep(src: Path, dest: Path):
-    """Store the file as-is, plus a downscaled JPEG beside it for the page to display."""
-    shutil.copyfile(src, dest)
+def _keep(src: Path, dest: Path, max_px: int = PREVIEW_MAX_PX):
+    """Store a downscaled JPEG of the file, nothing else. draft() lets a JPEG decode
+    straight at 1/2..1/8 scale instead of decoding all 12MP first; no optimize=True,
+    which is an extra full encoding pass for a few % of bytes."""
     try:
         with Image.open(src) as im:
+            im.draft("RGB", (max_px, max_px))
             im = im.convert("RGB")
-            im.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX))
-            im.save(dest.with_suffix(dest.suffix + THUMB_SUFFIX), quality=82, optimize=True)
+            im.thumbnail((max_px, max_px))
+            im.save(dest, quality=80)
     except Exception:
-        pass  # page falls back to the full file
-
-
-def _preview_or_self(dir_path: Path, name: str) -> str:
-    return name + THUMB_SUFFIX if (dir_path / (name + THUMB_SUFFIX)).exists() else name
+        pass  # a missing picture on a test page is not worth failing anything over
 
 
 def _safe(name: str) -> str:
@@ -124,26 +127,57 @@ def _safe(name: str) -> str:
 
 # --- the page ----------------------------------------------------------------------
 
-def _prune_old_jobs(root: Path, keep: int):
-    """Delete the oldest job directories beyond `keep`, newest-mtime first. Cheap
-    (one stat per top-level job dir, no file reads) — what makes build_index()'s cost
-    bounded by `keep` instead of by how long the instance has been running."""
-    if keep <= 0:
-        return
-    job_dirs = [p for p in root.iterdir() if p.is_dir()]
-    if len(job_dirs) <= keep:
-        return
-    job_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in job_dirs[keep:]:
-        shutil.rmtree(stale, ignore_errors=True)
+def _newest_jobs(root: Path, keep: int) -> list[Path]:
+    """Job directories, newest first; any beyond `keep` are deleted. One stat per
+    top-level job dir, no file reads."""
+    job_dirs = sorted((p for p in root.iterdir() if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if keep > 0:
+        for stale in job_dirs[keep:]:
+            shutil.rmtree(stale, ignore_errors=True)
+        job_dirs = job_dirs[:keep]
+    return job_dirs
+
+
+_render_cache = {"sig": None, "html": ""}
+_render_lock = threading.Lock()
+
+
+def render_index(report_dir: str) -> str:
+    """The page for the newest wardrobe_report_page_jobs jobs. Rebuilt only when a
+    record under them changed since the last request, so a page left open and
+    refreshed costs a few dozen stat() calls."""
+    settings = get_settings()
+    root = Path(report_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    jobs = _newest_jobs(root, settings.wardrobe_report_max_jobs)[:settings.wardrobe_report_page_jobs]
+    rec_paths = sorted(p for job in jobs for p in job.glob(f"*/{RECORD}"))
+    sig = []
+    for rec in rec_paths:
+        for f in (rec, rec.parent / WARDROBE):
+            try:
+                sig.append((str(f), f.stat().st_mtime_ns))
+            except OSError:
+                pass
+    sig = tuple(sig)
+    with _render_lock:
+        if sig and _render_cache["sig"] == sig:
+            return _render_cache["html"]
+        page = _render(_load_photos(root, rec_paths))
+        _render_cache.update(sig=sig, html=page)
+        return page
 
 
 def build_index(report_dir: str) -> Path:
-    root = Path(report_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    _prune_old_jobs(root, get_settings().wardrobe_report_max_jobs)
+    """Write the page to <report_dir>/index.html (for looking at it off-box)."""
+    out = Path(report_dir) / "index.html"
+    out.write_text(render_index(report_dir), encoding="utf-8")
+    return out
+
+
+def _load_photos(root: Path, rec_paths: list) -> list:
     photos = []
-    for rec_path in sorted(root.glob(f"*/*/{RECORD}")):
+    for rec_path in rec_paths:
         try:
             data = json.loads(rec_path.read_text(encoding="utf-8"))
         except Exception:
@@ -156,58 +190,13 @@ def build_index(report_dir: str) -> Path:
         for it in data.get("items", []):
             it["wardrobe"] = outcomes.get(it.get("objectKey") or "")
         data["_dir"] = here.relative_to(root).as_posix()
-        data["_original"] = next(
-            (p.name for p in sorted(here.glob(f"{STAGE_ORIGINAL}.*"))
-             if not p.name.endswith(THUMB_SUFFIX)), None)
+        data["_original"] = STAGE_ORIGINAL if (here / STAGE_ORIGINAL).exists() else None
         data["_isolated"] = STAGE_ISOLATED if (here / STAGE_ISOLATED).exists() else None
         data["_grid"] = STAGE_GRID if (here / STAGE_GRID).exists() else None
-        for key in ("_original", "_isolated", "_grid"):
-            data[key + "_preview"] = (
-                _preview_or_self(here, data[key]) if data.get(key) else None)
         photos.append(data)
 
     photos.sort(key=lambda d: (d.get("at") or "", d["_dir"]), reverse=True)
-    out = root / "index.html"
-    out.write_text(_render(photos), encoding="utf-8")
-    return out
-
-
-_debounce_state: dict[str, dict] = {}
-_debounce_lock = threading.Lock()
-
-
-def build_index_debounced(report_dir: str, min_interval: float | None = None) -> None:
-    """Same effect as build_index(), but collapses calls that land within
-    `min_interval` seconds of each other (per process) into a single trailing
-    rebuild instead of one full rescan-and-rewrite per call. Callers on the hot path
-    (one call per processed photo, from two different processes) should use this
-    instead of calling build_index() directly."""
-    interval = (get_settings().wardrobe_report_debounce_seconds
-                if min_interval is None else min_interval)
-    do_build = False
-    with _debounce_lock:
-        state = _debounce_state.setdefault(report_dir, {"last": 0.0, "timer": None})
-        now = time.monotonic()
-        if now - state["last"] >= interval:
-            state["last"] = now
-            do_build = True
-        elif state["timer"] is None:
-            delay = interval - (now - state["last"])
-            t = threading.Timer(delay, _flush_debounced, args=(report_dir,))
-            t.daemon = True
-            state["timer"] = t
-            t.start()
-    if do_build:
-        build_index(report_dir)
-
-
-def _flush_debounced(report_dir: str) -> None:
-    with _debounce_lock:
-        state = _debounce_state.get(report_dir)
-        if state is not None:
-            state["last"] = time.monotonic()
-            state["timer"] = None
-    build_index(report_dir)
+    return photos
 
 
 def _group_by_job(photos: list):
@@ -485,11 +474,10 @@ def _param_row(key, value, cls: str = "") -> str:
 
 
 def _stage_img(d: str, p: dict, key: str, alt: str) -> str:
-    full = p.get(key)
-    if not full:
+    shown = p.get(key)
+    if not shown:
         return ""
-    shown = p.get(key + "_preview") or full
-    return (f'<a href="{d}/{full}" target="_blank" rel="noopener">'
+    return (f'<a href="{d}/{shown}" target="_blank" rel="noopener">'
             f'<img src="{d}/{shown}" alt="{alt}" loading="lazy"></a>')
 
 

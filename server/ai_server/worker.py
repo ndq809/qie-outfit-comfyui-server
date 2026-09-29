@@ -117,11 +117,14 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
                if crops else [])
     stages.append(params.classify_stage(records, time.perf_counter() - t0, classify_timing))
 
-    t0 = time.perf_counter()
-    kept = _drop_same_image_duplicates(records) if records else []
-    stages.append(params.dedup_stage(records, kept, SAME_IMAGE_DEDUP_THRESHOLD,
-                                     settings.wardrobe_dedup_threshold,
-                                     time.perf_counter() - t0))
+    if settings.wardrobe_dedup_enabled:
+        t0 = time.perf_counter()
+        kept = _drop_same_image_duplicates(records) if records else []
+        stages.append(params.dedup_stage(records, kept, SAME_IMAGE_DEDUP_THRESHOLD,
+                                         settings.wardrobe_dedup_threshold,
+                                         time.perf_counter() - t0))
+    else:
+        kept = list(records)
 
     _write_report(job_id, item_id, raw_path, isolated_path, result_path,
                   crops, records, kept, detected, items, prompt, stages, settings)
@@ -167,7 +170,6 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
             detected={**detected, "_asked_items": items}, prompt=prompt,
             stages=stages,
         )
-        report.build_index_debounced(settings.wardrobe_report_dir)
     except Exception:
         log.exception("could not write the extraction report for %s/%s", job_id, item_id)
 
