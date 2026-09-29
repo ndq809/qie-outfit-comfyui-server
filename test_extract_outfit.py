@@ -181,6 +181,30 @@ def _grid_shape_desc(n):
     return "a single centered item (no grid)" if n == 1 else "a grid"
 
 
+def _layout_lead(n):
+    """Opening clause of the prompt, up to the colon.
+
+    Two items get their shape stated - "exactly 2 items side by side in a single row" -
+    instead of "a grid", which for two items the model read as a 2x2 grid and filled the
+    empty cells itself, almost always with a pair of trousers from the photo. Measured
+    2026-09-29 on real jobs, same inputs and seeds, only this clause changed:
+
+        photos where the LoRA drew a garment nobody asked for
+        "Arrange in a grid:"                                        6 of 18 generations
+        "Arrange exactly 2 items side by side in a single row:"     1 of 18
+        "Arrange in a grid: ... Only these 2 items, nothing else."  4 of 6 (worse on its own
+                                                                   photos - also duplicated shoes)
+
+    (707 / 0912 jacket+shoes: 4/4 -> 0/4 extra trousers; 710 jacket+trousers: extra vest
+    gone; the other 10 two-item photos kept both items. The one left, 55 hat+shirt, drew
+    an extra cap and bag either way.) This is the _grid_shape_desc note above coming
+    true for n=2; 3-4 item layouts showed no invented items in the same jobs and keep
+    "a grid"."""
+    if n == 2:
+        return "Arrange exactly 2 items side by side in a single row"
+    return f"Arrange in {_grid_shape_desc(n)}"
+
+
 def prompt_items(detected):
     """The item list the prompt asks for, in grid order (row-major). Split out of
     build_prompt() because the crop step needs the same list to label the crops it
@@ -237,7 +261,7 @@ def build_prompt(detected):
     # far apart, no overlapping" split only 2/3 (still merged one); "no touching, no
     # overlapping" and "large gap ... not touching" both still merged the one they were
     # meant to fix.
-    parts = [f"Arrange in {_grid_shape_desc(n)}: {placements}. Plain white background, "
+    parts = [f"{_layout_lead(n)}: {placements}. Plain white background, "
              "wide gap between items, no overlapping."]
     # Only describe how the bag should be laid out when a bag was actually detected -
     # naming/describing a category that isn't confirmed present (even to say how it
@@ -474,6 +498,113 @@ def _merge_regions(groups, labels, expected, cap, gap):
     return groups
 
 
+def _split_touching(groups, labels, image, expected, bg, ink_tol=30.0, valley_frac=0.35,
+                    min_piece_frac=0.15):
+    """The opposite repair to _merge_regions: fewer regions than the prompt asked for,
+    because two items were drawn touching and the segmenter returned them as one blob.
+
+    Measured on job 426d2176/315: shirt left, trousers right, the shirt's sleeve reaching
+    over the trousers' waistband. BiRefNet then also filled the ~20px strip of white
+    between the shirt body and the trouser leg, so the mask is one solid piece joined
+    along 300px - no erosion that leaves the garments standing cuts it - and the whole
+    outfit went into the wardrobe as a single "shirts" crop.
+
+    The colour image still shows the strip, though. Count, per column (and per row), the
+    pixels of the region that differ from the background colour: between two garments
+    laid side by side that count drops into a deep valley. Cut at the deepest valley
+    across the middle of the region, if it is deep enough (valley_frac of the typical
+    column), and let a watershed over the grid image decide the pixels near the cut -
+    so the sleeve that crosses it goes back to the shirt, following the colour edge.
+
+    Nothing is split when there is no such valley - one garment has no empty column
+    through its middle, and two garments drawn really overlapping (not just touching)
+    have none either; those stay one crop rather than being cut through a garment.
+    """
+    img = np.asarray(image).astype(np.float32)
+    ink_all = np.linalg.norm(img - bg, axis=2) > ink_tol
+    next_id = int(labels.max()) + 1
+    tried = set()
+    while len(groups) < expected:
+        order = sorted(range(len(groups)),
+                       key=lambda i: -int(np.isin(labels, groups[i]["ids"]).sum()))
+        k = next((i for i in order if tuple(groups[i]["ids"]) not in tried), None)
+        if k is None:
+            break
+        g = groups[k]
+        tried.add(tuple(g["ids"]))
+        x0, y0, x1, y1 = g["box"]
+        region = np.isin(labels[y0:y1, x0:x1], g["ids"])
+        ink = region & ink_all[y0:y1, x0:x1]
+        area = int(region.sum())
+
+        best = None  # (depth ratio, axis, cut index)
+        for axis in (0, 1):  # 0: cut between columns (side by side), 1: between rows
+            prof = ink.sum(axis=axis).astype(np.float32)
+            n = prof.size
+            lo, hi = int(n * 0.2), int(n * 0.8)
+            if hi - lo < 3:
+                continue
+            ref = float(np.median(prof[prof > 0])) if (prof > 0).any() else 0.0
+            if ref <= 0:
+                continue
+            smooth = np.convolve(prof, np.ones(5) / 5, mode="same")
+            cut = lo + int(np.argmin(smooth[lo:hi]))
+            ratio = smooth[cut] / ref
+            if ratio <= valley_frac and (best is None or ratio < best[0]):
+                best = (ratio, axis, cut)
+        if best is None:
+            continue
+        _, axis, cut = best
+        extent = region.shape[1] if axis == 0 else region.shape[0]
+        band = max(3, int(0.2 * extent))
+        coord = (np.arange(region.shape[1])[None, :] if axis == 0
+                 else np.arange(region.shape[0])[:, None])
+        core_a = region & (coord < cut - band)
+        core_b = region & (coord > cut + band)
+        if not core_a.any() or not core_b.any():
+            continue
+        # Near the cut a garment can reach across it (the sleeve over the waistband), so
+        # pixels there go to whichever side's colour they are closer to, in Lab.
+        lab = cv2.cvtColor(np.ascontiguousarray(np.asarray(image)[y0:y1, x0:x1]),
+                           cv2.COLOR_RGB2LAB).astype(np.float32)
+        mean_a, mean_b = lab[core_a].mean(axis=0), lab[core_b].mean(axis=0)
+        closer_a = (np.linalg.norm(lab - mean_a, axis=2) <= np.linalg.norm(lab - mean_b, axis=2))
+        markers = np.where(coord < cut, 2, 3) * np.ones(region.shape, np.int32)
+        contested = region & ~core_a & ~core_b
+        markers[contested] = np.where(closer_a[contested], 2, 3)
+        # A stray patch that took the other side's colour (a shadow, a button) but does
+        # not touch that side's garment goes back to the side it is attached to.
+        for m, core in ((2, core_a), (3, core_b)):
+            n_cc, cc = cv2.connectedComponents(((markers == m) & region).astype(np.uint8), 8)
+            for i in range(1, n_cc):
+                blob = cc == i
+                if not (blob & core).any():
+                    markers[blob] = 5 - m
+        markers[~region] = 1
+
+        pieces = []
+        for m in (2, 3):
+            piece = (markers == m) & region
+            if piece.sum() < min_piece_frac * area:
+                pieces = []
+                break
+            pieces.append(piece)
+        if not pieces:
+            continue
+        sub = labels[y0:y1, x0:x1]
+        sub[region] = 0
+        new = []
+        for piece in pieces:
+            sub[piece] = next_id
+            ys, xs = np.nonzero(piece)
+            new.append({"ids": [next_id],
+                        "box": (x0 + int(xs.min()), y0 + int(ys.min()),
+                                x0 + int(xs.max()) + 1, y0 + int(ys.max()) + 1)})
+            next_id += 1
+        groups = groups[:k] + new + groups[k + 1:]
+    return groups
+
+
 def _union(a, b):
     ba, bb = a["box"], b["box"]
     return {
@@ -533,6 +664,9 @@ def _segment_items(image, device=None, expected=None, min_area_frac=0.002,
     short = min(w, h)
     groups = _merge_regions(groups, labels, expected,
                             merge_cap_frac * short, merge_gap_frac * short)
+    if expected and len(groups) < expected:
+        groups = _split_touching(groups, labels, image, expected,
+                                 _background_color(np.asarray(image)).astype(np.float32))
 
     for g in groups:
         x0, y0, x1, y1 = g["box"]

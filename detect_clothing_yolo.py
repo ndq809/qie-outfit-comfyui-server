@@ -583,9 +583,66 @@ def resolve_bag_worn_over_top(candidates: dict, threshold: float):
     return extra
 
 
+# Luật hình học theo khuôn mặt chủ thể (đơn vị: chiều cao box mặt, tính từ CẰM xuống).
+# Đo trên 60 ảnh thật của 5 job (wardrobe_report_test, 2026-09-29):
+#
+# BOTTOM_MIN_BELOW_CHIN: mép trên của mọi cái quần/váy thật nằm từ +1.1 tới +3.2 dưới
+# cằm (thắt lưng ở dưới cằm ít nhất ~2 đầu người, ngồi/cúi thì co lại còn ~1). Các box
+# "bottom" sai nằm ở -0.2..+0.4: ảnh cận mặt 946 (cổ áo đen, box bắt đầu TRÊN cằm) và
+# 585, 710. 0.7 nằm giữa khoảng trống đó.
+#
+# DRESS_MIN_HEM_BELOW_CHIN: gấu áo thật khi thấy toàn thân nằm tới +3.7 dưới cằm (115,
+# 49, 99, 613, 645, 745, 9652), còn đầm ngắn nhất (mini, tới giữa đùi) theo tỉ lệ cơ thể
+# phải xuống ~+4.5. Các "dress" sai trên áo sơ mi nam (876, 881) có gấu ở +2.1..+2.3 -
+# người ngồi sau bàn, thân dưới bị che, box dừng ở hông. Chỉ áp dụng khi gấu nằm TRONG
+# khung hình: box chạm mép dưới ảnh thì không biết món đồ dài tới đâu.
+BOTTOM_MIN_BELOW_CHIN = 0.7
+DRESS_MIN_HEM_BELOW_CHIN = 4.0
+FRAME_EDGE_FRAC = 0.02
+
+
+def apply_body_geometry(candidates: dict, face_box, image_height: int) -> dict:
+    """Loại/đổi nhãn những ứng viên không thể đúng về vị trí so với khuôn mặt chủ thể.
+
+    - "bottom" bắt đầu ngang/trên cằm: không có cái quần nào mặc ở đó -> bỏ. Ảnh cận mặt
+      946 chỉ ra mỗi box này (0.41), prompt xin một cái quần, tủ đồ nhận "trousers".
+    - "dress" có gấu kết thúc ở ngang hông: đó là cái áo -> đổi nhãn thành "top". Ảnh 876
+      (áo sơ mi hoa, ngồi sau bàn) chỉ ra mỗi dress 0.42, tủ đồ nhận "mid length dresses".
+
+    Chạy trên ứng viên (trước resolve_dress_conflict và bước chót _last_resort_upper_body),
+    để một ảnh mất box sai vẫn còn đường nhận lại món thân trên thật."""
+    if not face_box:
+        return candidates
+    chin = face_box[3]
+    fh = face_box[3] - face_box[1]
+    if fh <= 0:
+        return candidates
+    out = {label: list(items) for label, items in candidates.items()}
+    if "bottom" in out:
+        out["bottom"] = [c for c in out["bottom"]
+                         if (c["box"][1] - chin) / fh >= BOTTOM_MIN_BELOW_CHIN]
+    if "dress" in out:
+        keep = []
+        for c in out["dress"]:
+            hem_visible = c["box"][3] < image_height * (1 - FRAME_EDGE_FRAC)
+            if hem_visible and (c["box"][3] - chin) / fh < DRESS_MIN_HEM_BELOW_CHIN:
+                tops = out.setdefault("top", [])
+                twin = next((i for i, tc in enumerate(tops)
+                             if _box_iou(tc["box"], c["box"]) >= 0.5), None)
+                if twin is None:
+                    tops.append({"score": c["score"], "box": c["box"]})
+                elif c["score"] > tops[twin]["score"]:
+                    tops[twin] = {"score": c["score"], "box": c["box"]}
+            else:
+                keep.append(c)
+        out["dress"] = keep
+    return {label: items for label, items in out.items() if items}
+
+
 @torch.no_grad()
 def predict_image(model, processors_full, processors_crop, person_model, person_pre,
-                   image_path, device: str, threshold: float, resolve_dress: bool):
+                   image_path, device: str, threshold: float, resolve_dress: bool,
+                   face_box=None):
     # Accepts an already-decoded PIL image as well as a path. outfit_items has the
     # SAM-isolated subject in memory already; making it write a full-resolution PNG
     # just so this could re-open it cost ~0.9s of every photo on a 12MP phone frame.
@@ -629,6 +686,7 @@ def predict_image(model, processors_full, processors_crop, person_model, person_
             for i in keep
         ]
 
+    candidates = apply_body_geometry(candidates, face_box, image.height)
     forced_dress, candidates = resolve_dress_conflict(candidates, image, resolve_dress)
     detections = resolve_ambiguous_pairs(candidates, threshold)
     detections += resolve_bag_worn_over_top(candidates, threshold)

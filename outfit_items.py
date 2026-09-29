@@ -351,7 +351,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     person_boxes = byface.get_all_person_boxes(person_model, person_pre, image)
     timing["person_detect"] = time.time() - t
 
-    target_box, face_similarity = None, None
+    target_box, face_similarity, face_box = None, None, None
     if selfie_path:
         t = time.time()
         face_app = _load_face_app()
@@ -376,6 +376,9 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         if rescued is not None:
             person_boxes = person_boxes + [rescued]
         target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)
+        # Same coordinates on the isolated image (isolation only repaints pixels), so the
+        # body-geometry rules in clothing.apply_body_geometry can use it on both passes.
+        face_box = face.bbox.tolist()
     elif len(person_boxes) > 1:
         # No reference face: assume the subject of an outfit-extraction photo is
         # the person occupying the most of the frame.
@@ -396,7 +399,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         t = time.time()
         pre = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
-            image, DEVICE, threshold, resolve_dress=True,
+            image, DEVICE, threshold, resolve_dress=True, face_box=face_box,
         )
         timing["fashion_detect_locate"] = time.time() - t
         t = time.time()
@@ -414,14 +417,14 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         t = time.time()
         detections = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
-            isolated, DEVICE, threshold, resolve_dress=True,
+            isolated, DEVICE, threshold, resolve_dress=True, face_box=face_box,
         )
         timing["fashion_detect_final"] = time.time() - t
     else:
         t = time.time()
         detections = clothing.predict_image(
             cloth_model, procs_full, procs_crop, person_model, person_pre,
-            image, DEVICE, threshold, resolve_dress=True,
+            image, DEVICE, threshold, resolve_dress=True, face_box=face_box,
         )
         timing["fashion_detect_final"] = time.time() - t
         # Nobody to paint out here, but the background still holds objects the
