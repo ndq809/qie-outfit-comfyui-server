@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     wardrobe_dedup_threshold: float = 0.90
     max_job_retries: int = 3
 
+    # How long a job, its per-photo results and its unreviewed garments are kept (Redis
+    # TTL, refreshed on every change, and the MinIO lifecycle on pending/ crops rounded
+    # up to whole days). Past this the user has to re-run the photos.
+    job_ttl_seconds: int = 7 * 24 * 3600
+
     presign_expires_seconds: int = 900
     read_url_expires_seconds: int = 3600
 

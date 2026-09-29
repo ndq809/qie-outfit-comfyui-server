@@ -41,8 +41,9 @@ STAGE_ISOLATED = "02_isolated.jpg"
 STAGE_GRID = "03_grid.jpg"
 ITEMS_DIR = "items"
 RECORD = "record.json"
-# Written by data-server once it has run wardrobe-level D2 on this photo's garments:
-# {objectKey: {"added": bool, "duplicateOf": id|null, "score": float|null}}.
+# Written by data-server as the user reviews this photo's garments:
+# {objectKey: {"added": true} | {"added": false, "rejected": true}}. No entry = not
+# reviewed yet.
 WARDROBE = "wardrobe.json"
 
 
@@ -98,13 +99,19 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
     return out
 
 
-def mark_wardrobe(report_dir: str, job_id: str, item_id: str, outcomes: dict):
-    """Record which garments data-server actually put in the wardrobe. A garment dropped
-    as a duplicate of something already owned is never stored in postgres, so this is
-    the only place the page can learn why it is missing."""
+def mark_review(report_dir: str, job_id: str, item_id: str, object_key: str, outcome: dict):
+    """Record the user's decision on one garment. A rejected garment is never stored in
+    postgres, so this is the only place the page can learn why it is missing."""
     out = Path(report_dir) / job_id / _safe(item_id)
-    if out.is_dir():
-        (out / WARDROBE).write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
+    if not out.is_dir():
+        return
+    path = out / WARDROBE
+    try:
+        outcomes = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        outcomes = {}
+    outcomes[object_key] = outcome
+    path.write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
 
 
 def _keep(src: Path, dest: Path, max_px: int = PREVIEW_MAX_PX):
@@ -488,14 +495,12 @@ def _item_tile(d: str, it: dict) -> str:
     w = it.get("wardrobe") or {}
     if it.get("duplicate"):
         badge, dupe = '<span class="badge">trùng món khác trong cùng ảnh, đã loại</span>', True
-    elif w.get("added") is False:
-        badge = (f'<span class="badge">trùng đồ đã có trong tủ (sim {w.get("score", 0):.3f}), '
-                 'không thêm</span>')
-        dupe = True
+    elif w.get("rejected"):
+        badge, dupe = '<span class="badge">người dùng từ chối</span>', True
     elif w.get("added"):
-        badge, dupe = '<span class="ok">&#10003; đã vào tủ đồ</span>', False
+        badge, dupe = '<span class="ok">&#10003; người dùng đã xác nhận vào tủ đồ</span>', False
     else:
-        badge, dupe = '<span class="pending">chưa có kết quả D2</span>', False
+        badge, dupe = '<span class="pending">chờ người dùng xác nhận</span>', False
     return f"""<figure{' class="dupe"' if dupe else ''}>
 <a href="{d}/{it['file']}" target="_blank" rel="noopener"><img src="{d}/{it['file']}" alt="{html.escape(str(it.get('label') or ''))}" loading="lazy"></a>
 <figcaption><b>{html.escape(str(it.get('type') or '?'))}</b> <span>{html.escape(str(it.get('gender') or ''))}</span><br>

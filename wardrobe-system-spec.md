@@ -119,14 +119,16 @@ Gồm giai đoạn D (góc nhìn từ Mobile, ký hiệu D0) và giai đoạn E 
 3. Vì mỗi lần upload chủ yếu là chờ độ trễ mạng chứ không tốn CPU, Mobile upload **nhiều ảnh song song theo lô** (mặc định 4 ảnh cùng lúc) thay vì tuần tự từng ảnh, để chồng lấn độ trễ thay vì cộng dồn.
 4. Sau khi upload xong, Mobile gọi `POST /v1/jobs` để Data server tạo batch job (gắn với user/account của session hiện tại) và đẩy vé việc vào hàng đợi cho AI server xử lý (chi tiết xử lý phía server xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4) ở mục 2.1).
 
-**E1. Theo dõi tiến độ và hiển thị wardrobe**
-Việc ghi wardrobe vào database đã do Data server thực hiện ở cuối giai đoạn D (không phải Mobile). Mobile chỉ cần:
+**E1. Theo dõi tiến độ, duyệt kết quả và đăng ký vào wardrobe**
+Kết quả tách trang phục **không tự vào wardrobe**: model có thể tách sai món, gắn sai tag, hoặc tách lại một món user đã có, nên người dùng phải xem và xác nhận trước khi món đồ được ghi vào database. Mobile:
 - Gọi định kỳ `GET /v1/jobs/{jobId}` (hoặc nhận thông báo đẩy) để theo dõi tiến độ.
-- Khi job hoàn tất, gọi `GET /v1/wardrobe/items` để tải dữ liệu wardrobe mới về hiển thị (Data server tự lọc theo user/account của session hiện tại).
+- Gọi `GET /v1/jobs/{jobId}/garments` để lấy các món đồ đề xuất (ảnh + tag của AI) và hiển thị màn hình duyệt — được phép gọi khi job còn đang chạy, danh sách lớn dần theo từng ảnh xử lý xong.
+- Với món user giữ lại (có thể sửa tag trước): gọi `POST /v1/wardrobe/items` — đây là bước **duy nhất** ghi wardrobe vào database. Với món user bỏ: gọi `POST /v1/jobs/{jobId}/garments/reject`. Món không được duyệt tự hết hạn cùng job (mặc định 7 ngày).
+- Gọi `GET /v1/wardrobe/items` để hiển thị wardrobe (chỉ gồm món đã xác nhận; Data server tự lọc theo user/account của session hiện tại).
 - Nếu người dùng muốn dừng giữa chừng, gọi `POST /v1/jobs/{jobId}/cancel`.
 
 **E2. Cập nhật index ảnh đã quét**
-Khi job chuyển sang "completed", Mobile đối chiếu danh sách kết quả theo từng ảnh (trường `items[]` trong response của `GET /v1/jobs/{jobId}`, xem [3.1](#31-data-server-api)) để biết ảnh nào xử lý thành công. Chỉ những ảnh thành công mới được thêm asset ID vào index cục bộ mô tả ở [1.1](#11-pipeline-xử-lý-on-device) (bước A0); ảnh xử lý lỗi không được thêm vào, để lần quét sau thử lại. Vì index chỉ tồn tại cục bộ, nếu người dùng gỡ app hoặc đổi thiết bị, index mất và ảnh cũ có thể bị quét lại — cơ chế khử trùng lặp D2 ở server đóng vai trò lưới an toàn cho trường hợp này, tránh tạo item trùng dù ảnh bị xử lý lại.
+Khi job chuyển sang "completed", Mobile đối chiếu danh sách kết quả theo từng ảnh (trường `items[]` trong response của `GET /v1/jobs/{jobId}`, xem [3.1](#31-data-server-api)) để biết ảnh nào xử lý thành công. Chỉ những ảnh thành công mới được thêm asset ID vào index cục bộ mô tả ở [1.1](#11-pipeline-xử-lý-on-device) (bước A0); ảnh xử lý lỗi không được thêm vào, để lần quét sau thử lại. Vì index chỉ tồn tại cục bộ, nếu người dùng gỡ app hoặc đổi thiết bị, index mất và ảnh cũ có thể bị quét lại — khi đó D2 so với wardrobe (nếu bật) gắn gợi ý "có thể đã có món này" vào món đồ ở màn hình duyệt, và người dùng là người quyết định bỏ bản trùng.
 
 **Xử lý gián đoạn phía Mobile**: nếu mất mạng hoặc app bị tắt giữa lúc đang upload, chỉ ảnh đã upload xong mới có vé việc; khi mở lại app, Mobile hỏi lại những ảnh nào đã upload thành công để chỉ tải nốt phần thiếu, không tạo lại cả batch. Nếu mất kết nối trong lúc chờ kết quả, quá trình xử lý ở server vẫn tiếp tục bình thường; Mobile chỉ cần hỏi lại trạng thái job khi hoạt động trở lại, không mất tiến độ đã xử lý xong.
 
@@ -164,11 +166,11 @@ Dùng để: kiểm chứng nhanh tác động của việc đổi ngưỡng (`h
 
 #### Thành phần chính
 
-- **Data server**: cấp quyền upload, tạo và theo dõi job, là chủ sở hữu duy nhất của database. Hiện thực toàn bộ API public.
+- **Data server**: cấp quyền upload, tạo và theo dõi job, giữ kết quả chờ người dùng duyệt, là chủ sở hữu duy nhất của database. Hiện thực toàn bộ API public. Luồng xử lý job (upload → tách → kết quả) **không ghi database**: trạng thái job và kết quả chờ duyệt nằm trong kho tạm có thời hạn (Test: Redis); database chỉ nhận món đồ người dùng đã xác nhận.
 - **AI server (worker pool)**: liên tục lấy việc từ job queue, xử lý D0b→D1→D3→D2 nối tiếp trên cùng một ảnh (thứ tự thực tế, xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4)), rồi báo kết quả qua result queue. Không có API nghiệp vụ, không đụng trực tiếp vào database.
 - **Object Storage**: kho lưu ảnh gốc chờ xử lý và ảnh trang phục đã tách. Mobile và AI server đọc/ghi trực tiếp bằng đường dẫn có giới hạn quyền và thời hạn.
 - **Message Queue (job queue)**: nơi Data server đặt vé việc cho AI server lấy về làm.
-- **Result Queue**: nơi AI server đặt kết quả xử lý để Data server tiêu thụ và ghi vào database.
+- **Result Queue**: nơi AI server đặt kết quả xử lý để Data server tiêu thụ, cập nhật tiến độ job và lưu kết quả chờ duyệt.
 
 Nguyên tắc xuyên suốt: **hai server không gọi thẳng vào nhau**, chỉ giao tiếp gián tiếp qua Object Storage và hai hàng đợi trên — không bên nào phụ thuộc trực tiếp schema hay uptime của bên kia.
 
@@ -179,7 +181,7 @@ Nguyên tắc xuyên suốt: **hai server không gọi thẳng vào nhau**, ch�
 3. **D1 — Tách trang phục**: model chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục. Hiện thực tham chiếu dùng **image-edit model + LoRA** để *vẽ lại* trang phục thành ảnh mockup phẳng, không phải segmentation cắt pixel từ ảnh gốc (hệ quả xem phần dưới).
 4. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1. Bước này càng quan trọng hơn sau khi B1 trên mobile được nới ngưỡng gom cụm (xem [1.1](#11-pipeline-xử-lý-on-device)) — mobile ưu tiên gom mạnh để giảm tải, phần trùng lặp còn sót lại do server bắt. **Thay đổi so với thiết kế gốc: D2 chạy *sau* D3**, và không cần thêm model CLIP riêng — xem giải thích ở phần dưới.
 5. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa. Ngoài tag, bước này còn sinh **embedding** dùng cho D2 và cho tìm kiếm wardrobe sau này.
-6. **D4 — Ghi wardrobe vào database (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage rồi đặt kết quả (đường dẫn ảnh + tag + embedding) vào result queue — không ghi thẳng database. Data server tiêu thụ result queue để ghi wardrobe vào database và cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`). Lưu ý **một ảnh gốc sinh ra nhiều item**, nên một bản tin kết quả chứa một danh sách item chứ không phải một item (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
+6. **D4 — Lưu kết quả chờ duyệt (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage (vùng `pending/`) rồi đặt kết quả (đường dẫn ảnh + tag + embedding) vào result queue. Data server tiêu thụ result queue để cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`) và giữ các món đồ ở trạng thái **chờ duyệt** — **không ghi database**. Chỉ khi người dùng xác nhận (`POST /v1/wardrobe/items`, xem [1.2](#12-tương-tác-với-server) E1), Data server mới chuyển ảnh sang vùng wardrobe và ghi bản ghi vào database, kèm tag người dùng đã sửa (tag gốc của AI được giữ lại riêng). Món bị bỏ thì ảnh bị xoá; món không được duyệt hết hạn cùng job. Lưu ý **một ảnh gốc sinh ra nhiều item**, nên một bản tin kết quả chứa một danh sách item chứ không phải một item (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
 
 Cấu trúc bản tin của job queue và result queue được định nghĩa chi tiết ở [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue).
 
@@ -293,7 +295,7 @@ Nếu số món tìm được **khác** số món prompt yêu cầu, tên crop l
 
 **D3 — mô hình và đầu ra.** Hai model chạy nối tiếp trên mỗi crop: `phase2.pt` (backbone SigLIP-base + 8 head thuộc tính) cho ra visual embedding và logits thuộc tính; `phase3.pt` nhận visual embedding *cùng* các thuộc tính đã dự đoán để sinh text embedding dùng cho tìm kiếm. Phase 3 là head nằm trên phase 2 nên luôn phải load cả hai. Không gian nhãn: gender 5, category 4, sub_category 49, type 122, color 23, neck 12, sleeve 5, pattern 11. Các head đa nhãn dùng ngưỡng riêng cho từng lớp (ngưỡng 0.5 phẳng vừa dự đoán thừa màu phổ biến vừa bỏ sót màu hiếm) và có cơ chế lấy top-1 khi không lớp nào vượt ngưỡng, nên một món không bao giờ ra kết quả rỗng màu.
 
-Mỗi crop cho ra một bản ghi — đây chính là đơn vị dữ liệu mà D4 ghi vào database:
+Mỗi crop cho ra một bản ghi — đây chính là đơn vị dữ liệu mà D4 đưa ra màn hình duyệt, và được ghi vào database khi người dùng xác nhận:
 
 | Trường | Ví dụ | Ghi chú |
 |---|---|---|
@@ -340,7 +342,7 @@ Mỗi vé việc trong hàng đợi được thử lại độc lập nếu xử
 
 #### Bảo mật và vòng đời dữ liệu
 
-Đường dẫn upload và đọc ảnh đều có thời hạn, giới hạn theo từng user, không dùng đường dẫn công khai vĩnh viễn. Ảnh gốc chờ xử lý trong Object Storage nên có chính sách tự động xóa sau một khoảng thời gian ngắn kể từ khi xử lý xong, để giảm thiểu dữ liệu riêng tư lưu trữ ngoài thiết bị của user.
+Đường dẫn upload và đọc ảnh đều có thời hạn, giới hạn theo từng user, không dùng đường dẫn công khai vĩnh viễn. Ảnh trang phục chưa được duyệt nằm ở vùng `pending/` của Object Storage với chính sách tự xóa cùng thời hạn của job (mặc định 7 ngày), nên kết quả người dùng bỏ quên không tồn tại vô hạn. Ảnh gốc chờ xử lý trong Object Storage nên có chính sách tự động xóa sau một khoảng thời gian ngắn kể từ khi xử lý xong, để giảm thiểu dữ liệu riêng tư lưu trữ ngoài thiết bị của user.
 
 **Mức độ quan trọng đã tăng lên** kể từ khi bước bôi xám (C1) chuyển từ mobile sang server: trước đây ảnh nhóm rời khỏi thiết bị đã được che khuôn mặt/thân người khác, nay **ảnh nhóm nguyên bản** được upload. Nghĩa là lớp bảo vệ dữ liệu của người thứ ba trong ảnh giờ nằm hoàn toàn ở phía server, không còn được bảo vệ "tại nguồn" nữa. Hai yêu cầu tối thiểu: (1) ảnh gốc phải bị xóa ngay sau khi tách trang phục xong, không giữ lại quá thời gian cần thiết cho retry; (2) chỉ ảnh trang phục đã tách (không còn khuôn mặt) mới được lưu dài hạn trong wardrobe.
 
@@ -349,7 +351,7 @@ Mỗi vé việc trong hàng đợi được thử lại độc lập nếu xử
 Nguyên tắc quan trọng: một khi ảnh đã upload xong và vé việc đã vào hàng đợi, việc xử lý ở AI server hoàn toàn độc lập với tình trạng kết nối/hoạt động của thiết bị Mobile.
 
 - **Người dùng chủ động hủy**: Mobile gọi `POST /v1/jobs/{jobId}/cancel`, Data server đánh dấu batch job "đang hủy". Không cần rút message khỏi Message Queue — AI server kiểm tra trạng thái batch trước khi xử lý mỗi vé việc, bỏ qua ngay nếu đã bị đánh dấu hủy. Ảnh đang xử lý dở khi lệnh hủy đến vẫn được cho hoàn tất (công sức GPU đã gần như bỏ ra hết). Khi hết vé việc đang chạy, Data server chuyển trạng thái "đã hủy" và dọn ảnh gốc còn sót trong Object Storage.
-- **Batch job bị bỏ quên**: nếu Mobile không bao giờ quay lại hỏi trạng thái (gỡ app, đổi máy...), batch job và ảnh gốc liên quan cần có thời hạn tồn tại tối đa; quá hạn, hệ thống tự dọn ảnh gốc và đánh dấu job hết hạn.
+- **Batch job bị bỏ quên**: nếu Mobile không bao giờ quay lại hỏi trạng thái hay duyệt kết quả (gỡ app, đổi máy...), batch job, kết quả chờ duyệt và ảnh liên quan có thời hạn tồn tại tối đa (mặc định 7 ngày kể từ lần thay đổi cuối); quá hạn, job và các món chưa duyệt tự biến mất. Món đã xác nhận nằm trong database nên không bị ảnh hưởng.
 
 (Xem thêm cách Mobile xử lý gián đoạn khi đang upload/đang chờ kết quả ở [1.2](#12-tương-tác-với-server).)
 
@@ -392,7 +394,7 @@ Tạo một Docker network riêng dạng bridge với subnet cố định (ví d
 
 #### 2.3.3 Cấu hình gọi nhau giữa các thành phần
 
-**data-server** cần biết địa chỉ của: postgres-db (ghi wardrobe, cập nhật trạng thái job), object-storage (tạo đường dẫn upload/tải có thời hạn cho Mobile), queue (đẩy vé việc vào job queue, đọc kết quả từ result queue). Đây là thành phần duy nhất có quyền ghi vào database, và là nơi hiện thực toàn bộ API public ở [3.1](#31-data-server-api).
+**data-server** cần biết địa chỉ của: postgres-db (ghi wardrobe người dùng đã xác nhận; trạng thái job nằm ở queue/Redis, không ở database), object-storage (tạo đường dẫn upload/tải có thời hạn cho Mobile), queue (đẩy vé việc vào job queue, đọc kết quả từ result queue, giữ trạng thái job và kết quả chờ duyệt). Đây là thành phần duy nhất có quyền ghi vào database, và là nơi hiện thực toàn bộ API public ở [3.1](#31-data-server-api).
 
 **ai-server** cần biết địa chỉ của: object-storage (tải ảnh về xử lý, ghi ảnh kết quả lên) và queue (lấy vé việc từ job queue, đẩy kết quả vào result queue). ai-server không cần và không nên biết địa chỉ của postgres-db — giữ đúng nguyên tắc AI server không đụng trực tiếp vào database, tách rời hoàn toàn khỏi Data server dù đang chạy chung một máy vật lý.
 
@@ -535,6 +537,8 @@ Public, gọi từ Mobile.
 | updatedAt | thời điểm | Lần cập nhật gần nhất |
 | items[].localId | string | Id ảnh phía Mobile (đối chiếu ngược lại asset gốc để cập nhật index quét — xem [1.2](#12-tương-tác-với-server), bước E2) |
 | items[].status | enum | "success" / "failed", chỉ có giá trị sau khi ảnh đó đã được AI server xử lý xong |
+| items[].garmentCount | số nguyên | Số món đồ tách được từ ảnh (chỉ khi "success") |
+| review | object | Số món đồ của job theo trạng thái duyệt: `pending`, `confirmed`, `rejected` |
 
 **POST /v1/jobs/{jobId}/cancel** — người dùng chủ động hủy job đang chạy.
 
@@ -542,7 +546,45 @@ Public, gọi từ Mobile.
 |---|---|---|
 | status | enum | "cancelling" nếu còn ảnh xử lý dở, "cancelled" nếu dừng ngay được |
 
-**GET /v1/wardrobe/items** — lấy danh sách item trang phục trong tủ đồ (giai đoạn E).
+**GET /v1/jobs/{jobId}/garments** — các món đồ AI tách được, để người dùng duyệt (giai đoạn E1). Gọi được khi job còn đang chạy.
+
+| Output | Kiểu | Mô tả |
+|---|---|---|
+| garments[].garmentId | string | Id món đồ, dùng khi xác nhận/bỏ |
+| garments[].localId | string | Ảnh gốc sinh ra món này |
+| garments[].reviewStatus | enum | pending / confirmed / rejected |
+| garments[].imageUrl | string hoặc null | Ảnh món đồ (null khi đã bỏ) |
+| garments[].tags | object | Tag D3 đề xuất (cấu trúc như [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)) |
+| garments[].description | string | Mô tả sinh từ tag |
+| garments[].wardrobeItemId | string (khi confirmed) | Id bản ghi trong wardrobe |
+| garments[].possibleDuplicate | object hoặc null (khi bật D2) | `{wardrobeItemId, score}` — gợi ý trùng với món đã có trong wardrobe; người dùng quyết định |
+
+**POST /v1/jobs/{jobId}/garments/reject** — người dùng bỏ món đồ; ảnh bị xóa, không ghi database.
+
+| Input | Kiểu | Mô tả |
+|---|---|---|
+| garmentIds | danh sách string | Các món cần bỏ |
+
+| Output | Kiểu | Mô tả |
+|---|---|---|
+| rejected | danh sách string | Món đã bỏ (kể cả món đã bỏ từ trước) |
+| notFound | danh sách string | Id không thuộc job |
+| alreadyConfirmed | danh sách string | Món đã xác nhận, không bỏ được bằng endpoint này |
+
+**POST /v1/wardrobe/items** — người dùng xác nhận món đồ vào wardrobe. **Là đường duy nhất ghi wardrobe vào database.** Idempotent theo `garmentId`.
+
+| Input | Kiểu | Mô tả |
+|---|---|---|
+| jobId | string | Job chứa các món đồ |
+| garments[].garmentId | string | Món được xác nhận |
+| garments[].tags | object (tùy chọn) | Tag người dùng đã sửa; trường không gửi giữ giá trị của AI |
+
+| Output | Kiểu | Mô tả |
+|---|---|---|
+| items[] | danh sách | Món đã vào wardrobe: `id`, `garmentId`, `imageUrl`, `tags`, `jobId` |
+| errors[] | danh sách | `{garmentId, error}` cho món không xác nhận được |
+
+**GET /v1/wardrobe/items** — lấy danh sách item trang phục trong tủ đồ (giai đoạn E) — chỉ gồm món đã xác nhận.
 
 | Input (query param) | Kiểu | Mô tả |
 |---|---|---|
@@ -552,8 +594,9 @@ Public, gọi từ Mobile.
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
+| items[].id | string | Id bản ghi wardrobe |
 | items[].imageUrl | string | Đường dẫn ảnh trang phục đã tách |
-| items[].tags | danh sách | Loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... |
+| items[].tags | danh sách | Loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... (đã qua người dùng duyệt) |
 | items[].jobId | string | Job sinh ra item này |
 | nextCursor | string (nếu còn dữ liệu) | Dùng cho lần gọi phân trang tiếp theo |
 
@@ -607,8 +650,7 @@ Mỗi phần tử của `garments` — đúng bằng một bản ghi mà D3 sinh
 | objectKey | string | Đường dẫn ảnh món trang phục trên object-storage |
 | tags | object | Kết quả phân loại từ D3: `type`, `category`, `sub_category`, `gender`, `color[]`, `neck[]`, `sleeve[]`, `pattern[]` |
 | description | string | Mô tả sinh từ các tag trên |
-| visualEmbedding | mảng 768 số thực | Đã chuẩn hóa L2. Data server lưu lại để D2 của các job sau so trùng với item này |
+| visualEmbedding | mảng 768 số thực | Đã chuẩn hóa L2. Data server lưu lại (khi món được xác nhận) để D2 của các job sau so trùng với item này |
 | textEmbedding | mảng 768 số thực | Phục vụ tìm kiếm wardrobe |
-| duplicateOf | string hoặc null | Nếu D2 xác định trùng với một item đã có, ghi id item đó; data-server bỏ qua không tạo bản ghi mới |
 
 Vì hai trường embedding làm bản tin nặng lên đáng kể — đo trên kết quả thật: **33 KB/món** ở dạng JSON số thực, tức toàn bộ phần còn lại của bản ghi chỉ chiếm chưa tới 0.5 KB — nên với ảnh nhiều món, bản tin dễ vượt giới hạn kích thước message của một số hệ hàng đợi. Hai phương án giảm tải, chọn khi đo thấy cần: ai-server ghi embedding thành file cạnh ảnh trên object-storage và bản tin chỉ mang đường dẫn; hoặc truyền embedding ở dạng nhị phân/base64 fp16 thay vì mảng số thực JSON (~3 KB/món).

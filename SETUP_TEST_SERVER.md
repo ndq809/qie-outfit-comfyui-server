@@ -403,11 +403,15 @@ container lên IP public của chính nó đi vòng qua NAT (hairpin) chỉ ~5 K
 ảnh 6 MB. Cờ này gửi cùng URL đã ký + cùng cookie tới cùng Caddy edge qua địa chỉ nội bộ.
 Client thật ở ngoài máy không cần.
 
-**Kỳ vọng** (9 ảnh, ~3.5 phút trên RTX 3090):
+**Kỳ vọng** (10 ảnh, ~3.5 phút trên RTX 3090):
 - `face-reference {'registered': True, ..., 'source': 'test-fixture'}`
-- `upload 9/9 ok`
-- `completed processed 9/9 failed 0`
-- `wardrobe N item(s)` với N > 0, và `imageUrl GET 200`
+- `upload 10/10 ok`
+- `completed processed 10/10 failed 0`
+- `review N garment(s) waiting for the user` với N > 0, `review imageUrl GET 200`
+- `wardrobe before confirm: 0 item(s)` — luồng xử lý không ghi database
+- `reject {'rejected': [<1 id>], ...}`, `confirm N-1 added, errors []`,
+  `confirm again 1 returned (idempotent, same id: True)`
+- `wardrobe N-1 item(s)`, `imageUrl GET 200`, `job review {'pending': 0, 'confirmed': N-1, 'rejected': 1}`
 
 Kiểm thử huỷ job (spec §2.3.6 bước 8):
 
@@ -419,7 +423,7 @@ from pathlib import Path
 c = m.Client(f"http://{os.environ['PUBLIC_IPADDR']}:{os.environ['VAST_TCP_PORT_' + os.environ.get('DATA_EXT', '10100')]}",
              os.environ["OPEN_BUTTON_TOKEN"], m.env_file("TEST_BEARER_TOKEN"), f"{os.environ['VAST_CONTAINERLABEL']}_auth_token")
 c.storage_host = "localhost:" + os.environ.get("STORAGE_EXT", "10200")
-files = sorted(Path("test-images").iterdir())[:3]
+files = sorted(Path("test-images").iterdir())[5:8]
 pre = c.call("POST", "/v1/uploads/presign", {"items": [{"localId": "cancel-" + m.local_id(f), "contentType": "image/jpeg"} for f in files]})
 for it, f in zip(pre["items"], files): c.put(it["uploadUrl"], f, "image/jpeg")
 jid = c.call("POST", "/v1/jobs", {"batchId": pre["batchId"], "uploadedItems": [i["localId"] for i in pre["items"]]})["jobId"]
@@ -433,15 +437,15 @@ EOF
 ```
 
 **Kỳ vọng:** `cancel -> {'status': 'cancelling'}`, rồi cuối cùng `cancelled 1 2`.
+Nếu Bước 11 chỉ chạy một phần `test-images`, chọn 3 ảnh **chưa chạy** — ComfyUI cache
+kết quả của ảnh vừa chạy nên job xong trong vài giây, trước khi lệnh huỷ tới.
 
-Dọn job huỷ khỏi report và tủ đồ, để report chỉ còn lượt chạy 9 ảnh:
+Dọn job huỷ khỏi report (nó không ghi gì vào tủ đồ vì không ai xác nhận):
 
 ```bash
 JID=<giá trị in ra ở dòng CANCEL_JOB>
 set -a; . /workspace/.env; set +a
 rm -rf "/workspace/qie-outfit-comfyui-server/wardrobe_report_test/$JID"
-PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "DELETE FROM wardrobe_items WHERE job_id='$JID';"
 python -c "from server.common import report; report.build_index('$WARDROBE_REPORT_DIR')"
 ```
 

@@ -11,8 +11,11 @@ Nguyên tắc cần nhớ trước khi đọc chi tiết:
   giờ gọi ai-server, postgres, redis hay object-storage bằng địa chỉ nội bộ.
 - Ảnh **không** đi qua data-server. Data-server chỉ cấp URL; byte ảnh đi thẳng lên
   object-storage để hai server không thành nút nghẽn băng thông.
-- Toàn bộ pipeline chạy **bất đồng bộ**. Tạo job xong là xong phần việc của Mobile;
-  kết quả lấy về bằng polling.
+- Toàn bộ pipeline chạy **bất đồng bộ**. Tạo job xong thì Mobile polling tiến độ.
+- **Kết quả tách trang phục chưa vào tủ đồ.** Server trả về danh sách món đồ *đề xuất*;
+  người dùng xem, sửa tag nếu cần, rồi xác nhận. Chỉ những món được xác nhận mới được
+  ghi vào database ([mục 6](#6-duyệt-kết-quả-và-đăng-ký-vào-tủ-đồ)). Món không được duyệt
+  sẽ tự hết hạn sau **7 ngày**.
 
 ---
 
@@ -94,13 +97,19 @@ từ token, để client không thể mạo danh người khác.
  ├─ POST /v1/jobs               ──► jobId, status=pending
  ├─ GET  /v1/jobs/{jobId}       (lặp mỗi 5–10s cho tới completed)
  │   └─ POST /v1/jobs/{jobId}/cancel   (nếu user bấm huỷ)
- └─ GET  /v1/wardrobe/items?jobId=…    ──► danh sách trang phục + imageUrl
+ │
+ │  (màn hình duyệt kết quả — có thể bắt đầu ngay khi job còn đang chạy)
+ ├─ GET  /v1/jobs/{jobId}/garments          ──► các món đồ đề xuất + tag của AI
+ ├─ POST /v1/jobs/{jobId}/garments/reject   (món user bỏ đi)
+ ├─ POST /v1/wardrobe/items                 (món user xác nhận, kèm tag đã sửa) ──► ghi DB
+ │
+ └─ GET  /v1/wardrobe/items                 ──► tủ đồ = chỉ những món đã xác nhận
 ```
 
 Ở phía server, mỗi ảnh đi qua D0b (tách đúng người bằng khuôn mặt) → D1 (vẽ lại trang
-phục thành ảnh mockup) → D3 (gắn tag + sinh embedding) → D2 (khử trùng lặp) → D4 (ghi
-database). Mobile không cần biết chi tiết, nhưng cần biết **một ảnh gốc sinh ra nhiều
-item**, và **một số item sẽ bị loại vì trùng với đồ đã có trong tủ**.
+phục thành ảnh mockup) → D3 (gắn tag + sinh embedding) → D4 (lưu kết quả **chờ duyệt**).
+Luồng xử lý này **không ghi database**; database chỉ nhận món đồ khi user xác nhận.
+Mobile không cần biết chi tiết, nhưng cần biết **một ảnh gốc sinh ra nhiều món đồ**.
 
 ---
 
@@ -252,11 +261,20 @@ Nếu `uploadedItems` rỗng hoặc không khớp batch nào → `400`.
   "failedItems": 0,
   "updatedAt": "2026-09-11T04:51:42.686506+00:00",
   "items": [
-    { "localId": "asset-IMG_9822", "status": "success" },
+    { "localId": "asset-IMG_9822", "status": "success", "garmentCount": 3 },
     { "localId": "asset-IMG_0168", "status": "failed"  }
-  ]
+  ],
+  "review": { "pending": 3, "confirmed": 0, "rejected": 0 }
 }
 ```
+
+`garmentCount` là số món đồ tách được từ ảnh đó (có thể là `0` nếu ảnh không có trang
+phục nào). `review` đếm các món đồ của cả job theo trạng thái duyệt — dùng để hiện badge
+"còn N món chờ duyệt".
+
+Job và kết quả của nó được giữ **7 ngày** kể từ lần thay đổi gần nhất (xử lý xong một
+ảnh, duyệt một món...). Quá hạn thì `GET /v1/jobs/{jobId}` trả `404` và các món chưa duyệt
+biến mất — những món đã xác nhận vẫn nằm trong tủ đồ.
 
 `status` của job:
 
@@ -290,20 +308,132 @@ trạng thái là đủ, không mất tiến độ.
 ```
 
 Ảnh đang xử lý dở vẫn được chạy nốt (GPU đã tốn gần hết công rồi), ảnh chưa bắt đầu bị
-bỏ qua và **đếm vào `failedItems`**. Kết quả đo thực tế trên job 3 ảnh: huỷ sau 5 giây →
+bỏ qua và **đếm vào `failedItems`**. Món đồ từ những ảnh đã xử lý xong trước khi huỷ vẫn
+xuất hiện ở màn hình duyệt — user có thể xác nhận hoặc bỏ chúng như bình thường. Kết quả đo thực tế trên job 3 ảnh: huỷ sau 5 giây →
 `processedItems=1`, `failedItems=2`, status `cancelling` → `cancelled` sau khoảng 20s.
 UI nên vẫn polling sau khi gửi lệnh huỷ, tới khi status thành `cancelled`.
 
 ### 5.3 Cập nhật index ảnh đã quét
 
 Khi job `completed`, chỉ thêm asset ID của những ảnh có `items[].status == "success"` vào
-index cục bộ. Ảnh `failed` **không** được thêm, để lần quét sau thử lại.
+index cục bộ. Ảnh `failed` **không** được thêm, để lần quét sau thử lại. Ảnh đã xử lý
+thành công vẫn vào index kể cả khi user bỏ hết món đồ của nó — nó đã được xem rồi.
 
 ---
 
-## 6. Lấy wardrobe
+## 6. Duyệt kết quả và đăng ký vào tủ đồ
 
-### `GET /v1/wardrobe/items`
+Server **không** tự đưa kết quả vào tủ đồ. Sau khi tách trang phục, mỗi món đồ nằm ở
+trạng thái `pending` (chờ duyệt). User xem từng món trên app rồi:
+
+- **xác nhận** (có thể sửa tag trước) → món đồ được ghi vào database, xuất hiện trong
+  `GET /v1/wardrobe/items`;
+- **bỏ** → ảnh món đồ bị xoá, không bao giờ vào database;
+- **không làm gì** → món đồ tự hết hạn sau 7 ngày.
+
+```
+pending ──POST /v1/wardrobe/items──────────► confirmed  (có wardrobeItemId)
+   └────POST /v1/jobs/{id}/garments/reject──► rejected
+```
+
+### 6.1 `GET /v1/jobs/{jobId}/garments` — danh sách món đồ để duyệt
+
+Gọi được **ngay khi job còn đang chạy**: danh sách lớn dần theo từng ảnh xử lý xong, nên
+app có thể mở màn hình duyệt sớm thay vì chờ cả lô.
+
+```jsonc
+{
+  "jobId": "bfbf24f3-e2fb-4eaf-9c96-e5705ab6c140",
+  "garments": [
+    {
+      "garmentId": "1dbffca2638349d6918f7e5f930a6faf",
+      "localId": "asset-IMG_0168",          // ảnh gốc sinh ra món này
+      "reviewStatus": "pending",            // pending / confirmed / rejected
+      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/pending/...?X-Amz-Algorithm=...",
+      "tags": {
+        "type": "shirts",
+        "category": "clothing",
+        "sub_category": "shirts",
+        "gender": "men",
+        "color":   [ { "color": "blue", "confidence": 95.2 } ],
+        "neck":    ["spread collar"],
+        "sleeve":  ["short sleeve"],
+        "pattern": []
+      },
+      "description": "short sleeve shirts in blue. spread collar. men's clothing."
+    }
+  ]
+}
+```
+
+- Thứ tự: theo ảnh gốc, rồi theo vị trí món đồ trong ảnh.
+- Món đã `confirmed` có thêm `wardrobeItemId`, và `imageUrl` trỏ tới ảnh trong tủ đồ.
+- Món `rejected` có `imageUrl: null` (ảnh đã bị xoá).
+- Nếu server bật khử trùng lặp với tủ đồ (tắt ở bản test), món `pending` có thêm
+  `"possibleDuplicate": {"wardrobeItemId": "...", "score": 0.94}` — gợi ý "có vẻ bạn đã
+  có món này", **để user quyết định**, server không tự loại.
+
+Đọc tags cho đúng:
+
+- `type`, `category`, `sub_category`, `gender` là **đơn nhãn** (string).
+- `color` là **đa nhãn kèm độ tin cậy**, đã sắp giảm dần — lấy phần tử đầu làm màu chính.
+- `neck`, `sleeve`, `pattern` là **mảng string, có thể rỗng** khi không áp dụng (quần
+  không có kiểu tay áo). Luôn kiểm tra rỗng trước khi hiển thị.
+
+Phân trang: còn `nextCursor` thì gọi tiếp với `cursor=<nextCursor>`; hết dữ liệu thì
+trường này biến mất khỏi response.
+
+### 6.2 `POST /v1/jobs/{jobId}/garments/reject` — bỏ món đồ
+
+```jsonc
+// request
+{ "garmentIds": ["1dbffca2638349d6918f7e5f930a6faf"] }
+// response
+{ "rejected": ["1dbffca2638349d6918f7e5f930a6faf"], "notFound": [], "alreadyConfirmed": [] }
+```
+
+Gọi lại với cùng id là an toàn (id đã bỏ vẫn nằm trong `rejected`). Món đã xác nhận thì
+không bỏ được bằng endpoint này — nó nằm trong `alreadyConfirmed`.
+
+### 6.3 `POST /v1/wardrobe/items` — xác nhận món đồ vào tủ đồ
+
+Đây là **cách duy nhất** để một món đồ được ghi vào database.
+
+```jsonc
+// request
+{
+  "jobId": "bfbf24f3-e2fb-4eaf-9c96-e5705ab6c140",
+  "garments": [
+    { "garmentId": "95ca02ba7f44..." },                                   // giữ nguyên tag của AI
+    { "garmentId": "3abb65512729...", "tags": { "gender": "women",        // sửa tag
+                                                 "color": [ { "color": "navy", "confidence": 100 } ] } }
+  ]
+}
+// response
+{
+  "items": [
+    { "id": "95ca02ba-7f44-464a-b28e-b923b8617718", "garmentId": "95ca02ba7f44...",
+      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/wardrobe/...", "tags": { ... },
+      "jobId": "bfbf24f3-..." }
+  ],
+  "errors": [ { "garmentId": "...", "error": "already rejected" } ]
+}
+```
+
+- `tags` là **tuỳ chọn** và chỉ cần gửi những trường user đã sửa; trường không gửi giữ
+  nguyên giá trị AI. Gửi đúng kiểu như ở 6.1 (`color` là mảng object, `neck`/`sleeve`/
+  `pattern` là mảng string). Khi tag bị sửa, server tự dựng lại `description`.
+- Xác nhận được **từng phần**: gửi vài món một lần, lần sau gửi tiếp.
+- **Idempotent**: gửi lại một `garmentId` đã xác nhận (ví dụ retry sau khi mất mạng)
+  trả về đúng item cũ, cùng `id`, không tạo bản sao.
+- `errors[]` liệt kê món không xác nhận được: `not found` (sai id hoặc job đã hết hạn),
+  `already rejected`, `image no longer available`. Các món còn lại trong request vẫn
+  được xử lý bình thường.
+- `jobId` không tồn tại, thuộc account khác, hoặc đã hết hạn → `404`.
+
+### 6.4 `GET /v1/wardrobe/items` — tủ đồ
+
+Chỉ chứa những món đã xác nhận.
 
 | Query param | Kiểu | Mô tả |
 |---|---|---|
@@ -315,31 +445,15 @@ index cục bộ. Ảnh `failed` **không** được thêm, để lần quét sa
 {
   "items": [
     {
-      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/items/...?X-Amz-Algorithm=...",
-      "jobId": "e1f0b194-2110-4278-8462-1d6e5e9bee48",
-      "tags": {
-        "type": "shirts",
-        "category": "clothing",
-        "sub_category": "shirts",
-        "gender": "men",
-        "color":   [ { "color": "brown", "confidence": 80.9 },
-                     { "color": "beige", "confidence": 70.0 } ],
-        "neck":    ["spread collar"],
-        "sleeve":  ["short sleeve"],
-        "pattern": []
-      }
+      "id": "95ca02ba-7f44-464a-b28e-b923b8617718",
+      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/wardrobe/...?X-Amz-Algorithm=...",
+      "jobId": "bfbf24f3-e2fb-4eaf-9c96-e5705ab6c140",
+      "tags": { "type": "shirts", "gender": "women", "color": [ ... ], ... }
     }
   ],
   "nextCursor": "a1b2c3d4-..."
 }
 ```
-
-Đọc tags cho đúng:
-
-- `type`, `category`, `sub_category`, `gender` là **đơn nhãn** (string).
-- `color` là **đa nhãn kèm độ tin cậy**, đã sắp giảm dần — lấy phần tử đầu làm màu chính.
-- `neck`, `sleeve`, `pattern` là **mảng string, có thể rỗng** khi không áp dụng (quần
-  không có kiểu tay áo). Luôn kiểm tra rỗng trước khi hiển thị.
 
 Phân trang: còn `nextCursor` thì gọi tiếp với `cursor=<nextCursor>`; hết dữ liệu thì
 trường này biến mất khỏi response.
@@ -356,19 +470,12 @@ khung — an toàn để hiển thị thẳng trong lưới mà không cần cro
 theo mặt nạ rồi dựng lại nền, nên mỗi ảnh chứa **đúng một món**, không còn sót dải của
 món kế bên như bản trước.
 
-### Vì sao số item ít hơn kỳ vọng
+### Job xong nhưng không có món nào để duyệt
 
-Server tự khử trùng lặp (D2): item mới có cosine similarity ≥ **0.90** với một item đã có
-cùng `type` sẽ **không** được tạo bản ghi mới. Trên bộ test 9 ảnh: 26 crop sinh ra, 6 bị
-khử, còn **20 item** trong tủ. Đây là hành vi đúng — cùng một chiếc áo chụp ở nhiều ảnh
-chỉ nên xuất hiện một lần. Đừng coi chênh lệch giữa số ảnh upload và số item trả về là lỗi.
-
-Trường hợp cực đoan đã đo được: upload lại **đúng một ảnh đã xử lý trước đó** thì job vẫn
-`completed` với `processedItems=1`, nhưng `GET /v1/wardrobe/items?jobId=…` trả về **mảng
-rỗng** — cả 4 món đều trùng đồ đã có (similarity 0.92–0.98). Đây chính là lưới an toàn cho
-trường hợp index ảnh đã quét trên máy bị mất (user cài lại app, đổi máy): ảnh cũ bị quét
-lại cũng không sinh ra item trùng. **UI không được coi "job xong nhưng wardrobe rỗng" là
-lỗi** — hãy hiển thị "không có trang phục mới" thay vì báo thất bại.
+Ảnh không có trang phục nhận diện được (ảnh chân dung cận mặt...) cho `garmentCount: 0`.
+Server không tự bỏ món trùng với tủ đồ nữa — cùng một chiếc áo chụp ở nhiều ảnh sẽ hiện
+nhiều lần ở màn hình duyệt, user tự bỏ những bản thừa. **UI không được coi "job xong
+nhưng không có món nào" là lỗi** — hãy hiển thị "không tìm thấy trang phục mới".
 
 ---
 
@@ -392,7 +499,7 @@ lỗi** — hãy hiển thị "không có trang phục mới" thay vì báo th�
 | `401 {"detail":"invalid token"}` | App token sai/đã xoá | Đăng nhập lại |
 | `400` | `uploadedItems` không khớp batch, hoặc face-reference chưa upload | Không retry nguyên trạng |
 | `403` (từ object-storage) | URL hết hạn hoặc chữ ký sai | Xin presign mới |
-| `404` | `jobId` không tồn tại hoặc thuộc account khác | Không retry |
+| `404` | `jobId` không tồn tại, thuộc account khác, hoặc đã quá 7 ngày | Không retry |
 | `422` | Tham số sai kiểu/ngoài khoảng (ví dụ `limit=500` > 200) | Lỗi lập trình, sửa request |
 | `5xx` | Lỗi server | Retry với exponential backoff |
 
@@ -405,7 +512,7 @@ khi đánh `failed`, và không ảnh hưởng ảnh khác cùng job.
 
 ## 8. Sai khác so với spec
 
-Ba điểm khác [`wardrobe-system-spec.md`](wardrobe-system-spec.md) Phần 3, đều đã hiện thực
+Các điểm khác [`wardrobe-system-spec.md`](wardrobe-system-spec.md) Phần 3, đều đã hiện thực
 và kiểm chứng trên instance test:
 
 1. **Nhóm endpoint `/v1/face-reference` là mới.** Spec mô tả D0b "đối chiếu khuôn mặt với
@@ -424,6 +531,10 @@ và kiểm chứng trên instance test:
 
 3. **Hai lớp token chỉ tồn tại ở Test** ([mục 1.2](#12-hai-lớp-token-chỉ-môi-trường-test)).
    Spec chỉ mô tả một Bearer token; lớp edge là của hạ tầng vast.ai, không phải của hệ thống.
+
+4. **Bước duyệt kết quả trước khi vào tủ đồ** ([mục 6](#6-duyệt-kết-quả-và-đăng-ký-vào-tủ-đồ)):
+   đã cập nhật vào spec (§1.2 E1, §2.1 D4, §3.1). Ghi ở đây vì bản mobile cũ giả định
+   kết quả tự vào tủ đồ.
 
 Ngoài ra, hệ thống đăng nhập/session mà spec giả định có sẵn **chưa được hiện thực** —
 bản test dùng bearer token tĩnh seed sẵn trong database.
@@ -467,7 +578,19 @@ JID=$(echo "$JOB" | jq -r .jobId)
 until [ "$(curl -s "$BASE/v1/jobs/$JID?token=$EDGE" -H "Authorization: Bearer $APP" \
           | jq -r .status)" = "completed" ]; do sleep 10; done
 
-# 6) lấy wardrobe
+# 6) xem các món đồ AI tách được
+curl -s "$BASE/v1/jobs/$JID/garments?token=$EDGE" -H "Authorization: Bearer $APP" \
+  | jq '.garments[] | {garmentId, reviewStatus, type: .tags.type}'
+G1=<garmentId muốn giữ>; G2=<garmentId muốn bỏ>
+
+# 7) bỏ một món, xác nhận một món (sửa gender)
+curl -s -X POST "$BASE/v1/jobs/$JID/garments/reject?token=$EDGE" \
+  -H "Authorization: Bearer $APP" -H "Content-Type: application/json" -d "{\"garmentIds\":[\"$G2\"]}"
+curl -s -X POST "$BASE/v1/wardrobe/items?token=$EDGE" \
+  -H "Authorization: Bearer $APP" -H "Content-Type: application/json" \
+  -d "{\"jobId\":\"$JID\",\"garments\":[{\"garmentId\":\"$G1\",\"tags\":{\"gender\":\"women\"}}]}"
+
+# 8) tủ đồ
 curl -s "$BASE/v1/wardrobe/items?jobId=$JID&token=$EDGE" -H "Authorization: Bearer $APP" | jq .
 ```
 
@@ -526,6 +649,25 @@ class WardrobeApi {
   Future<Map<String, dynamic>> cancelJob(String jobId) async =>
       _json(await http.post(_u('/v1/jobs/$jobId/cancel'), headers: _headers));
 
+  /// Các món đồ AI đề xuất (kể cả khi job còn chạy).
+  Future<Map<String, dynamic>> jobGarments(String jobId) async =>
+      _json(await http.get(_u('/v1/jobs/$jobId/garments'), headers: _headers));
+
+  Future<Map<String, dynamic>> rejectGarments(String jobId, List<String> garmentIds) async =>
+      _json(await http.post(_u('/v1/jobs/$jobId/garments/reject'), headers: _headers,
+          body: jsonEncode({'garmentIds': garmentIds})));
+
+  /// [edits]: garmentId -> các tag user đã sửa (null/không có = giữ tag của AI).
+  Future<Map<String, dynamic>> confirmGarments(String jobId, List<String> garmentIds,
+          {Map<String, Map<String, dynamic>> edits = const {}}) async =>
+      _json(await http.post(_u('/v1/wardrobe/items'), headers: _headers,
+          body: jsonEncode({
+            'jobId': jobId,
+            'garments': [
+              for (final id in garmentIds) {'garmentId': id, if (edits[id] != null) 'tags': edits[id]}
+            ],
+          })));
+
   Future<Map<String, dynamic>> wardrobeItems({String? jobId, String? cursor, int limit = 50}) async =>
       _json(await http.get(_u('/v1/wardrobe/items', {
         if (jobId != null) 'jobId': jobId,
@@ -581,4 +723,7 @@ Future<Map<String, dynamic>> waitForJob(WardrobeApi api, String jobId) async {
 - [ ] `imageUrl` không cache quá 1 giờ (cache file ảnh, không cache URL)
 - [ ] `neck`/`sleeve`/`pattern` kiểm tra mảng rỗng trước khi hiển thị
 - [ ] Không gọi `/v1/face-reference` — server test đã cố định ảnh khuôn mặt ([mục 3](#3-ảnh-khuôn-mặt-tham-chiếu--server-test-đã-cố-định-mobile-bỏ-qua))
-- [ ] UI giải thích được vì sao số item < số ảnh (D2 khử trùng lặp)
+- [ ] Có màn hình duyệt: hiện `GET /v1/jobs/{jobId}/garments`, cho sửa tag, xác nhận/bỏ
+- [ ] Chỉ gọi `POST /v1/wardrobe/items` cho món user đã xác nhận; retry an toàn (idempotent)
+- [ ] Nhắc user còn món chờ duyệt (`review.pending` của job) — quá 7 ngày sẽ mất
+- [ ] "Job xong nhưng không có món nào" hiển thị như kết quả bình thường, không báo lỗi

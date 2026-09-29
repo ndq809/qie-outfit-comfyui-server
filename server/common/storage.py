@@ -47,6 +47,14 @@ def ensure_buckets():
     for bucket in (s.minio_raw_bucket, s.minio_items_bucket):
         if bucket not in existing:
             client.create_bucket(Bucket=bucket)
+    # Crops nobody confirmed or rejected expire with their job (jobs.py): the Redis
+    # record goes at job_ttl_seconds, the image here at the same age in whole days.
+    days = max(1, -(-s.job_ttl_seconds // 86400))
+    client.put_bucket_lifecycle_configuration(
+        Bucket=s.minio_items_bucket,
+        LifecycleConfiguration={"Rules": [{
+            "ID": "expire-unreviewed-garments", "Status": "Enabled",
+            "Filter": {"Prefix": PENDING_PREFIX}, "Expiration": {"Days": days}}]})
 
 
 def raw_object_key(account_id: str, batch_id: str, local_id: str, content_type: str) -> str:
@@ -64,11 +72,25 @@ def face_object_key(account_id: str, content_type: str) -> str:
     return f"face/{account_id}/reference{_ext_from_content_type(content_type)}"
 
 
+PENDING_PREFIX = "pending/"
+
+
 def item_object_key(job_id: str, item_id: str, index: int) -> str:
-    # No account_id here deliberately: ai-server only ever knows jobId/itemId/objectKey
-    # from the job-queue ticket (wardrobe-system-spec.md §3.3) and must never be given
-    # postgres's address (§2.3.3), so it can't look account_id up either.
-    return f"items/{job_id}/{item_id}/{index:02d}.png"
+    """Where ai-server puts a crop: awaiting the user's review, expired by lifecycle if
+    it never gets one. No account_id here deliberately: ai-server only ever knows
+    jobId/itemId/objectKey from the job-queue ticket (wardrobe-system-spec.md §3.3)."""
+    return f"{PENDING_PREFIX}{job_id}/{item_id}/{index:02d}.png"
+
+
+def wardrobe_object_key(account_id: str, wardrobe_item_id: str) -> str:
+    """Where a crop lives once the user confirmed it into their wardrobe."""
+    return f"wardrobe/{account_id}/{wardrobe_item_id}.png"
+
+
+def move_object(bucket: str, src: str, dest: str):
+    client = s3_client()
+    client.copy_object(Bucket=bucket, Key=dest, CopySource={"Bucket": bucket, "Key": src})
+    client.delete_object(Bucket=bucket, Key=src)
 
 
 def _ext_from_content_type(content_type: str) -> str:

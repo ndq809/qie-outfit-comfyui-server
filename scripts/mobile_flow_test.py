@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drives the public data-server API exactly as the mobile app does (MOBILE_CLIENT_API.md):
-presign -> PUT to object-storage (4 in parallel) -> create job -> poll -> wardrobe items.
+presign -> PUT to object-storage (4 in parallel) -> create job -> poll -> review the
+extracted garments (reject the last one, confirm the rest, correcting one tag on the first)
+-> wardrobe items.
 
 Goes through the public vast.ai edge, so it also proves the two-token scheme works from
 outside. Reads BASE/tokens from the instance environment unless given explicitly.
@@ -117,17 +119,42 @@ def main():
             break
         time.sleep(args.poll)
 
+    review = c.call("GET", f"/v1/jobs/{jid}/garments")["garments"]
+    print(f"review         {len(review)} garment(s) waiting for the user")
+    for g in review:
+        t = g["tags"]
+        colors = ", ".join(f"{x['color']} {x['confidence']:.0f}%" for x in t.get("color", []))
+        print(f"  {g['localId']:<8} {t.get('type'):<28} {t.get('gender'):<6} {colors}")
+    if review:
+        code = urllib.request.urlopen(urllib.request.Request(
+            re.sub(r"^http://[^/]+", f"http://{c.storage_host}", review[0]["imageUrl"])
+            if c.storage_host else review[0]["imageUrl"], headers={"Cookie": c.cookie})).status
+        print(f"review imageUrl GET {code}")
+
+    before = len(c.call("GET", f"/v1/wardrobe/items?jobId={jid}&limit=200")["items"])
+    print(f"wardrobe before confirm: {before} item(s)")
+    rejected = review[-1:] if len(review) > 1 else []
+    to_confirm = review[:len(review) - len(rejected)]
+    if rejected:
+        print("reject        ", c.call("POST", f"/v1/jobs/{jid}/garments/reject",
+                                       {"garmentIds": [g["garmentId"] for g in rejected]}))
+    if to_confirm:
+        body = [{"garmentId": g["garmentId"]} for g in to_confirm]
+        body[0]["tags"] = {"gender": "women" if to_confirm[0]["tags"].get("gender") == "men" else "men"}
+        res = c.call("POST", "/v1/wardrobe/items", {"jobId": jid, "garments": body})
+        print(f"confirm        {len(res['items'])} added, errors {res['errors']}")
+        again = c.call("POST", "/v1/wardrobe/items", {"jobId": jid, "garments": body[:1]})
+        print(f"confirm again  {len(again['items'])} returned (idempotent, same id: "
+              f"{again['items'][0]['id'] == res['items'][0]['id']})")
+
     wardrobe = c.call("GET", f"/v1/wardrobe/items?jobId={jid}&limit=200")
     print(f"wardrobe       {len(wardrobe['items'])} item(s)")
-    for it in wardrobe["items"]:
-        t = it["tags"]
-        colors = ", ".join(f"{x['color']} {x['confidence']:.0f}%" for x in t.get("color", []))
-        print(f"  {t.get('type'):<28} {t.get('gender'):<6} {colors}")
     if wardrobe["items"]:
         code = urllib.request.urlopen(urllib.request.Request(
             re.sub(r"^http://[^/]+", f"http://{c.storage_host}", wardrobe["items"][0]["imageUrl"])
             if c.storage_host else wardrobe["items"][0]["imageUrl"], headers={"Cookie": c.cookie})).status
         print(f"imageUrl GET   {code}")
+    print("job review    ", c.call("GET", f"/v1/jobs/{jid}")["review"])
     if args.out:
         Path(args.out).write_text(json.dumps({"job": st, "wardrobe": wardrobe}, indent=1))
 

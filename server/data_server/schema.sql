@@ -29,56 +29,23 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS upload_batches (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id UUID NOT NULL REFERENCES accounts(id),
-    user_id UUID NOT NULL REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- Upload batches, jobs and extraction results are not stored here: they live in Redis
+-- until the user reviews them (server/data_server/jobs.py). These drops retire the
+-- tables an earlier version kept them in.
+ALTER TABLE IF EXISTS wardrobe_items DROP CONSTRAINT IF EXISTS wardrobe_items_job_id_fkey;
+ALTER TABLE IF EXISTS wardrobe_items DROP CONSTRAINT IF EXISTS wardrobe_items_job_item_id_fkey;
+ALTER TABLE IF EXISTS wardrobe_items DROP COLUMN IF EXISTS job_item_id;
+DROP TABLE IF EXISTS job_items, jobs, upload_batch_items, upload_batches;
 
-CREATE TABLE IF NOT EXISTS upload_batch_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    batch_id UUID NOT NULL REFERENCES upload_batches(id),
-    local_id TEXT NOT NULL,
-    object_key TEXT NOT NULL,
-    content_type TEXT NOT NULL,
-    checksum TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (batch_id, local_id)
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id UUID NOT NULL REFERENCES accounts(id),
-    user_id UUID NOT NULL REFERENCES users(id),
-    batch_id UUID NOT NULL REFERENCES upload_batches(id),
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','processing','cancelling','cancelled','completed','failed')),
-    total_items INTEGER NOT NULL DEFAULT 0,
-    processed_items INTEGER NOT NULL DEFAULT 0,
-    failed_items INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS job_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    local_id TEXT NOT NULL,
-    object_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','success','failed')),
-    error_reason TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_job_items_job_id ON job_items(job_id);
-
+-- Only garments the user confirmed. job_id/source_local_id say which job and photo it came
+-- from (no FK - the job itself is gone from Redis after its TTL). source_garment_id makes
+-- confirming idempotent. ai_tags is what D3 predicted; tags is what the user accepted,
+-- possibly edited (tags_edited) - in which case text_embedding still reflects ai_tags.
 CREATE TABLE IF NOT EXISTS wardrobe_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id UUID NOT NULL REFERENCES accounts(id),
     user_id UUID NOT NULL REFERENCES users(id),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    job_item_id UUID NOT NULL REFERENCES job_items(id),
+    job_id UUID NOT NULL,
     object_key TEXT NOT NULL,
     tags JSONB NOT NULL,
     description TEXT NOT NULL,
@@ -87,5 +54,11 @@ CREATE TABLE IF NOT EXISTS wardrobe_items (
     duplicate_of UUID REFERENCES wardrobe_items(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE wardrobe_items ADD COLUMN IF NOT EXISTS source_local_id TEXT;
+ALTER TABLE wardrobe_items ADD COLUMN IF NOT EXISTS source_garment_id TEXT;
+ALTER TABLE wardrobe_items ADD COLUMN IF NOT EXISTS ai_tags JSONB;
+ALTER TABLE wardrobe_items ADD COLUMN IF NOT EXISTS tags_edited BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wardrobe_items_source_garment
+    ON wardrobe_items(source_garment_id) WHERE source_garment_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_wardrobe_items_account_id ON wardrobe_items(account_id, id);
 CREATE INDEX IF NOT EXISTS idx_wardrobe_items_job_id ON wardrobe_items(job_id);
