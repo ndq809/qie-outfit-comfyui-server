@@ -588,6 +588,18 @@ python detect_clothing_yolo.py --images-dir images --single-scale --no-person-cr
   being worn) compared to plain descriptive phrasing ("the bag lies flat on its own
   with its strap coiled neatly beside it"). This model responds to *description*, not
   *commands*.
+- **Exception, measured: "No bag." when no bag was detected.** A crossbody strap left on
+  the isolated subject made the model draw the whole bag over the shirt. Over the 58 real
+  photos with no bag detected × 2 seeds: bag drawn 7/116 without the sentence, **0/116**
+  with it, no garment dropped. Softer wordings did worse: "Each item is shown on its own,
+  with nothing worn over it." had no effect (4/58); "Only the listed clothing, without
+  straps or accessories." read shoes and hats as accessories and dropped them. This does
+  not generalise to other categories without measuring them the same way.
+- **Ask for small items to keep them apart.** Adding "Items are drawn small, with plenty
+  of empty white space between them." to multi-item prompts took generations where two
+  items came out touching from 6/52 to **0/52** (26 real photos × 2 seeds). "Separate
+  cells" separated even further but drew visible cell borders and a duplicate jacket;
+  percentages ("fills less than 40% of the width") and "spaced well apart" did worse.
 - **Never name an item category that isn't confirmed present.** Even inside a "don't
   invent X" clause, naming an absent category (e.g. "shoes") in the prompt text
   measurably increases the chance it gets drawn anyway. Detect first, then only

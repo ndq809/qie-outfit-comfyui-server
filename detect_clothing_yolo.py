@@ -594,11 +594,17 @@ def resolve_bag_worn_over_top(candidates: dict, threshold: float):
 # DRESS_MIN_HEM_BELOW_CHIN: gấu áo thật khi thấy toàn thân nằm tới +3.7 dưới cằm (115,
 # 49, 99, 613, 645, 745, 9652), còn đầm ngắn nhất (mini, tới giữa đùi) theo tỉ lệ cơ thể
 # phải xuống ~+4.5. Các "dress" sai trên áo sơ mi nam (876, 881) có gấu ở +2.1..+2.3 -
-# người ngồi sau bàn, thân dưới bị che, box dừng ở hông. Chỉ áp dụng khi gấu nằm TRONG
-# khung hình: box chạm mép dưới ảnh thì không biết món đồ dài tới đâu.
+# người ngồi sau bàn, thân dưới bị che, box dừng ở hông.
+# Áp dụng cả khi box bị mép dưới ảnh cắt: phần nhìn thấy chỉ tới ngang hông thì ảnh không
+# chứa bằng chứng nào cho một chiếc đầm, và gọi nó là "dress" khiến D1 bịa ra chân váy.
+# Đo được ở ảnh 55 (áo sơ mi hoa nam, ảnh cắt ở hông): dress 0.69 > top 0.47, gấu bị cắt
+# ở +2.6. Đầm thật bị cắt ngang hông thì thành "áo thân trên" - đúng với phần nhìn thấy.
 BOTTOM_MIN_BELOW_CHIN = 0.7
 DRESS_MIN_HEM_BELOW_CHIN = 4.0
-FRAME_EDGE_FRAC = 0.02
+# Phần của box bottom phải nằm trong box dress bị bác bỏ để nhận điểm của nó.
+DRESS_BOTTOM_INSIDE_FRAC = 0.6
+# ...và cả box dress lẫn box bottom phải xuống quá gấu áo ít nhất ngần này chiều cao mặt.
+DRESS_BELOW_TOP_MIN = 0.3
 
 
 def apply_body_geometry(candidates: dict, face_box, image_height: int) -> dict:
@@ -617,24 +623,47 @@ def apply_body_geometry(candidates: dict, face_box, image_height: int) -> dict:
     fh = face_box[3] - face_box[1]
     if fh <= 0:
         return candidates
-    out = {label: list(items) for label, items in candidates.items()}
+    out = {label: [dict(c) for c in items] for label, items in candidates.items()}
     if "bottom" in out:
         out["bottom"] = [c for c in out["bottom"]
                          if (c["box"][1] - chin) / fh >= BOTTOM_MIN_BELOW_CHIN]
     if "dress" in out:
         keep = []
         for c in out["dress"]:
-            hem_visible = c["box"][3] < image_height * (1 - FRAME_EDGE_FRAC)
-            if hem_visible and (c["box"][3] - chin) / fh < DRESS_MIN_HEM_BELOW_CHIN:
-                tops = out.setdefault("top", [])
-                twin = next((i for i, tc in enumerate(tops)
-                             if _box_iou(tc["box"], c["box"]) >= 0.5), None)
-                if twin is None:
-                    tops.append({"score": c["score"], "box": c["box"]})
-                elif c["score"] > tops[twin]["score"]:
-                    tops[twin] = {"score": c["score"], "box": c["box"]}
-            else:
+            if (c["box"][3] - chin) / fh >= DRESS_MIN_HEM_BELOW_CHIN:
                 keep.append(c)
+                continue
+            # Not a one-piece: the upper part is a top. Keep the detector's own top box
+            # when it has one for this region (it is shaped to the top, the dress box
+            # also covers whatever is below), with the stronger of the two scores.
+            tops = out.setdefault("top", [])
+            twin = next((i for i, tc in enumerate(tops)
+                         if _box_iou(tc["box"], c["box"]) >= 0.5), None)
+            top_hem = tops[twin]["box"][3] if twin is not None else None
+            if twin is None:
+                tops.append({"score": c["score"], "box": c["box"]})
+            else:
+                tops[twin] = {"score": max(c["score"], tops[twin]["score"]),
+                              "box": tops[twin]["box"]}
+            # And whatever lower-body garment it also covered is real: the detector saw
+            # top + bottom as one piece. A bottom candidate lying inside it (and placed
+            # like a bottom, see above) carries the dress's score. Measured on 226 (polo
+            # + shorts, seated): dress 0.52 over both, the shorts alone 0.37 - so without
+            # this the shorts fell under the 0.4 floor and the wardrobe lost them.
+            # Only when the dress box and the bottom both reach clearly below the top's
+            # hem - otherwise the "bottom" is the top's own lower half: on 876 (seated
+            # behind a table, no trousers in frame) a 0.27 "bottom" sat inside the shirt
+            # and the dress box ended where the shirt did (0.02 face-heights below it,
+            # against 0.59 on 226).
+            def below_top(y):
+                return top_hem is None or (y - top_hem) / fh >= DRESS_BELOW_TOP_MIN
+            if not below_top(c["box"][3]):
+                continue
+            for b in out.get("bottom", []):
+                if (_box_containment(b["box"], c["box"]) >= DRESS_BOTTOM_INSIDE_FRAC
+                        and below_top(b["box"][3])):
+                    b["score"] = max(b["score"], c["score"])
+                    b["from_dress"] = True
         out["dress"] = keep
     return {label: items for label, items in out.items() if items}
 

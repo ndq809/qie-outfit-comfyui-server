@@ -219,6 +219,28 @@ def prompt_items(detected):
     return [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
 
 
+# Asking for smaller items is what actually keeps them apart. "wide gap between items" alone
+# still let the LoRA draw a shirt's sleeve over the trousers' waistband, and the crop step
+# then had to cut one blob in two (job a569ed95/261, 426d2176/315). Measured 2026-09-30
+# over the 26 real multi-item photos x 2 seeds, counting generations where two items came
+# out of the segmenter touching (and the gap left between the closest pair):
+#
+#   current wording                                             6/52 touching, median gap 3.7%
+#   + "Items are drawn small, with plenty of empty white space
+#      between them."                                           0/52 touching, median gap 3.9%
+#   "... each item fills less than 40% of the image width, at
+#      least 10% empty white space between items"              2/26 touching
+#   "... in separate cells, each item in the middle of its own
+#      cell ..."                                                0/26, gap 11.5% - but drew
+#                                                  visible cell borders (650, 687) and a
+#                                                  second jacket (658); rejected
+#   "... small and spaced well apart ..."                       1/26 touching
+#
+# Checked by eye as well, per the note in build_prompt: no item dropped or invented by it,
+# and it drew fewer extra items than the current wording (613: a second vest; 55).
+SPACING_SENTENCE = "Items are drawn small, with plenty of empty white space between them."
+
+
 def build_prompt(detected):
     """How the top/bottom items are named was measured three ways, 15 paired
     generations each (5 photos x 3 seeds, same detection and seed, only the wording
@@ -263,6 +285,8 @@ def build_prompt(detected):
     # meant to fix.
     parts = [f"{_layout_lead(n)}: {placements}. Plain white background, "
              "wide gap between items, no overlapping."]
+    if n > 1:
+        parts.append(SPACING_SENTENCE)
     # Only describe how the bag should be laid out when a bag was actually detected -
     # naming/describing a category that isn't confirmed present (even to say how it
     # should look) measurably increases the chance the model draws one anyway (see
@@ -270,6 +294,16 @@ def build_prompt(detected):
     # a bag kept appearing in results even when detected["bag"] was False.
     if detected.get("bag"):
         parts.append("The bag lies flat on its own with no strap.")
+    else:
+        # The one measured exception to "never name an absent category" below. A crossbody
+        # strap across the chest survives isolation (it is on the subject), and the LoRA
+        # drew the whole bag over the shirt from it (a569ed95/84: the prompt asked for the
+        # shirt only). Measured 2026-09-30 over the 58 real photos with no bag detected x 2
+        # seeds: bag drawn 7/116 without this sentence, 0/116 with it, no garment dropped.
+        # Softer wordings lost: "Each item is shown on its own, with nothing worn over it."
+        # 4/58 (no effect); "Only the listed clothing, without straps or accessories."
+        # 1/58 but read shoes and hats as accessories and dropped them (707, 0912, 55).
+        parts.append("No bag.")
     parts.append("Professional flat mockup photography.")
     return " ".join(parts)
 

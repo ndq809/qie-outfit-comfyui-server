@@ -271,6 +271,64 @@ def _rescue_person_box_for_face(person_model, person_pre, image, person_boxes, f
     return min(tighter, key=_box_area) if tighter else None
 
 
+# Khuôn mặt "cỡ tương đương" chủ thể: chiều cao >= tỉ lệ này của mặt chủ thể. Người đứng
+# cạnh (ôm, khoác vai) cao mặt 0.9-1.1 lần; mặt người đi đường xa phía sau nhỏ hơn hẳn và
+# không phải lý do để cắt box của chủ thể.
+SPLIT_FACE_MIN_REL_HEIGHT = 0.6
+# Hai tâm mặt phải cách nhau ít nhất ngần này bề rộng mặt theo chiều ngang thì mới cắt
+# dọc được; người đứng ngay sau lưng (tâm gần trùng x) không tách bằng đường dọc.
+SPLIT_FACE_MIN_DX = 0.6
+
+
+def _split_box_by_faces(target_box, face_box, other_faces, person_boxes=()):
+    """Box người đang chứa NHIỀU người: tách nó theo từng khuôn mặt.
+
+    Detector người (Faster R-CNN) gộp hai người đứng sát/ôm nhau thành một box - đo trên
+    ảnh thật (55): một box 0.998 bao cả hai, không box nào khác kể cả ở ngưỡng 0.2, nên
+    `persons` ra 1, SAM không chạy, và mũ + áo của người bên cạnh vào tủ đồ của chủ thể.
+    InsightFace vẫn thấy rõ 2 khuôn mặt cùng cỡ trong box đó, và khuôn mặt là bằng chứng
+    đáng tin hơn: mỗi khuôn mặt cỡ tương đương nằm trong box là một người.
+
+    Cắt dọc tại trung điểm giữa các tâm mặt kề nhau, giữ nguyên chiều cao box. Trả về
+    (box của chủ thể, các box còn lại) hoặc None nếu không có gì để tách. Sau đó phần
+    còn lại của pipeline chạy y như ảnh nhiều người: SAM cô lập chủ thể, và món đồ nằm
+    trong box của người bên cạnh (_owned_by_subject) không được hợp vào mask.
+
+    Chỉ tính khuôn mặt CHƯA có box người nào khác chứa nó - tức người mà detector đã bỏ
+    sót. Mặt đã có box riêng thì pipeline vốn đã tách được người đó; bản đầu không có vế
+    này và đổi kết quả của 14/64 ảnh (mất túi thật ở 99, áo khoác thành áo ở 707/0912),
+    vì box chủ thể trong ảnh đông người thường chồng lên mặt người đứng sát."""
+    fh = face_box[3] - face_box[1]
+    fw = face_box[2] - face_box[0]
+    if fh <= 0 or fw <= 0:
+        return None
+
+    def center(b):
+        return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+
+    people = [face_box]
+    for f in other_faces:
+        cx, cy = center(f)
+        if not (target_box[0] <= cx <= target_box[2] and target_box[1] <= cy <= target_box[3]):
+            continue
+        if (f[3] - f[1]) < SPLIT_FACE_MIN_REL_HEIGHT * fh:
+            continue
+        if abs(cx - center(face_box)[0]) < SPLIT_FACE_MIN_DX * fw:
+            continue
+        if any(b is not target_box and b[0] <= cx <= b[2] and b[1] <= cy <= b[3]
+               for b in person_boxes):
+            continue
+        people.append(f)
+    if len(people) < 2:
+        return None
+    people.sort(key=lambda b: center(b)[0])
+    xs = [center(b)[0] for b in people]
+    cuts = [target_box[0]] + [(a + b) / 2 for a, b in zip(xs, xs[1:])] + [target_box[2]]
+    boxes = [[cuts[i], target_box[1], cuts[i + 1], target_box[3]] for i in range(len(people))]
+    k = people.index(face_box)
+    return boxes[k], boxes[:k] + boxes[k + 1:]
+
+
 def _owned_by_subject(item_box, target_box, person_boxes):
     """Món này có phải của chủ thể không, khi nhiều người cùng chứa nó.
 
@@ -376,6 +434,15 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         if rescued is not None:
             person_boxes = person_boxes + [rescued]
         target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)
+        if target_box is not None:
+            split = _split_box_by_faces(target_box, face.bbox.tolist(),
+                                        [f.bbox.tolist() for f in all_faces if f is not face],
+                                        person_boxes)
+            if split is not None:
+                merged = target_box
+                target_box, neighbours = split
+                person_boxes = ([b for b in person_boxes if b is not merged]
+                                + [target_box] + neighbours)
         # Same coordinates on the isolated image (isolation only repaints pixels), so the
         # body-geometry rules in clothing.apply_body_geometry can use it on both passes.
         face_box = face.bbox.tolist()
