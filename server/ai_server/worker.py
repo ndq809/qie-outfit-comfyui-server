@@ -5,8 +5,10 @@ pipeline in test_extract_outfit.py verbatim, does same-image D2 dedup, uploads
 crops, and reports back on result_queue. Never touches postgres (§2.3.3) —
 cancellation is checked via the cancelled_jobs Redis set instead.
 """
+import gc
 import json
 import logging
+import os
 import sys
 import tempfile
 import time
@@ -27,17 +29,56 @@ log = logging.getLogger("ai-server.worker")
 
 SAME_IMAGE_DEDUP_THRESHOLD = 0.90
 
+# Once the queue has been empty this long, the worker hands its VRAM back: BiRefNet and
+# the magic_eye classifier are dropped here, and ComfyUI is asked to unload its ~31GB
+# of weights (POST /free). Everything reloads lazily on the next ticket. The detector
+# service runs the same timer on its own models. 0 = never unload.
+IDLE_UNLOAD_SECONDS = float(os.environ.get("MODEL_IDLE_UNLOAD_SECONDS", "60"))
+
 
 def run_worker_loop(stop_event=None):
-    log.info("worker loop starting")
+    log.info("worker loop starting (unload models after %.0fs idle)", IDLE_UNLOAD_SECONDS)
+    last_work = time.monotonic()
+    gpu_dirty = False
     while stop_event is None or not stop_event.is_set():
         try:
             ticket = queue.pop_job(timeout=5)
             if not ticket:
+                if (gpu_dirty and IDLE_UNLOAD_SECONDS > 0
+                        and time.monotonic() - last_work >= IDLE_UNLOAD_SECONDS):
+                    _release_gpu()
+                    gpu_dirty = False
                 continue
-            _handle_ticket(ticket)
+            gpu_dirty = True
+            try:
+                _handle_ticket(ticket)
+            finally:
+                last_work = time.monotonic()
         except Exception:
             log.exception("unhandled error in worker loop")
+
+
+def _release_gpu():
+    pipeline._segmenter_cache.clear()
+    classifier = sys.modules.get("wardrobe_classifier")
+    if classifier is not None:
+        classifier._models_cache.clear()
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        log.exception("torch.cuda.empty_cache failed")
+    try:
+        req = urllib.request.Request(
+            f"{get_settings().comfyui_url}/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:
+        log.warning("could not ask ComfyUI to free its models: %s", exc)
+    log.info("idle: segmenter/classifier dropped and ComfyUI models unloaded from VRAM")
 
 
 def _handle_ticket(ticket: dict):

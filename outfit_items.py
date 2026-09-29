@@ -465,6 +465,22 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     return result
 
 
+def models_loaded():
+    return any(m is not None for m in (_clothing_models, _sam, _face_app))
+
+
+def unload_models():
+    """Drop every detector model so its VRAM goes back to the card. The next
+    detect_worn_items() call reloads them lazily. The selfie ArcFace embedding cache is
+    plain numpy and stays."""
+    global _clothing_models, _sam, _face_app
+    _clothing_models = _sam = _face_app = None
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def warm_up():
     """Load the always-used models up front (SAM and insightface stay lazy - they
     are only needed for multi-person / selfie inputs)."""

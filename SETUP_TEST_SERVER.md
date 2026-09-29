@@ -234,6 +234,7 @@ AI_SERVER_HEALTH_PORT=18090
 COMFYUI_URL=http://127.0.0.1:18188
 ITEM_DETECTOR_URL=http://127.0.0.1:18189
 OUTFIT_ITEMS_DEVICE=cuda
+MODEL_IDLE_UNLOAD_SECONDS=60
 
 WARDROBE_DEDUP_ENABLED=false
 WARDROBE_DEDUP_THRESHOLD=0.90
@@ -269,6 +270,12 @@ Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạ
   mỗi process ML mở một thread cho mỗi core (instance thường 64–128 core) và OpenMP
   spin-wait chiếm hết CPU, sshd không còn lượt chạy.
 - `comfyui`, `item_detector`, `ai-server` chạy dưới `nice -n 10 ionice -c2 -n7`.
+- Model **không** được giữ nóng trong VRAM: item_detector nạp model ở request đầu tiên
+  (không warm-up lúc khởi động), và sau `MODEL_IDLE_UNLOAD_SECONDS` giây không có việc
+  thì item_detector tự bỏ model, ai-server bỏ BiRefNet + magic_eye và gọi `POST /free`
+  của ComfyUI. Lúc rảnh GPU chỉ còn ~1.8 GB CUDA context. Ảnh đầu tiên sau khi rảnh
+  chậm hơn (~70s nạp lại model), các ảnh sau trong cùng lô chạy nóng bình thường.
+  `0` = không bao giờ bỏ; `ITEM_DETECTOR_WARMUP=true` = nạp detector lúc khởi động.
 - `WARDROBE_DEDUP_ENABLED=false`: tắt D2 (cả so trùng trong cùng ảnh lẫn so với tủ
   đồ). Đặt `true` nếu cần.
 - Report chỉ lưu JPEG thu nhỏ của từng bước và trang `/report/` chỉ render khi có
