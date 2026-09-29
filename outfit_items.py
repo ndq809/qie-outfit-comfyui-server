@@ -406,7 +406,10 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
             t = time.time()
-            isolated.save(save_isolated_to)
+            # compress_level=1: still lossless, but the default (6) spent up to 1.3s of
+            # single-core zlib on a 12MP photo on slower server CPUs (EPYC 7542). The
+            # file only travels over localhost to ComfyUI, so its size doesn't matter.
+            isolated.save(save_isolated_to, compress_level=1)
             timing["save_isolated"] = time.time() - t
         t = time.time()
         detections = clothing.predict_image(

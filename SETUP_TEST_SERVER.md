@@ -142,15 +142,25 @@ Không chờ — làm tiếp Bước 5. Kiểm tra ở Bước 9.
 source /venv/main/bin/activate
 cd /workspace/ComfyUI && uv pip install -r requirements.txt
 uv pip install fastapi "uvicorn[standard]" pydantic-settings boto3 redis psycopg2-binary \
-    transformers scipy opencv-python-headless insightface onnxruntime timm einops
+    transformers scipy opencv-python-headless insightface timm einops
+# InsightFace (so khớp khuôn mặt ở D0b) chạy qua onnxruntime: bản `onnxruntime` thường
+# chỉ có CPU (đo được 2-6s/ảnh thay vì 0.2-0.4s). Bản GPU từ 1.23 trên PyPI build cho
+# CUDA 13; 1.22.0 là bản CUDA 12 cuối, dùng chung cuBLAS/cuDNN mà torch đã cài.
+# Driver có driver_max_cuda >= 13.0 thì bỏ ghim phiên bản cũng được.
+uv pip uninstall onnxruntime 2>/dev/null || true
+uv pip install "onnxruntime-gpu==1.22.0"
 cd /workspace/qie-outfit-comfyui-server
 python -c "
 import torch; from transformers import SamModel, SamProcessor, AutoModelForObjectDetection, SiglipModel, AutoModelForImageSegmentation
 import insightface, onnxruntime, cv2, boto3, redis, psycopg2, fastapi
-print('imports ok, cuda =', torch.cuda.is_available())"
+import detect_clothing_by_face as b
+print('imports ok, cuda =', torch.cuda.is_available())
+print('face providers =', {m.session.get_providers()[0] for m in b.load_face_app().models.values()})" 2>&1 | tail -2
 ```
 
-**Kỳ vọng:** `imports ok, cuda = True`. **Không đổi phiên bản** `torch` (image đã có bản
+**Kỳ vọng:** `imports ok, cuda = True` và `face providers = {'CUDAExecutionProvider'}`.
+Nếu thấy `CPUExecutionProvider` thì onnxruntime đang là bản CPU hoặc sai bản CUDA (log
+có `libcublasLt.so.13` là bản CUDA 13) — cài lại đúng như trên. **Không đổi phiên bản** `torch` (image đã có bản
 khớp driver) — chỉ đổi *bản dựng CUDA* như ngay dưới đây.
 
 ### Bước 5b — Đổi torch sang bản dựng cu130 (nếu `driver_max_cuda` ≥ 13.0)
@@ -479,6 +489,7 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 | CUDA OOM ở ai-server hoặc ComfyUI | GPU < 24 GB dùng chung cho detector và ComfyUI | Đặt `OUTFIT_ITEMS_DEVICE=cpu` trong `.env`, restart `item_detector ai-server` (D0b chậm hơn ~4 lần) |
 | Ảnh đen / NaN | Có ai thêm `--use-sage-attention` vào ComfyUI | Bỏ cờ đó khỏi `scripts/comfyui.sh` |
 | Wardrobe ít item hơn số crop trong report | D2 loại món trùng với đồ đã có trong tủ (ngưỡng 0.90) — chỉ khi `WARDROBE_DEDUP_ENABLED=true` | Không phải lỗi — report ghi rõ "trùng đồ đã có trong tủ (sim …)" |
+| D0b chậm (vài giây), "so khớp khuôn mặt" chiếm 2-6s trong report | InsightFace chạy trên CPU (`onnxruntime` bản CPU hoặc bản CUDA 13) | Làm lại phần onnxruntime ở Bước 5, `supervisorctl restart item_detector` |
 | SSH lag/rớt kết nối khi đang chạy job | Thread CPU không giới hạn, hoặc service ML chạy cùng độ ưu tiên với sshd | Kiểm tra `.env` có `OMP_NUM_THREADS`/`OMP_WAIT_POLICY` và script dùng `nice`; `supervisorctl restart comfyui item_detector ai-server` |
 | Log service | — | `tail -f /var/log/portal/<service>.log` |
 
