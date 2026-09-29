@@ -4,7 +4,7 @@ No database here any more: a photo's extracted garments are parked in Redis
 (server/data_server/jobs.py) as a proposal for the user to review. Only what the
 user confirms is written to postgres, by POST /v1/wardrobe/items. This loop just
 records per-photo progress and results, and deletes the raw photo once it has been
-processed.
+processed (unless KEEP_RAW_IMAGES, test only).
 """
 import logging
 
@@ -32,5 +32,6 @@ def _handle_result(msg: dict):
         raw_key = jobs.finish_item(job_id, local_id, "success", None, msg.get("garments", []))
     else:
         raw_key = jobs.finish_item(job_id, local_id, "failed", msg.get("errorReason"))
-    if raw_key:
-        storage.delete_object(get_settings().minio_raw_bucket, raw_key)
+    settings = get_settings()
+    if raw_key and not settings.keep_raw_images:
+        storage.delete_object(settings.minio_raw_bucket, raw_key)

@@ -127,7 +127,7 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
         # it saves ~20s of generation that would only invent an outfit.
         log.info("job %s item %s: no garment detected, nothing to extract", job_id, item_id)
         _write_report(job_id, item_id, raw_path, isolated_path, tmp_dir / "result.png",
-                      [], [], [], detected, items, "", stages, settings)
+                      [], [], [], detected, items, "", stages, settings, object_key)
         return []
     prompt = pipeline.build_prompt(detected)
 
@@ -168,7 +168,7 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
         kept = list(records)
 
     _write_report(job_id, item_id, raw_path, isolated_path, result_path,
-                  crops, records, kept, detected, items, prompt, stages, settings)
+                  crops, records, kept, detected, items, prompt, stages, settings, object_key)
     if not records:
         return []
 
@@ -195,7 +195,8 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
 
 
 def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
-                  crops, records, kept, detected, items, prompt, stages, settings):
+                  crops, records, kept, detected, items, prompt, stages, settings,
+                  raw_object_key=None):
     """Test-only (WARDROBE_REPORT_DIR). Wrapped so a reporting problem can never fail a
     job whose extraction actually worked."""
     if not settings.wardrobe_report_dir:
@@ -209,7 +210,7 @@ def _write_report(job_id, item_id, raw_path, isolated_path, result_path,
             object_keys={r["image_name"]: storage.item_object_key(job_id, item_id, idx)
                          for idx, r in enumerate(kept, start=1)},
             detected={**detected, "_asked_items": items}, prompt=prompt,
-            stages=stages,
+            stages=stages, raw_object_key=raw_object_key,
         )
     except Exception:
         log.exception("could not write the extraction report for %s/%s", job_id, item_id)

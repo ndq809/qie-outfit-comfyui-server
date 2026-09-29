@@ -50,7 +50,7 @@ WARDROBE = "wardrobe.json"
 def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
                 isolated: Path | None, grid: Path, crops: list, records: list,
                 object_keys: dict, detected: dict, prompt: str,
-                stages: list | None = None) -> Path:
+                stages: list | None = None, raw_object_key: str | None = None) -> Path:
     """Copy one photo's four stages into <report_dir>/<job_id>/<item_id>/ and write the
     metadata the page needs beside them. Never raises into the worker: a broken report
     must not fail a job that otherwise succeeded."""
@@ -87,6 +87,8 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
 
     (out / RECORD).write_text(json.dumps({
         "jobId": job_id, "itemId": item_id,
+        # Full-resolution upload in the raw bucket - still there when KEEP_RAW_IMAGES.
+        "rawObjectKey": raw_object_key,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "detected": {k: v for k, v in detected.items()
                      if k not in ("timing", "params") and not k.startswith("_")},

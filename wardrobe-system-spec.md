@@ -346,6 +346,8 @@ Mỗi vé việc trong hàng đợi được thử lại độc lập nếu xử
 
 **Mức độ quan trọng đã tăng lên** kể từ khi bước bôi xám (C1) chuyển từ mobile sang server: trước đây ảnh nhóm rời khỏi thiết bị đã được che khuôn mặt/thân người khác, nay **ảnh nhóm nguyên bản** được upload. Nghĩa là lớp bảo vệ dữ liệu của người thứ ba trong ảnh giờ nằm hoàn toàn ở phía server, không còn được bảo vệ "tại nguồn" nữa. Hai yêu cầu tối thiểu: (1) ảnh gốc phải bị xóa ngay sau khi tách trang phục xong, không giữ lại quá thời gian cần thiết cho retry; (2) chỉ ảnh trang phục đã tách (không còn khuôn mặt) mới được lưu dài hạn trong wardrobe.
 
+**Ngoại lệ duy nhất: môi trường Test** giữ lại ảnh gốc (`KEEP_RAW_IMAGES=true`, xem [2.3.5](#235-khác-biệt-so-với-production)) để điều tra kết quả sai trên đúng ảnh đầu vào. Production **bắt buộc** `KEEP_RAW_IMAGES=false` (giá trị mặc định) — yêu cầu (1) ở trên áp dụng nguyên vẹn.
+
 #### Hủy xử lý và sự cố thiết bị giữa chừng
 
 Nguyên tắc quan trọng: một khi ảnh đã upload xong và vé việc đã vào hàng đợi, việc xử lý ở AI server hoàn toàn độc lập với tình trạng kết nối/hoạt động của thiết bị Mobile.
@@ -407,6 +409,8 @@ Chỉ data-server cần mở cổng ra ngoài (map port 8080 nội bộ ra một
 #### 2.3.5 Khác biệt so với Production
 
 Đây là một máy vật lý duy nhất nên không có khả năng chịu lỗi phần cứng thật — nếu máy gặp sự cố, mọi thành phần dừng theo. Chấp nhận được cho môi trường test nhưng không dùng cho production.
+
+**Ảnh gốc được giữ lại** (`KEEP_RAW_IMAGES=true` trong `.env` của máy test): khác với yêu cầu xóa ngay ở [Bảo mật và vòng đời dữ liệu](#bảo-mật-và-vòng-đời-dữ-liệu). Lý do: khi một ảnh test cho kết quả sai, cần chạy lại D0b/D1 trên **đúng ảnh độ phân giải gốc** — bản thu nhỏ trong trang report không tái hiện được điểm số của detector (đo được: ảnh 876 và 946 cho kết quả khác hẳn khi chạy lại trên bản thu nhỏ). Ảnh nằm ở bucket raw, key `raw/<accountId>/<batchId>/<localId>.<ext>`, và mỗi ảnh trong report ghi lại key đó ở trường `rawObjectKey` của `record.json`. Khi chuyển sang Production phải để cờ này `false` (mặc định) — không có ngoại lệ.
 
 Không có autoscale GPU thật vì chỉ có một máy; nếu muốn giả lập worker pool nhiều tiến trình, có thể chạy song song nhiều tiến trình worker trong cùng container ai-server, tất cả cùng đọc chung một job queue.
 

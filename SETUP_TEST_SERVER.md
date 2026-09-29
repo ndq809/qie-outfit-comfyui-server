@@ -247,6 +247,7 @@ NUMEXPR_MAX_THREADS=8
 OMP_WAIT_POLICY=PASSIVE
 
 TEST_FIXED_FACE_REF_IMAGE=/workspace/qie-outfit-comfyui-server/face-image/selfie.jpg
+KEEP_RAW_IMAGES=true
 WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_test
 WARDROBE_REPORT_MAX_JOBS=10
 WARDROBE_REPORT_PAGE_JOBS=5
@@ -276,6 +277,15 @@ Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạ
   của ComfyUI. Lúc rảnh GPU chỉ còn ~1.8 GB CUDA context. Ảnh đầu tiên sau khi rảnh
   chậm hơn (~70s nạp lại model), các ảnh sau trong cùng lô chạy nóng bình thường.
   `0` = không bao giờ bỏ; `ITEM_DETECTOR_WARMUP=true` = nạp detector lúc khởi động.
+- `KEEP_RAW_IMAGES=true`: **chỉ môi trường test** — ảnh gốc mobile upload được giữ lại trong
+  bucket `wardrobe-raw` sau khi xử lý (production mặc định `false`, xoá ngay theo spec
+  "Bảo mật và vòng đời dữ liệu"). Để điều tra ảnh sai trên đúng ảnh gốc độ phân giải đầy
+  đủ, lấy key ở `rawObjectKey` trong `wardrobe_report_test/<jobId>/<localId>/record.json`
+  rồi tải về:
+  ```bash
+  python -c "from pathlib import Path; from server.common import storage; from server.common.config import get_settings as g; storage.download_to(g().minio_raw_bucket, '<rawObjectKey>', Path('/tmp/raw.jpg'))"
+  ```
+  Thêm dòng này vào `.env` của instance cũ rồi `supervisorctl restart data-server ai-server`.
 - `WARDROBE_DEDUP_ENABLED=false`: tắt D2 (cả so trùng trong cùng ảnh lẫn so với tủ
   đồ). Đặt `true` nếu cần.
 - Report chỉ lưu JPEG thu nhỏ của từng bước và trang `/report/` chỉ render khi có

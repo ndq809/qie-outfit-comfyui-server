@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     presign_expires_seconds: int = 900
     read_url_expires_seconds: int = 3600
 
+    # Test-only: keep each uploaded photo in the raw bucket after it has been processed,
+    # so a wrong result can be re-run on the exact full-resolution input (the report only
+    # keeps a downscaled preview, which does not always reproduce the detector's scores).
+    # MUST be false in production - wardrobe-system-spec.md "Bảo mật và vòng đời dữ liệu"
+    # requires the original to be deleted once extraction is done.
+    keep_raw_images: bool = False
+
     # Test-only shared face reference (wardrobe-system-spec.md §2.3.7).
     # MUST be empty in production.
     test_fixed_face_ref_image: str = ""
