@@ -25,15 +25,15 @@ Nguyên tắc cần nhớ trước khi đọc chi tiết:
 
 | Môi trường | Base URL |
 |---|---|
-| Test (máy vast.ai hiện tại) | `http://95.3.33.46:41970` |
+| Test (máy vast.ai hiện tại) | `http://175.155.64.157:16828` |
 | Production | domain thật của data-server |
 
 Đặt giá trị này trong config build, **không hard-code** — chuyển Test ↔ Production chỉ
 nên là đổi một hằng số.
 
-> Port `41970` là port public mà vast.ai map cho container port `10100`. Nếu instance
+> Port `16828` là port public mà vast.ai map cho container port `10100`. Nếu instance
 > được tạo lại, con số này đổi — đọc lại bằng `vast-capabilities` trên máy chủ, đừng coi
-> `41970` là cố định.
+> `16828` là cố định.
 
 ### 1.2 Hai lớp token (chỉ môi trường Test)
 
@@ -50,7 +50,7 @@ Vì sao edge token đi ở **query param** chứ không phải header: cả hai 
 edge, header để dành cho token ứng dụng.
 
 ```
-GET http://95.3.33.46:41970/v1/wardrobe/items?token=<EDGE_TOKEN>
+GET http://175.155.64.157:16828/v1/wardrobe/items?token=<EDGE_TOKEN>
 Authorization: Bearer <APP_TOKEN>
 ```
 
@@ -185,7 +185,7 @@ Xin đường dẫn upload cho cả lô ảnh trong một lần gọi.
     {
       "localId":   "asset-IMG_9652",
       "objectKey": "raw/67180bc0-.../5245fa0b-.../asset-IMG_9652.jpg",
-      "uploadUrl": "http://95.3.33.46:41884/wardrobe-raw/raw/...?X-Amz-Algorithm=...",
+      "uploadUrl": "http://175.155.64.157:16696/wardrobe-raw/raw/...?X-Amz-Algorithm=...",
       "expiresAt": "2026-09-11T05:00:00+00:00"
     }
   ]
@@ -204,9 +204,9 @@ vì xin một lần rồi upload dần quá hạn.
 `PUT` thẳng vào `uploadUrl`, body là **raw bytes** của file (không multipart, không form).
 
 ```http
-PUT http://95.3.33.46:41884/wardrobe-raw/raw/...?X-Amz-Algorithm=...
+PUT http://175.155.64.157:16696/wardrobe-raw/raw/...?X-Amz-Algorithm=...
 Content-Type: image/jpeg
-Cookie: C.53314480_auth_token=<EDGE_TOKEN>
+Cookie: C.54595356_auth_token=<EDGE_TOKEN>
 
 <bytes ảnh>
 ```
@@ -219,7 +219,7 @@ Ba điểm bắt buộc, sai một cái là `403 SignatureDoesNotMatch`:
    số `X-Amz-*` đều nằm trong chữ ký.
 3. **Edge token ở môi trường Test phải đi bằng Cookie, không phải query param** — thêm
    `?token=` vào URL sẽ phá chữ ký. Tên cookie là `<VAST_CONTAINERLABEL>_auth_token`,
-   trên instance hiện tại là `C.53314480_auth_token`. Production không cần cookie này.
+   trên instance hiện tại là `C.54595356_auth_token`. Production không cần cookie này.
 
 Thành công trả `200` (body rỗng). Upload **4 ảnh song song** — mỗi lần upload chủ yếu là
 chờ mạng chứ không tốn CPU, chạy tuần tự chỉ cộng dồn độ trễ.
@@ -349,7 +349,7 @@ app có thể mở màn hình duyệt sớm thay vì chờ cả lô.
       "garmentId": "1dbffca2638349d6918f7e5f930a6faf",
       "localId": "asset-IMG_0168",          // ảnh gốc sinh ra món này
       "reviewStatus": "pending",            // pending / confirmed / rejected
-      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/pending/...?X-Amz-Algorithm=...",
+      "imageUrl": "http://175.155.64.157:16696/wardrobe-items/pending/...?X-Amz-Algorithm=...",
       "tags": {
         "type": "shirts",
         "category": "clothing",
@@ -413,7 +413,7 @@ không bỏ được bằng endpoint này — nó nằm trong `alreadyConfirmed`
 {
   "items": [
     { "id": "95ca02ba-7f44-464a-b28e-b923b8617718", "garmentId": "95ca02ba7f44...",
-      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/wardrobe/...", "tags": { ... },
+      "imageUrl": "http://175.155.64.157:16696/wardrobe-items/wardrobe/...", "tags": { ... },
       "jobId": "bfbf24f3-..." }
   ],
   "errors": [ { "garmentId": "...", "error": "already rejected" } ]
@@ -446,7 +446,7 @@ Chỉ chứa những món đã xác nhận.
   "items": [
     {
       "id": "95ca02ba-7f44-464a-b28e-b923b8617718",
-      "imageUrl": "http://95.3.33.46:41884/wardrobe-items/wardrobe/...?X-Amz-Algorithm=...",
+      "imageUrl": "http://175.155.64.157:16696/wardrobe-items/wardrobe/...?X-Amz-Algorithm=...",
       "jobId": "bfbf24f3-e2fb-4eaf-9c96-e5705ab6c140",
       "tags": { "type": "shirts", "gender": "women", "color": [ ... ], ... }
     }
@@ -546,10 +546,10 @@ bản test dùng bearer token tĩnh seed sẵn trong database.
 ### 9.1 curl
 
 ```bash
-BASE=http://95.3.33.46:41970
+BASE=http://175.155.64.157:16828
 EDGE=<EDGE_TOKEN>
 APP=$(grep TEST_BEARER_TOKEN ${WORKSPACE:-/workspace}/.env | cut -d= -f2)
-COOKIE="C.53314480_auth_token=$EDGE"
+COOKIE="C.54595356_auth_token=$EDGE"
 
 # 0) health
 curl -s "$BASE/v1/health?token=$EDGE"
@@ -600,10 +600,10 @@ curl -s "$BASE/v1/wardrobe/items?jobId=$JID&token=$EDGE" -H "Authorization: Bear
 class WardrobeApi {
   WardrobeApi({required this.baseUrl, required this.appToken, this.edgeToken, this.edgeCookie});
 
-  final String baseUrl;       // http://95.3.33.46:41970
+  final String baseUrl;       // http://175.155.64.157:16828
   final String appToken;      // bearer token của user
   final String? edgeToken;    // chỉ Test; Production để null
-  final String? edgeCookie;   // 'C.53314480_auth_token'
+  final String? edgeCookie;   // 'C.54595356_auth_token'
 
   Uri _u(String path, [Map<String, String> q = const {}]) => Uri.parse('$baseUrl$path').replace(
         queryParameters: {...q, if (edgeToken != null) 'token': edgeToken!},
