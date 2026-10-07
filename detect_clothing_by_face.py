@@ -37,10 +37,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
-from scipy.ndimage import binary_fill_holes
 from transformers import SamModel, SamProcessor
 
 import detect_clothing_yolo as clothing
@@ -94,9 +94,7 @@ def scored_person_boxes(person_model, person_pre, image: Image.Image, min_score:
 
     Tach rieng de goi y co the ha san khi CAN bang chung khac - xem
     outfit_items._rescue_person_box_for_face()."""
-    x = person_pre(image).unsqueeze(0).to(next(person_model.parameters()).device)
-    with torch.no_grad():
-        out = person_model(x)[0]
+    out = clothing.person_detections(person_model, person_pre, image)
     mask = (out["labels"] == 1) & (out["scores"] > min_score)
     pairs = list(zip(out["scores"][mask].tolist(), out["boxes"][mask].tolist()))
     pairs.sort(key=lambda sb: -sb[0])
@@ -104,6 +102,13 @@ def scored_person_boxes(person_model, person_pre, image: Image.Image, min_score:
 
 
 _ref_embedding_cache = {}
+
+
+def _bgr(image: Image.Image) -> np.ndarray:
+    """RGB PIL -> contiguous BGR for insightface. A [:, :, ::-1] view has negative strides,
+    which sends every cv2.warpAffine of the face-alignment step down a slow copying path
+    over the whole 12MP frame (~70ms per face); the pixel values are identical."""
+    return np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
 
 
 def find_reference_embedding(face_app, selfie_path: Path):
@@ -115,7 +120,7 @@ def find_reference_embedding(face_app, selfie_path: Path):
     if key in _ref_embedding_cache:
         return _ref_embedding_cache[key]
 
-    img = np.array(Image.open(selfie_path).convert("RGB"))[:, :, ::-1]  # RGB -> BGR cho insightface
+    img = _bgr(Image.open(selfie_path).convert("RGB"))
     faces = face_app.get(img)
     if not faces:
         raise ValueError(f"Không phát hiện khuôn mặt nào trong ảnh selfie: {selfie_path}")
@@ -127,8 +132,7 @@ def find_reference_embedding(face_app, selfie_path: Path):
 
 def match_face_in_group(face_app, group_image: Image.Image, ref_embedding, return_all=False):
     """Best-matching face and its similarity; with return_all, also every face found."""
-    img = np.array(group_image.convert("RGB"))[:, :, ::-1]
-    faces = face_app.get(img)
+    faces = face_app.get(_bgr(group_image))
     if not faces:
         return (None, 0.0, []) if return_all else (None, 0.0)
 
@@ -187,12 +191,12 @@ def _pick_mask(masks, scores, box):
     NÓ (đúng với cả box người lẫn box món đồ), loại các mask quá nhỏ so với box
     trước khi chọn theo score, để tránh lặp lại lỗi này."""
     box_area = (box[2] - box[0]) * (box[3] - box[1])
-    area_fracs = [masks[i].numpy().sum() / box_area for i in range(masks.shape[0])]
+    area_fracs = (masks.flatten(1).sum(dim=1).double() / box_area).tolist()
     candidates = [i for i, frac in enumerate(area_fracs) if frac >= MIN_MASK_AREA_FRAC]
     if not candidates:
         candidates = range(masks.shape[0])  # không mask nào đủ lớn -> đành lấy hết, chọn theo score
     best = max(candidates, key=lambda i: scores[i].item())
-    return masks[best].numpy()  # (H, W) bool
+    return masks[best].cpu().numpy()  # (H, W) bool
 
 
 @torch.no_grad()
@@ -205,24 +209,37 @@ def segment_boxes(sam_model, sam_processor, image: Image.Image, boxes, device: s
     2.78s, nhưng 5 box gọi riêng từng cái = 12.25s (encoder chạy lại 5 lần)."""
     inputs = sam_processor(image, input_boxes=[list(boxes)], return_tensors="pt").to(device)
     outputs = sam_model(**inputs)
+    # Upsampled to the full frame on the GPU: the same two bilinear interpolations and
+    # threshold, but on a 12MP frame they cost ~0.4s on the CPU.
     masks = sam_processor.image_processor.post_process_masks(
-        outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
+        outputs.pred_masks, inputs["original_sizes"], inputs["reshaped_input_sizes"]
     )[0]  # (num_boxes, 3, H, W)
-    scores = outputs.iou_scores.cpu()[0]  # (num_boxes, 3)
+    scores = outputs.iou_scores[0]  # (num_boxes, 3)
     return [_pick_mask(masks[i], scores[i], box) for i, box in enumerate(boxes)]
 
 
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    """scipy.ndimage.binary_fill_holes(mask), same result: background pixels 4-connected to
+    the frame stay background, every other one becomes mask. One OpenCV flood fill from a
+    1px padding instead of scipy's iterated dilation - ~15x faster on a 12MP mask."""
+    h, w = mask.shape
+    bg = np.zeros((h + 2, w + 2), np.uint8)
+    bg[1:-1, 1:-1] = ~mask
+    bg[0, :] = bg[-1, :] = 1
+    bg[:, 0] = bg[:, -1] = 1
+    cv2.floodFill(bg, np.zeros((h + 4, w + 4), np.uint8), (0, 0), 2, flags=4)
+    return bg[1:-1, 1:-1] != 2
+
+
 def segment_person(sam_model, sam_processor, image: Image.Image, person_box, device: str):
-    return binary_fill_holes(
+    return fill_holes(
         segment_boxes(sam_model, sam_processor, image, [person_box], device)[0]
     )
 
 
 def isolate_person(image: Image.Image, mask: np.ndarray) -> Image.Image:
-    arr = np.array(image.convert("RGB"))
-    out = np.full_like(arr, MASK_BG_COLOR)
-    out[mask] = arr[mask]
-    return Image.fromarray(out)
+    arr = np.asarray(image.convert("RGB"))
+    return Image.fromarray(np.where(mask[:, :, None], arr, np.array(MASK_BG_COLOR, dtype=np.uint8)))
 
 
 def find_images(images_dir: Path):

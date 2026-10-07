@@ -317,10 +317,31 @@ def load_model(device: str, multi_scale: bool, person_crop: bool):
     return model, processors_full, processors_crop, person_model, person_pre
 
 
+_person_raw_cache = {"image": None, "out": None}
+
+
+@torch.no_grad()
+def person_detections(person_model, person_pre, image: Image.Image):
+    """Raw Faster R-CNN output for this exact image object, computed once.
+
+    One photo asks for it up to three times on the same image (all person boxes, the
+    rescue pass at a lower floor, and the person-crop TTA of the locate pass) - each a
+    full forward plus a 12MP PIL -> float conversion on the CPU (~0.1s).
+
+    The conversion deliberately stays on the CPU: done on the GPU its /255 differs in the
+    last bit, the boxes move by up to 0.3px, and that alone shifted a detector score from
+    0.4746 to 0.5336 (IMG_9822) via a one-pixel-different person crop."""
+    if _person_raw_cache["image"] is image:
+        return _person_raw_cache["out"]
+    device = next(person_model.parameters()).device
+    out = person_model(person_pre(image).unsqueeze(0).to(device))[0]
+    _person_raw_cache.update(image=image, out=out)
+    return out
+
+
 @torch.no_grad()
 def get_person_crop(person_model, person_pre, image: Image.Image):
-    x = person_pre(image).unsqueeze(0).to(next(person_model.parameters()).device)
-    out = person_model(x)[0]
+    out = person_detections(person_model, person_pre, image)
     person_idx = 1  # "person" trong COCO
     mask = (out["labels"] == person_idx) & (out["scores"] > PERSON_SCORE_THRESHOLD)
     boxes = out["boxes"][mask]

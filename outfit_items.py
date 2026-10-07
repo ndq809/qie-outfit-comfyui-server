@@ -51,7 +51,6 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from scipy.ndimage import binary_fill_holes
 
 import detect_clothing_by_face as byface
 import detect_clothing_yolo as clothing
@@ -375,14 +374,14 @@ def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
     people = person_boxes or [target_box]
     inside = [b for b in item_boxes if _owned_by_subject(b, target_box, people)]
     masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE)
-    mask = binary_fill_holes(masks[0])
+    mask = byface.fill_holes(masks[0])
     for item_mask in masks[1:]:
         mask |= item_mask
     return mask
 
 
 def detect_worn_items(image_path, selfie_path=None, threshold=None,
-                      face_match_threshold=None, save_isolated_to=None):
+                      face_match_threshold=None, save_isolated_to=None, return_isolated=False):
     """Return the item flags build_prompt() needs, plus the raw per-label scores.
 
     selfie_path: optional reference photo of the person whose outfit should be
@@ -393,7 +392,10 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         (default FACE_MATCH_THRESHOLD). Below it no face is accepted as the
         subject, rather than risking someone else's clothes.
     save_isolated_to: optional path to write the SAM-isolated image to, for
-        checking the mask by eye (the --save-isolated of the other module)."""
+        checking the mask by eye (the --save-isolated of the other module).
+    image_path may also be an already-decoded RGB PIL image, and return_isolated=True puts
+    the isolated PIL image itself in result["isolated_image"] - the in-process worker hands
+    it straight to D1 instead of a 12MP PNG round trip (~0.2-0.5s of zlib alone)."""
     threshold = THRESHOLD if threshold is None else threshold
     face_match_threshold = (
         FACE_MATCH_THRESHOLD if face_match_threshold is None else face_match_threshold
@@ -402,7 +404,10 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     cloth_model, procs_full, procs_crop, person_model, person_pre = load_clothing_models()
     timing = {}
     t = time.time()
-    image = Image.open(image_path).convert("RGB")
+    if isinstance(image_path, Image.Image):
+        image = image_path if image_path.mode == "RGB" else image_path.convert("RGB")
+    else:
+        image = Image.open(image_path).convert("RGB")
     timing["decode_image"] = time.time() - t
 
     t = time.time()
@@ -509,6 +514,8 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
             ]
 
     result = _flags_from_detections(detections)
+    if return_isolated and isolated_by_sam:
+        result["isolated_image"] = isolated
     result["persons"] = len(person_boxes)
     result["isolated_by_sam"] = isolated_by_sam
     result["device"] = DEVICE
