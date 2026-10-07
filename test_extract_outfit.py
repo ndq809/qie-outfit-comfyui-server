@@ -757,8 +757,9 @@ def crop_items(result_path, out_dir, items=None, device=None, timing=None):
     if the model dropped or added a cell, positional names are used instead of
     mislabelling e.g. a bag as "footwear".
     timing: optional dict, filled with the seconds the segmenter itself took, apart
-    from the compositing around it."""
-    result_img = Image.open(result_path).convert("RGB")
+    from the compositing around it. result_path may also be the grid as a PIL image."""
+    result_img = (result_path.convert("RGB") if isinstance(result_path, Image.Image)
+                  else Image.open(result_path).convert("RGB"))
     img = np.array(result_img)
     t = time.time()
     found = _segment_items(result_img, device=device,

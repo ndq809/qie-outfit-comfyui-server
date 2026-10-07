@@ -104,12 +104,21 @@ for what each file is.
 | `magic_eye/` | Model definitions for that classifier (`model_phase2.py`, `model_phase3.py`, …), vendored from the MS_Model_Magic_Eye training project. |
 | `models/magic_eye/` | Its trained weights + taxonomy — the committed bundle. [Details](models/magic_eye/README.md). |
 | `scripts/export_magic_eye_bundle.py` | Regenerates that bundle from the training project after a retrain. |
+| `d1_engine/` | The in-process D1 engine the server uses: same workflow as ComfyUI's, run as int8 W8A8 Triton kernels + SageAttention with every model resident. See [D1 engine](#d1-engine-in-process-int8). |
+| `server/ai_server/fast_pipeline.py` | The ai-server worker that drives it: D0b / D1 / D3 in one process, overlapped across three threads. |
+| `scripts/sageattention-current-stream.patch` | Makes SageAttention launch on torch's current CUDA stream; required by the pipelined worker. |
 | `result_v4.png` | A saved extraction result, committed as a fixture so stages 3–4 can be exercised without the generation model. |
 
 `outfit_items.py` imports `detect_clothing_yolo.py` and `detect_clothing_by_face.py`,
 so those three must sit in the same folder.
 
 ## Service setup (Vast.ai / supervisor)
+
+With the server's default `D1_ENGINE=fast` the ai-server process runs D0b, D1 and D3
+itself ([D1 engine](#d1-engine-in-process-int8)) and neither service below is needed - they
+stay installed with `autostart=false` as the `D1_ENGINE=comfyui` fallback, and for
+`test_extract_outfit.py`, which still drives ComfyUI over HTTP. Don't run ComfyUI with
+models loaded next to the fast ai-server on one card: both hold the transformer.
 
 Two supervisor services:
 
@@ -639,6 +648,79 @@ python detect_clothing_yolo.py --images-dir images --single-scale --no-person-cr
   two items or add an unrequested one. Use `--seed N` to retry rather than chasing
   a "perfect" prompt further — this is inherent stochasticity of the 4/8-step
   distilled sampler, not something prompt wording alone fixes.
+
+## D1 engine (in-process, int8)
+
+`d1_engine/` runs exactly this README's workflow (Qwen-Image-Edit-2511 fp8mixed +
+Extract-Outfit LoRA + Lightning-4step LoRA, euler/simple, shift 3.1, cfg 1, reference
+latent `index_timestep_zero`, 4 steps, seed 42) without ComfyUI's server, using ComfyUI's
+own model code as a library (`COMFYUI_DIR`, default `/workspace/ComfyUI`, still holds the
+weights). What changed, all measured on the RTX 4090 48GB of the test box (driver 560 /
+CUDA 12.6, torch 2.11 cu128):
+
+| | ComfyUI path | d1_engine |
+|---|---|---|
+| sampling, 4 steps | 5.7-6.0s (1.42s/step) | **1.72s** (0.43s/step) |
+| text encoder | 0.41s | 0.09s |
+| VAE encode + decode | 0.08 + 0.11s (+ a second, unused 0.1s encode) | 0.06 + 0.11s |
+| photo upload / Kontext resize / poll / download | ~0.8s | 0.15s, on a CPU thread |
+| **D1 total** | **~7.8s** | **~2.1s** |
+
+- **Why ComfyUI was slow here.** `qwen_image_edit_2511_fp8mixed` marks every layer
+  `full_precision_matrix_mult: true`, and with LoRA patches attached ComfyUI never takes
+  its quantized path either: every forward dequantized each fp8 weight to bf16, added both
+  LoRAs on the fly and ran a bf16 GEMM (~118 TFLOPS effective). The text encoder ran fp32
+  GEMMs on weights dequantized per call (`sd1_clip` hardcodes `dtype=torch.float32`).
+- **Both LoRAs merged once** (`W += strength * alpha/rank * up @ down` in fp32, the
+  formula of `comfy/weight_adapter/lora.py`), then **int8 W8A8**: per-output-channel int8
+  weights, per-token int8 activations, int32 accumulation (`d1_engine/kernels.py`). Bias,
+  GELU and the adaLN-gated residual are fused into the GEMM epilogue, LayerNorm + adaLN
+  modulation into the activation quantizer, RMSNorm + RoPE into one in-place pass. The
+  Triton GEMM reaches 406-480 TOPS (cuBLAS `_int_mm` 435-513 without the epilogue, bf16
+  ~160 TFLOPS).
+- **adaLN precomputed.** `img_mod`/`txt_mod`/`norm_out` depend only on the timestep and
+  the 4-step schedule is fixed, so their outputs are tables. That also drops 6.8B of the
+  20.4B parameters from VRAM (12.7GB transformer, 14.5GB fp16 text encoder, ~28GB total).
+- **SageAttention2** (int8 QK, fp8 PV; built from source, sm89) for the 8.5k-token joint
+  attention: 2.5ms vs 6.1ms per layer. Its fp16-PV variants return NaN on this model -
+  the value activations overflow fp16 - which is the README's old `--use-sage-attention`
+  failure. Falls back to PyTorch SDPA (+0.7s) if the package is missing.
+- **Text encoder resident**, fp16 GEMMs with everything between them in fp32. bf16 GEMMs
+  were rejected: the residual stream reaches ~170 and moved the conditioning by ~10%.
+- Converted weights are cached (`D1_CACHE_DIR`, ~13GB): a cold start reads them in ~4s
+  instead of the ~25s conversion; Triton's tuned tiles are cached as well. Cold start of
+  the whole worker (D0b + D1 + D3 models, warm-up) is ~40s.
+
+**Quality.** Two runs of ComfyUI's own workflow on identical inputs already differ by
+~17-20% (relative L2 of the final latent): it is not deterministic, and four distilled
+steps turn tiny numeric differences into different-but-equivalent details. So the
+engine is judged against that spread, on the 10 test photos x 2 seeds (the D0b outputs as
+D1 sees them), by relative deviation from the saved ComfyUI grids:
+
+| variant | deviation | verdict |
+|---|---|---|
+| bf16 re-implementation (same math as ComfyUI) | 0.203 | = the noise floor |
+| int8 W8A8 + SDPA | 0.195 | same |
+| int8 W8A8 + SageAttention + fp16 text encoder (**shipped**) | 0.211 | same |
+| fp8 W8A8, per-tensor activation scale | 0.256 | rejected |
+
+and end to end through the server (crop + classify included), the 10 photos give the same
+item count on 10/10 and the same garment types as the ComfyUI path (20 garments each).
+
+Approximations measured and **rejected** because they changed what gets drawn, not just
+how fast: reusing the reference image's attention K/V across steps (-30% sampling) and 3
+steps instead of 4 (-25%) both turned a hooded jacket into a collared jacket or a blazer
+on both seeds of IMG_0912, where every exact variant kept the hood.
+
+**Server throughput** (`fast_pipeline.py`): D0b (on its own CUDA stream), D1 and D3 +
+uploads run on three threads; a 30-photo job takes **~2.4s per photo** after the first
+(the old serial worker: ~11s per photo - D0b 3.0s via HTTP, D1 7.8s, D3 0.35s). At that
+point the GPU is the limit: D1's ~2.0s plus the ~0.4s of D0b/D3 kernels per photo. D0b's
+plumbing was sped up without changing a single score: one person-detector pass per image
+instead of three, SAM masks upsampled on the GPU, hole filling via an OpenCV flood fill
+equivalent to `binary_fill_holes`, a contiguous BGR frame for ArcFace alignment, and no
+PNG round trip of the isolated subject (2.97s -> 1.6s standalone, flags/scores/isolated
+pixels identical over the test photos).
 
 ## Benchmarks
 

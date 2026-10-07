@@ -99,6 +99,18 @@ def generate_stage(workflow: dict, used_isolated: bool, grid: Path, seconds: flo
                   timing=_with_overhead(timing, seconds, "chờ hàng đợi + poll"))
 
 
+def generate_stage_engine(settings: dict, used_isolated: bool, grid_size, seconds: float,
+                          timing: dict | None = None) -> dict:
+    """D1 through the in-process d1_engine: its settings come from the engine itself
+    (D1Engine.settings), the same way the ComfyUI path reads them out of the workflow."""
+    params = dict(settings.get("params") or {})
+    params["ảnh đưa vào"] = ("ảnh isolate (SAM)" if used_isolated else "ảnh gốc") + " → FluxKontextImageScale"
+    params["ảnh grid sinh ra"] = f"{grid_size[0]}×{grid_size[1]}"
+    return _stage("d1", "D1 · Sinh ảnh grid trang phục (d1_engine)", seconds,
+                  dict(settings.get("models") or {}), params,
+                  timing=_with_overhead(timing, seconds, "khác"))
+
+
 def crop_stage(asked_items: list, crops: list, seconds: float,
                timing: dict | None = None) -> dict:
     """D3a — cutting the generated grid back into one image per garment."""

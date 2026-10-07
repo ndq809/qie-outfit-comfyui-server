@@ -11,7 +11,7 @@
 
 ## Kết quả cuối cùng
 
-Trên **một** instance, 7 service chạy dưới supervisor (không dùng Docker — instance là
+Trên **một** instance, 5 service chạy dưới supervisor (không dùng Docker — instance là
 container không chạy được Docker lồng bên trong; mọi thành phần nói chuyện qua
 `127.0.0.1:port`, địa chỉ nằm trong `/workspace/.env`):
 
@@ -20,10 +20,14 @@ container không chạy được Docker lồng bên trong; mọi thành phần n
 | `postgres` | database | 127.0.0.1:5432 | không |
 | `redis` | job/result queue | 127.0.0.1:6379 | không |
 | `minio` | object-storage | 127.0.0.1:9000 | có, qua Caddy, external port `10200` |
-| `comfyui` | D1 sinh ảnh | 127.0.0.1:18188 | không |
-| `item_detector` | D0b detector giữ nóng | 127.0.0.1:18189 | không |
-| `ai-server` | worker D0b→D1→D3→D2 | 127.0.0.1:18090 | không |
+| `ai-server` | worker D0b→D1→D3→D2 **trong cùng process** (`d1_engine`, int8 + SageAttention) | 127.0.0.1:18090 | không |
 | `data-server` | API public + `/report` | 127.0.0.1:18080 | có, qua Caddy, external port `10100` |
+
+`comfyui` (127.0.0.1:18188) và `item_detector` (127.0.0.1:18189) **không còn cần** với cấu
+hình mặc định `D1_ENGINE=fast`: ComfyUI chỉ được dùng như thư viện (mã model + thư mục
+`models/`). Hai service đó chỉ cài khi muốn chạy đường cũ `D1_ENGINE=comfyui` (để so sánh
+A/B), và khi đó để `autostart=false` — không bao giờ chạy ComfyUI có model nạp sẵn cạnh
+ai-server nhanh trên cùng một card (cả hai đều giữ transformer ~20 GB).
 
 Ảnh khuôn mặt tham chiếu cố định: `face-image/selfie.jpg`. Trang report từng bước xử lý:
 `wardrobe_report_test/`, phục vụ tại `/report/`.
@@ -32,7 +36,9 @@ container không chạy được Docker lồng bên trong; mọi thành phần n
 
 - Image vast.ai **PyTorch** (có `/venv/main`, supervisor, Caddy, `vast-capabilities`).
   Ubuntu 24.04 (có sẵn gói `postgresql-16` qua apt).
-- GPU ≥ 24 GB VRAM (đã chạy trên RTX 3090 24 GB, RTX 4090, L4). Blackwell cần torch cu128+.
+- GPU ≥ **40 GB** VRAM cho `D1_ENGINE=fast` (ai-server giữ ~33 GB: transformer int8
+  12.7 GB + text encoder fp16 14.5 GB + VAE/D0b/D3). Đã chạy trên RTX 4090 48 GB. Card
+  24 GB chỉ chạy được đường cũ `D1_ENGINE=comfyui`. Blackwell cần torch cu128+.
 - Disk trống ≥ **60 GB** (model ~31 GB + pip + MinIO build).
 - **Hai port external kiểu thường (không self-mapped) còn trống**, tốt nhất đúng là
   `10100` và `10200` (khai báo lúc tạo instance). Kiểm tra ở Bước 1.
@@ -159,11 +165,38 @@ print('face providers =', {m.session.get_providers()[0] for m in b.load_face_app
 ```
 
 **Kỳ vọng:** `imports ok, cuda = True` và `face providers = {'CUDAExecutionProvider'}`.
+
+### Bước 5a — SageAttention 2 (build từ mã nguồn, có bản vá stream)
+
+PyPI chỉ có bản 1.x. Bản 2 phải build (~10 phút với 1 kiến trúc), **và phải áp
+`scripts/sageattention-current-stream.patch`**: bản gốc launch kernel trên default stream
+bất kể stream hiện tại của torch, mà worker chạy D1 trên stream riêng — không vá thì mọi
+ảnh grid ra **đen (NaN)**.
+
+```bash
+source /venv/main/bin/activate
+mkdir -p /opt/src && cd /opt/src
+[ -d SageAttention ] || git clone https://github.com/thu-ml/SageAttention.git
+cd SageAttention
+git checkout -q d1a57a546c3d       # bản vá được tạo trên commit này
+git apply --check /workspace/qie-outfit-comfyui-server/scripts/sageattention-current-stream.patch 2>/dev/null \
+  && git apply /workspace/qie-outfit-comfyui-server/scripts/sageattention-current-stream.patch
+# 8.9 = Ada (RTX 4090/L4/RTX 6000 Ada); 8.0 = A100, 9.0 = H100
+TORCH_CUDA_ARCH_LIST="8.9" EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=16 \
+  pip install --no-build-isolation .
+grep -rn "<<<" csrc/qattn csrc/fused | grep -vc getCurrentCUDAStream   # phải in 0
+python -c "import sageattention as s; print('sage', [n for n in dir(s) if n.startswith('sageattn')][:3])"
+```
+
+**Kỳ vọng:** dòng `grep` in `0`, dòng cuối in `sage [...]`. Thiếu SageAttention thì
+`d1_engine` tự rơi về PyTorch SDPA (chậm hơn ~0.7s/ảnh, log có cảnh báo).
 Nếu thấy `CPUExecutionProvider` thì onnxruntime đang là bản CPU hoặc sai bản CUDA (log
 có `libcublasLt.so.13` là bản CUDA 13) — cài lại đúng như trên. **Không đổi phiên bản** `torch` (image đã có bản
 khớp driver) — chỉ đổi *bản dựng CUDA* như ngay dưới đây.
 
-### Bước 5b — Đổi torch sang bản dựng cu130 (nếu `driver_max_cuda` ≥ 13.0)
+### Bước 5b — Đổi torch sang bản dựng cu130 (chỉ cho `D1_ENGINE=comfyui`, nếu `driver_max_cuda` ≥ 13.0)
+
+`d1_engine` không dùng backend `comfy_kitchen`, nên với cấu hình mặc định bỏ qua bước này.
 
 ComfyUI chỉ bật backend CUDA tối ưu của `comfy_kitchen` khi torch được dựng với cu130
 trở lên; với cu128 nó ghi `WARNING: You need pytorch with cu130 or higher to use
@@ -231,6 +264,8 @@ DATA_SERVER_HOST=127.0.0.1
 DATA_SERVER_PORT=18080
 
 AI_SERVER_HEALTH_PORT=18090
+D1_ENGINE=fast
+D1_CACHE_DIR=/workspace/.cache/d1_engine
 COMFYUI_URL=http://127.0.0.1:18188
 ITEM_DETECTOR_URL=http://127.0.0.1:18189
 OUTFIT_ITEMS_DEVICE=cuda
@@ -262,8 +297,9 @@ EOF
 mkdir -p /workspace/qie-outfit-comfyui-server/wardrobe_report_test
 ```
 
-Trên card 48 GB thêm `COMFYUI_VRAM_ARGS="--reserve-vram 8"` vào `.env` (xem
-`scripts/comfyui.sh`); card 24 GB để trống.
+`COMFYUI_VRAM_ARGS` chỉ có tác dụng với `D1_ENGINE=comfyui` (trên card 48 GB đặt
+`"--reserve-vram 8"`, xem `scripts/comfyui.sh`). `D1_CACHE_DIR` giữ trọng số D1 đã chuyển
+đổi (~13 GB, tạo ở lần chạy đầu ~25s; các lần sau đọc trong ~4s).
 
 Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạt ảnh:
 
@@ -271,11 +307,12 @@ Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạ
   mỗi process ML mở một thread cho mỗi core (instance thường 64–128 core) và OpenMP
   spin-wait chiếm hết CPU, sshd không còn lượt chạy.
 - `comfyui`, `item_detector`, `ai-server` chạy dưới `nice -n 10 ionice -c2 -n7`.
-- Model **không** được giữ nóng trong VRAM: item_detector nạp model ở request đầu tiên
-  (không warm-up lúc khởi động), và sau `MODEL_IDLE_UNLOAD_SECONDS` giây không có việc
-  thì item_detector tự bỏ model, ai-server bỏ BiRefNet + magic_eye và gọi `POST /free`
-  của ComfyUI. Lúc rảnh GPU chỉ còn ~1.8 GB CUDA context. Ảnh đầu tiên sau khi rảnh
-  chậm hơn (~70s nạp lại model), các ảnh sau trong cùng lô chạy nóng bình thường.
+- Model **không** được giữ nóng trong VRAM: ai-server nạp model ở ảnh đầu tiên, và sau
+  `MODEL_IDLE_UNLOAD_SECONDS` giây không có việc thì bỏ toàn bộ model D0b/D1/D3 (đường cũ
+  `D1_ENGINE=comfyui`: item_detector tự bỏ model, ai-server gọi `POST /free` của ComfyUI).
+  Lúc rảnh GPU chỉ còn ~1 GB CUDA context. Ảnh đầu tiên sau khi rảnh chậm hơn (~40s nạp
+  lại model), các ảnh sau trong cùng lô chạy nóng bình thường. Production chạy liên tục
+  nên đặt giá trị lớn (hoặc `0` = không bao giờ bỏ).
   `0` = không bao giờ bỏ; `ITEM_DETECTOR_WARMUP=true` = nạp detector lúc khởi động.
 - `KEEP_RAW_IMAGES=true`: **chỉ môi trường test** — ảnh gốc mobile upload được giữ lại trong
   bucket `wardrobe-raw` sau khi xử lý (production mặc định `false`, xoá ngay theo spec
@@ -365,7 +402,7 @@ supervisorctl restart caddy
 
 **Kỳ vọng:** `caddy: started`. Không stop `caddy`, `instance_portal`, `tunnel_manager`.
 
-## Bước 10 — Chạy data-server, ComfyUI, item_detector, ai-server
+## Bước 10 — Chạy data-server và ai-server
 
 ```bash
 tail -1 /tmp/models.log        # phải là MODELS_DONE; chưa có thì chờ (kiểm tra lại mỗi phút)
@@ -377,29 +414,32 @@ Extract-Outfit ~236 MB, Lightning-4steps ~850 MB.
 
 ```bash
 cd /workspace/qie-outfit-comfyui-server
-cp scripts/data-server.sh scripts/comfyui.sh scripts/item_detector.sh scripts/ai-server.sh /opt/supervisor-scripts/
-chmod +x /opt/supervisor-scripts/{data-server,comfyui,item_detector,ai-server}.sh
-cp scripts/data-server.conf scripts/comfyui.conf scripts/item_detector.conf scripts/ai-server.conf /etc/supervisor/conf.d/
+cp scripts/data-server.sh scripts/ai-server.sh /opt/supervisor-scripts/
+chmod +x /opt/supervisor-scripts/{data-server,ai-server}.sh
+cp scripts/data-server.conf scripts/ai-server.conf /etc/supervisor/conf.d/
 supervisorctl reread && supervisorctl update
-sleep 60
-supervisorctl status postgres redis minio data-server comfyui item_detector ai-server
+sleep 20
+supervisorctl status postgres redis minio data-server ai-server
 curl -s http://127.0.0.1:18080/v1/health; echo
-curl -s http://127.0.0.1:18188/system_stats | head -c 80; echo
-curl -s http://127.0.0.1:18189/health; echo
 curl -s http://127.0.0.1:18090/health; echo
 grep -E "fixture|report mounted|result_consumer thread" /var/log/portal/data-server.log | tail -3
+grep -E "pipelined worker starting" /var/log/portal/ai-server.log | tail -1
 ```
 
 **Kỳ vọng:**
-- 7 service `RUNNING`.
+- 5 service `RUNNING`.
 - data-server: `{"status":"ok","dependencies":{"postgres":"ok","objectStorage":"ok","queue":"ok"}}`
-- ComfyUI: bắt đầu bằng `{"system": {`
-- item_detector: `{"status": "ok", "device": "cuda"}`
-- ai-server: `{"status":"ok","activeWorkers":1,...}`
+- ai-server: `{"status":"ok","activeWorkers":1,...}` và log có `pipelined worker starting`.
 - log data-server có đủ 3 dòng: `test face fixture uploaded`, `test extraction report mounted at /report`, `result_consumer thread started`.
 
-Lần đầu item_detector/ai-server tự tải model phụ (SAM, detector, insightface, BiRefNet,
-SigLIP) vào `HF_HOME` — job đầu tiên sẽ chậm hơn vài chục giây, bình thường.
+Model được nạp ở ảnh đầu tiên (và lại sau mỗi `MODEL_IDLE_UNLOAD_SECONDS` rảnh). Lần đầu
+tiên trên máy mới còn tải model phụ (SAM, detector, insightface, BiRefNet, SigLIP) vào
+`HF_HOME`, chuyển đổi trọng số D1 vào `D1_CACHE_DIR` (~25s) và Triton tự tune kernel
+(~40s) — ảnh đầu của job đầu chậm ~2 phút. Các lần nạp sau ~40s. Log ai-server khi xong:
+`D1 weights loaded from cache ... D1 engine ready ... D1 engine warm-up ...`.
+
+(Chỉ khi cần đường cũ `D1_ENGINE=comfyui`: cài thêm `comfyui` + `item_detector` như README
+"Service setup", đặt `D1_ENGINE=comfyui` trong `.env`, `supervisorctl restart ai-server`.)
 
 ## Bước 11 — Kiểm thử toàn luồng như app mobile
 
@@ -413,7 +453,8 @@ container lên IP public của chính nó đi vòng qua NAT (hairpin) chỉ ~5 K
 ảnh 6 MB. Cờ này gửi cùng URL đã ký + cùng cookie tới cùng Caddy edge qua địa chỉ nội bộ.
 Client thật ở ngoài máy không cần.
 
-**Kỳ vọng** (10 ảnh, ~3.5 phút trên RTX 3090):
+**Kỳ vọng** (10 ảnh: ~2.4s/ảnh sau khi model đã nạp, tức ~25s; cộng ~40s-2 phút nạp
+model nếu ai-server đang nguội):
 - `face-reference {'registered': True, ..., 'source': 'test-fixture'}`
 - `upload 10/10 ok`
 - `completed processed 10/10 failed 0`
@@ -446,9 +487,10 @@ print("CANCEL_JOB", jid)
 EOF
 ```
 
-**Kỳ vọng:** `cancel -> {'status': 'cancelling'}`, rồi cuối cùng `cancelled 1 2`.
-Nếu Bước 11 chỉ chạy một phần `test-images`, chọn 3 ảnh **chưa chạy** — ComfyUI cache
-kết quả của ảnh vừa chạy nên job xong trong vài giây, trước khi lệnh huỷ tới.
+**Kỳ vọng:** `cancel -> {'status': 'cancelling'}`, rồi cuối cùng `cancelled N M` với
+N + M = 3 và M ≥ 1: ảnh đang ở giữa pipeline (đã qua bước kiểm tra huỷ trước D1) vẫn chạy
+xong, phần còn lại báo `failed`/"cancelled". Ảnh xử lý nhanh (~2.4s/ảnh), nên gửi lệnh huỷ
+ngay sau khi tạo job; nếu job đã `completed` trước khi lệnh huỷ tới, tăng số ảnh lên.
 
 Dọn job huỷ khỏi report (nó không ghi gì vào tủ đồ vì không ai xác nhận):
 
@@ -506,6 +548,9 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 | `/report/` trả 404 | Thư mục `WARDROBE_REPORT_DIR` chưa tồn tại lúc data-server khởi động | `mkdir -p` thư mục rồi `supervisorctl restart data-server` |
 | `/v1/face-reference` trả `source: null` | `TEST_FIXED_FACE_REF_IMAGE` sai đường dẫn hoặc MinIO chưa chạy khi data-server khởi động | Kiểm tra file tồn tại, `supervisorctl restart data-server`, xem `/var/log/portal/data-server.log` |
 | Bước D3 báo file `.pt` là LFS pointer | Clone không có LFS | `git lfs install && git lfs pull`, restart ai-server |
+| Mọi ảnh grid trong report **đen**, `0 garment(s)` cho mọi ảnh | SageAttention build **không** có `scripts/sageattention-current-stream.patch` (kernel chạy sai stream, ra NaN) | Làm lại Bước 5a (áp patch, build lại), `supervisorctl restart ai-server` |
+| Log ai-server: `sageattention not installed - D1 falls back to PyTorch SDPA` | Chưa làm Bước 5a | Vẫn chạy đúng, chỉ chậm hơn ~0.7s/ảnh; làm Bước 5a để nhanh lại |
+| ai-server `CUDA out of memory` ở ảnh đầu | GPU < 40 GB, hoặc ComfyUI đang chạy với model nạp sẵn trên cùng card | `supervisorctl stop comfyui item_detector`; card 24 GB thì đặt `D1_ENGINE=comfyui` |
 | Job đứng ở `processing`, log ai-server có `ComfyUI rejected workflow` | Thiếu/sai tên file model | So tên file ở Bước 10 với bảng "Models required" trong README |
 | CUDA OOM ở ai-server hoặc ComfyUI | GPU < 24 GB dùng chung cho detector và ComfyUI | Đặt `OUTFIT_ITEMS_DEVICE=cpu` trong `.env`, restart `item_detector ai-server` (D0b chậm hơn ~4 lần) |
 | Ảnh đen / NaN | Có ai thêm `--use-sage-attention` vào ComfyUI | Bỏ cờ đó khỏi `scripts/comfyui.sh` |

@@ -42,6 +42,14 @@ class Settings(BaseSettings):
 
     # ai-server
     ai_server_health_port: int = 18090
+    # D1 engine. "fast": d1_engine in the ai-server process (int8 W8A8 + SageAttention,
+    # text encoder/VAE/transformer resident, D0b/D1/D3 pipelined across threads; no
+    # ComfyUI or item_detector service needed). "comfyui": the original serial path -
+    # HTTP to the item_detector service and a ComfyUI workflow round trip per photo.
+    d1_engine: str = "fast"
+    # Converted D1 weights (LoRAs merged, int8) are cached here: ~13GB, turns a ~25s
+    # conversion at every start into a few seconds of reading.
+    d1_cache_dir: str = "/workspace/.cache/d1_engine"
     comfyui_url: str = "http://127.0.0.1:18188"
     item_detector_url: str = "http://127.0.0.1:18189"
 

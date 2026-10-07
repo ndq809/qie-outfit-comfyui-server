@@ -4,6 +4,10 @@ D3). Pulls tickets from job_queue, reuses the existing D0b/D1/D3 reference
 pipeline in test_extract_outfit.py verbatim, does same-image D2 dedup, uploads
 crops, and reports back on result_queue. Never touches postgres (§2.3.3) —
 cancellation is checked via the cancelled_jobs Redis set instead.
+
+This file is the serial path (settings.d1_engine == "comfyui": item_detector service +
+ComfyUI workflow per photo). The default, d1_engine == "fast", is fast_pipeline.py: the
+same stages in-process and overlapped across threads; it reuses the helpers below.
 """
 import gc
 import json
@@ -37,6 +41,9 @@ IDLE_UNLOAD_SECONDS = float(os.environ.get("MODEL_IDLE_UNLOAD_SECONDS", "60"))
 
 
 def run_worker_loop(stop_event=None):
+    if get_settings().d1_engine == "fast":
+        from server.ai_server import fast_pipeline
+        return fast_pipeline.run(stop_event)
     log.info("worker loop starting (unload models after %.0fs idle)", IDLE_UNLOAD_SECONDS)
     last_work = time.monotonic()
     gpu_dirty = False
