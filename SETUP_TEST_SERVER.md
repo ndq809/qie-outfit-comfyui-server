@@ -166,6 +166,17 @@ print('face providers =', {m.session.get_providers()[0] for m in b.load_face_app
 
 **Kỳ vọng:** `imports ok, cuda = True` và `face providers = {'CUDAExecutionProvider'}`.
 
+D0b xử lý ảnh trên GPU (`gpu_image.py`) và phải cho ra **đúng từng bit** như code CPU gốc
+(resize, chuẩn hoá, decode). Kiểm tra một lần trên máy mới (~2 phút):
+
+```bash
+cd /workspace/qie-outfit-comfyui-server && python scripts/check_gpu_image.py | tail -1
+```
+
+**Kỳ vọng:** `ALL IDENTICAL`. Nếu ra `MISMATCH` (thường do torch/transformers/torchvision
+đổi phiên bản) thì điểm số D0b có thể lệch so với các ngưỡng đã hiệu chỉnh - báo lại,
+đừng bỏ qua.
+
 ### Bước 5a — SageAttention 2 (build từ mã nguồn, có bản vá stream)
 
 PyPI chỉ có bản 1.x. Bản 2 phải build (~10 phút với 1 kiến trúc), **và phải áp

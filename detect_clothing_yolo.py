@@ -61,6 +61,7 @@ import argparse
 import csv
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -72,7 +73,10 @@ from torchvision.models.detection import (
     fasterrcnn_mobilenet_v3_large_320_fpn,
 )
 from torchvision.ops import nms
+import transformers.masking_utils as _masking_utils
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
+
+import gpu_image as gi
 
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -325,16 +329,18 @@ def person_detections(person_model, person_pre, image: Image.Image):
     """Raw Faster R-CNN output for this exact image object, computed once.
 
     One photo asks for it up to three times on the same image (all person boxes, the
-    rescue pass at a lower floor, and the person-crop TTA of the locate pass) - each a
-    full forward plus a 12MP PIL -> float conversion on the CPU (~0.1s).
+    rescue pass at a lower floor, and the person-crop TTA of the locate pass).
 
-    The conversion deliberately stays on the CPU: done on the GPU its /255 differs in the
-    last bit, the boxes move by up to 0.3px, and that alone shifted a detector score from
-    0.4746 to 0.5336 (IMG_9822) via a one-pixel-different person crop."""
+    The uint8 -> float conversion must give the CPU's bits: torch's own /255 on the GPU
+    differs in the last bit, the boxes move by up to 0.3px, and that alone shifted a
+    detector score from 0.4746 to 0.5336 (IMG_9822) via a one-pixel-different person crop.
+    A GpuImage converts through a lookup table built by that CPU code (gpu_image.to_float),
+    which is exact and skips the 12MP CPU conversion (~0.1s)."""
     if _person_raw_cache["image"] is image:
         return _person_raw_cache["out"]
     device = next(person_model.parameters()).device
-    out = person_model(person_pre(image).unsqueeze(0).to(device))[0]
+    x = gi.to_float(image) if isinstance(image, gi.GpuImage) else person_pre(image)
+    out = person_model(x.unsqueeze(0).to(device))[0]
     _person_raw_cache.update(image=image, out=out)
     return out
 
@@ -359,28 +365,134 @@ def get_person_crop(person_model, person_pre, image: Image.Image):
     return image.crop((x0, y0, x1, y1)), (x0, y0)
 
 
+def _collect(processor, outputs, image, offset):
+    """One forward's candidate boxes (in full-image coordinates), scores and labels."""
+    target_sizes = torch.tensor([image.size[::-1]])
+    # Thu thập xuống tới min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR) - thấp hơn
+    # COLLECT_THRESHOLD bình thường - để không bỏ lỡ box "bag" điểm thấp ngay ở
+    # bước này. finish_detection() sẽ lọc lại: chỉ "bag" được giữ dưới COLLECT_THRESHOLD,
+    # mọi nhãn khác vẫn phải đạt COLLECT_THRESHOLD như cũ (xem comment ở đó - hạ
+    # chung cho mọi nhãn từng gây hồi quy ở resolve_dress_conflict).
+    res = processor.post_process_object_detection(
+        outputs, threshold=min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR), target_sizes=target_sizes
+    )[0]
+    boxes = res["boxes"].cpu()
+    boxes[:, [0, 2]] += offset[0]
+    boxes[:, [1, 3]] += offset[1]
+    return boxes, res["scores"].cpu(), res["labels"].cpu()
+
+
 @torch.no_grad()
 def run_scales(model, processors, image: Image.Image, device: str, offset=(0, 0)):
-    target_sizes = torch.tensor([image.size[::-1]])
-    boxes_list, scores_list, labels_list = [], [], []
+    parts = []
     for processor in processors:
-        inputs = processor(images=image, return_tensors="pt").to(device)
-        outputs = model(**inputs)
-        # Thu thập xuống tới min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR) - thấp hơn
-        # COLLECT_THRESHOLD bình thường - để không bỏ lỡ box "bag" điểm thấp ngay ở
-        # bước này. predict_image() sẽ lọc lại: chỉ "bag" được giữ dưới COLLECT_THRESHOLD,
-        # mọi nhãn khác vẫn phải đạt COLLECT_THRESHOLD như cũ (xem comment ở đó - hạ
-        # chung cho mọi nhãn từng gây hồi quy ở resolve_dress_conflict).
-        res = processor.post_process_object_detection(
-            outputs, threshold=min(COLLECT_THRESHOLD, BAG_OVERLAP_FLOOR), target_sizes=target_sizes
-        )[0]
-        boxes = res["boxes"].cpu()
-        boxes[:, [0, 2]] += offset[0]
-        boxes[:, [1, 3]] += offset[1]
-        boxes_list.append(boxes)
-        scores_list.append(res["scores"].cpu())
-        labels_list.append(res["labels"].cpu())
-    return torch.cat(boxes_list), torch.cat(scores_list), torch.cat(labels_list)
+        if isinstance(image, gi.GpuImage):
+            inputs = gi.detr_inputs(processor, image)   # same tensors, resized on the GPU
+        else:
+            inputs = processor(images=image, return_tensors="pt").to(device)
+        parts.append(_collect(processor, model(**inputs), image, offset))
+    return tuple(torch.cat(x) for x in zip(*parts))
+
+
+# ---------------------------------------------------------------- concurrent forwards
+#
+# One detection pass is 4 independent forwards (2 scales x {whole image, person crop}).
+# Run one after another, each is a chain of ~950 short kernels, and under the pipeline's
+# load every one of them waits for an SM behind D1's long kernels - measured 0.4s a pass.
+# On a GPU photo they are launched together, each on a stream of its own (same priority as
+# the caller's), and collected afterwards: the same kernels on the same inputs, so the same
+# numbers, but the GPU works through the four chains side by side and the caller can do
+# CPU work (face matching) while they run.
+
+_side_streams = {}
+
+
+def side_streams(n):
+    """n reusable streams at the current stream's priority."""
+    cur = torch.cuda.current_stream()
+    pool = _side_streams.setdefault((cur.device, cur.priority), [])
+    while len(pool) < n:
+        pool.append(torch.cuda.Stream(device=cur.device, priority=cur.priority))
+    return pool[:n]
+
+
+# transformers decides whether DETR's attention needs its padding mask with
+# `padding_mask.all()` - a device->host sync in the middle of every forward (two per
+# forward), which stops the CPU from queueing the rest of it and, with forwards on several
+# streams, serialises them again. A GpuImage input is never padded (one image per call,
+# pixel_mask all ones), so the answer is known to be "skip the mask": while _unpadded.on
+# is set on this thread the check returns that answer without reading the GPU. Same branch,
+# same kernels; other threads and other callers see the original function.
+_unpadded = threading.local()
+_ignore_mask_orig = getattr(_masking_utils, "_ignore_bidirectional_mask_sdpa", None)
+
+
+def _ignore_bidirectional_mask_sdpa(padding_mask, kv_length, local_attention_size=None):
+    if getattr(_unpadded, "on", False) and local_attention_size is None:
+        return True
+    return _ignore_mask_orig(padding_mask, kv_length, local_attention_size)
+
+
+if _ignore_mask_orig is not None:      # a transformers without it: the syncs stay, nothing breaks
+    _masking_utils._ignore_bidirectional_mask_sdpa = _ignore_bidirectional_mask_sdpa
+
+
+class _Pending:
+    """Forwards of one detection pass, launched but not yet collected."""
+
+    def __init__(self, image, jobs, launched, streams):
+        self.image, self.jobs, self.launched, self.streams = image, jobs, launched, streams
+
+
+@torch.no_grad()
+def launch_detection(model, processors_full, processors_crop, person_model, person_pre,
+                     image, device):
+    """Start the forwards of predict_image() on `image`; finish_detection() collects them.
+
+    On a GpuImage they are queued on side streams and this returns at once; otherwise they
+    run here, one after another, exactly as before."""
+    jobs = [(p, image, (0, 0)) for p in processors_full]
+    if person_model is not None:
+        crop_info = get_person_crop(person_model, person_pre, image)
+        if crop_info is not None:
+            crop, offset = crop_info
+            jobs += [(p, crop, offset) for p in processors_crop]
+    if not (isinstance(image, gi.GpuImage) and image.t.is_cuda):
+        return _Pending(image, jobs, [run_scales(model, [p], img, device, off)
+                                      for p, img, off in jobs], [])
+    cur = torch.cuda.current_stream()
+    streams = side_streams(len(jobs))
+    launched = []
+    _unpadded.on = True
+    try:
+        for (processor, img, _), s in zip(jobs, streams):
+            s.wait_stream(cur)                          # the photo was made on `cur`
+            with torch.cuda.stream(s):
+                inputs = gi.detr_inputs(processor, img)
+                launched.append((inputs, model(**inputs)))
+    finally:
+        _unpadded.on = False
+    return _Pending(image, jobs, launched, streams)
+
+
+@torch.no_grad()
+def finish_detection(model, pending, threshold: float, resolve_dress: bool, face_box=None):
+    """predict_image()'s result for a launch_detection()."""
+    image = pending.image
+    if not pending.streams:
+        parts = pending.launched
+    else:
+        parts = []
+        for (processor, img, offset), (_, outputs), s in zip(pending.jobs, pending.launched,
+                                                              pending.streams):
+            with torch.cuda.stream(s):
+                parts.append(_collect(processor, outputs, img, offset))
+        cur = torch.cuda.current_stream()
+        for s in pending.streams:
+            cur.wait_stream(s)    # before the photo or these tensors can be freed and reused
+        pending.launched = None
+    boxes, scores, labels = (torch.cat(x) for x in zip(*parts))
+    return _resolve(model, image, boxes, scores, labels, threshold, resolve_dress, face_box)
 
 
 def _pooled_garment_clusters(candidates: dict):
@@ -696,20 +808,15 @@ def predict_image(model, processors_full, processors_crop, person_model, person_
     # Accepts an already-decoded PIL image as well as a path. outfit_items has the
     # SAM-isolated subject in memory already; making it write a full-resolution PNG
     # just so this could re-open it cost ~0.9s of every photo on a 12MP phone frame.
-    image = (image_path if isinstance(image_path, Image.Image)
+    image = (image_path if isinstance(image_path, (Image.Image, gi.GpuImage))
              else Image.open(image_path).convert("RGB"))
+    pending = launch_detection(model, processors_full, processors_crop, person_model, person_pre,
+                               image, device)
+    return finish_detection(model, pending, threshold, resolve_dress, face_box)
 
-    boxes, scores, labels = run_scales(model, processors_full, image, device)
 
-    if person_model is not None:
-        crop_info = get_person_crop(person_model, person_pre, image)
-        if crop_info is not None:
-            crop, offset = crop_info
-            cb, cs, cl = run_scales(model, processors_crop, crop, device, offset)
-            boxes = torch.cat([boxes, cb])
-            scores = torch.cat([scores, cs])
-            labels = torch.cat([labels, cl])
-
+def _resolve(model, image, boxes, scores, labels, threshold, resolve_dress, face_box):
+    """Candidates of every scale/crop (whole image, then crop) -> final detections."""
     # run_scales() thu thập chung xuống tới BAG_OVERLAP_FLOOR (thấp hơn COLLECT_THRESHOLD
     # bình thường) để không bỏ lỡ "bag" điểm thấp. Nhưng hạ ngưỡng thu thập CHUNG cho
     # MỌI nhãn từng gây hồi quy thực tế: 1 box "dress" điểm 0.20 bất ngờ lọt vào, kích

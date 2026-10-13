@@ -49,11 +49,14 @@ import os
 import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image
 
 import detect_clothing_by_face as byface
 import detect_clothing_yolo as clothing
+import gpu_image as gi
 
 
 def _resolve_device():
@@ -328,6 +331,30 @@ def _split_box_by_faces(target_box, face_box, other_faces, person_boxes=()):
     return boxes[k], boxes[:k] + boxes[k + 1:]
 
 
+# Box người dựng từ khuôn mặt chủ thể khi detector người bỏ sót hẳn người đó: rộng thêm
+# 1 bề rộng mặt mỗi bên (vai ~3 lần bề rộng mặt), từ trên đỉnh đầu tới mép dưới ảnh.
+FACE_BODY_SIDE = 1.0
+FACE_BODY_ABOVE = 0.15
+
+
+def _body_box_from_face(face_box, width, height):
+    """Box người cho khuôn mặt chủ thể mà KHÔNG box người nào chứa tâm của nó.
+
+    Detector người (Faster R-CNN) có thể bỏ sót hẳn chủ thể khi người đó bị che: ảnh 474
+    (job cc8cfc49), người cha ngồi sau em bé và vợ - 5 box người (kể cả ở ngưỡng 0.2),
+    không box nào chứa khuôn mặt anh ta. match_face_to_person_box() khi đó rơi vào nhánh
+    "box gần tâm mặt nhất" và chọn box của EM BÉ trong lòng anh ta: SAM cô lập em bé, tủ
+    đồ nhận áo của em bé.
+
+    Khuôn mặt khớp là bằng chứng chắc chắn về vị trí chủ thể, nên dựng box thân người từ
+    nó thay vì mượn box của người khác. Người khác vẫn giữ box của mình trong person_boxes,
+    nên món đồ của họ (vd áo em bé, nằm gọn trong box nhỏ hơn) không bị hợp vào mask."""
+    fx0, fy0, fx1, fy1 = face_box
+    fw, fh = fx1 - fx0, fy1 - fy0
+    return [max(0.0, fx0 - FACE_BODY_SIDE * fw), max(0.0, fy0 - FACE_BODY_ABOVE * fh),
+            min(float(width), fx1 + FACE_BODY_SIDE * fw), float(height)]
+
+
 def _owned_by_subject(item_box, target_box, person_boxes):
     """Món này có phải của chủ thể không, khi nhiều người cùng chứa nó.
 
@@ -350,7 +377,7 @@ def _owned_by_subject(item_box, target_box, person_boxes):
 
 
 def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
-                  person_boxes=None):
+                  person_boxes=None, embedding=None):
     """Pixel mask of the subject INCLUDING the things they are wearing/carrying.
 
     SAM prompted with a person box returns only the PERSON. Anything carried is a
@@ -373,8 +400,10 @@ def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
     boxes as separate calls 12.25s."""
     people = person_boxes or [target_box]
     inside = [b for b in item_boxes if _owned_by_subject(b, target_box, people)]
-    masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE)
-    mask = byface.fill_holes(masks[0])
+    on_gpu = isinstance(image, gi.GpuImage)
+    masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE,
+                                 keep_on_device=on_gpu, embedding=embedding)
+    mask = byface.fill_holes_on_device(masks[0]) if on_gpu else byface.fill_holes(masks[0])
     for item_mask in masks[1:]:
         mask |= item_mask
     return mask
@@ -393,9 +422,13 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         subject, rather than risking someone else's clothes.
     save_isolated_to: optional path to write the SAM-isolated image to, for
         checking the mask by eye (the --save-isolated of the other module).
-    image_path may also be an already-decoded RGB PIL image, and return_isolated=True puts
-    the isolated PIL image itself in result["isolated_image"] - the in-process worker hands
-    it straight to D1 instead of a 12MP PNG round trip (~0.2-0.5s of zlib alone)."""
+    image_path may also be an already-decoded RGB PIL image or a gpu_image.GpuImage, and
+    return_isolated=True puts the isolated PIL image itself in result["isolated_image"] -
+    the in-process worker hands it straight to D1 instead of a 12MP PNG round trip (~0.2-0.5s
+    of zlib alone); return_isolated="gpu" hands over the GpuImage, still on the GPU.
+
+    On a GPU the photo is uploaded once and every model's pixel preprocessing, the crops and
+    the background paint run there, bit-identical to the CPU code (see gpu_image.py)."""
     threshold = THRESHOLD if threshold is None else threshold
     face_match_threshold = (
         FACE_MATCH_THRESHOLD if face_match_threshold is None else face_match_threshold
@@ -404,7 +437,12 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     cloth_model, procs_full, procs_crop, person_model, person_pre = load_clothing_models()
     timing = {}
     t = time.time()
-    if isinstance(image_path, Image.Image):
+    if isinstance(image_path, gi.GpuImage):
+        image = image_path
+    elif DEVICE.startswith("cuda"):
+        image = (gi.GpuImage.from_pil(image_path, DEVICE) if isinstance(image_path, Image.Image)
+                 else gi.GpuImage.open(image_path, DEVICE))
+    elif isinstance(image_path, Image.Image):
         image = image_path if image_path.mode == "RGB" else image_path.convert("RGB")
     else:
         image = Image.open(image_path).convert("RGB")
@@ -414,7 +452,33 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     person_boxes = byface.get_all_person_boxes(person_model, person_pre, image)
     timing["person_detect"] = time.time() - t
 
+    # Whatever the face match decides, the detector runs on the original photo - as the
+    # locate pass when SAM isolates the subject, as the final pass otherwise - and its
+    # forwards need nothing from the face (only the rules applied to their output do). On a
+    # GPU they are launched here and run while the CPU matches faces. So does SAM's image
+    # encoder when the photo holds more than one person: SAM then always runs (a matched
+    # face picks the subject, or else the largest person does).
+    original_pass = sam_embedding = None
+    if isinstance(image, gi.GpuImage) and image.t.is_cuda:
+        t = time.time()
+        original_pass = clothing.launch_detection(cloth_model, procs_full, procs_crop,
+                                                  person_model, person_pre, image, DEVICE)
+        if len(person_boxes) > 1:
+            sam_model, sam_processor = _load_sam()
+            sam_embedding = byface.launch_sam_embedding(sam_model, sam_processor, image,
+                                                        clothing.side_streams(5)[4])
+        timing["launch_original_pass"] = time.time() - t
+
+    def detect_on_original():
+        if original_pass is not None:
+            return clothing.finish_detection(cloth_model, original_pass, threshold,
+                                             resolve_dress=True, face_box=face_box)
+        return clothing.predict_image(cloth_model, procs_full, procs_crop, person_model,
+                                      person_pre, image, DEVICE, threshold, resolve_dress=True,
+                                      face_box=face_box)
+
     target_box, face_similarity, face_box = None, None, None
+    subject_box_from_face = False
     if selfie_path:
         t = time.time()
         face_app = _load_face_app()
@@ -438,7 +502,14 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
             [f.bbox.tolist() for f in all_faces if f is not face])
         if rescued is not None:
             person_boxes = person_boxes + [rescued]
-        target_box = byface.match_face_to_person_box(face.bbox.tolist(), person_boxes)
+        fb = face.bbox.tolist()
+        fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
+        if not any(b[0] <= fcx <= b[2] and b[1] <= fcy <= b[3] for b in person_boxes):
+            target_box = _body_box_from_face(fb, image.width, image.height)
+            person_boxes = person_boxes + [target_box]
+            subject_box_from_face = True
+        else:
+            target_box = byface.match_face_to_person_box(fb, person_boxes)
         if target_box is not None:
             split = _split_box_by_faces(target_box, face.bbox.tolist(),
                                         [f.bbox.tolist() for f in all_faces if f is not face],
@@ -469,14 +540,11 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         # still runs on the isolated image below, because a clean grey background
         # scores better than a crowded one.
         t = time.time()
-        pre = clothing.predict_image(
-            cloth_model, procs_full, procs_crop, person_model, person_pre,
-            image, DEVICE, threshold, resolve_dress=True, face_box=face_box,
-        )
+        pre = detect_on_original()
         timing["fashion_detect_locate"] = time.time() - t
         t = time.time()
         mask = _subject_mask(sam_model, sam_processor, image, target_box,
-                             [d["box"] for d in pre], person_boxes)
+                             [d["box"] for d in pre], person_boxes, embedding=sam_embedding)
         timing["sam_segment"] = time.time() - t
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
@@ -484,7 +552,8 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
             # compress_level=1: still lossless, but the default (6) spent up to 1.3s of
             # single-core zlib on a 12MP photo on slower server CPUs (EPYC 7542). The
             # file only travels over localhost to ComfyUI, so its size doesn't matter.
-            isolated.save(save_isolated_to, compress_level=1)
+            (isolated.to_pil() if isinstance(isolated, gi.GpuImage) else isolated).save(
+                save_isolated_to, compress_level=1)
             timing["save_isolated"] = time.time() - t
         t = time.time()
         detections = clothing.predict_image(
@@ -494,10 +563,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         timing["fashion_detect_final"] = time.time() - t
     else:
         t = time.time()
-        detections = clothing.predict_image(
-            cloth_model, procs_full, procs_crop, person_model, person_pre,
-            image, DEVICE, threshold, resolve_dress=True, face_box=face_box,
-        )
+        detections = detect_on_original()
         timing["fashion_detect_final"] = time.time() - t
         # Nobody to paint out here, but the background still holds objects the
         # detector will happily report as worn - shoes on the floor behind the
@@ -515,6 +581,8 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
 
     result = _flags_from_detections(detections)
     if return_isolated and isolated_by_sam:
+        if isinstance(isolated, gi.GpuImage) and return_isolated != "gpu":
+            isolated = isolated.to_pil()
         result["isolated_image"] = isolated
     result["persons"] = len(person_boxes)
     result["isolated_by_sam"] = isolated_by_sam
@@ -526,7 +594,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     # this call actually ran with, including a per-request override and OUTFIT_ITEMS_DEVICE.
     result["params"] = {
         "detector_model": clothing.MODEL_NAME,
-        "person_model": "torchvision fasterrcnn_mobilenet_v3_large_320_fpn (CPU)",
+        "person_model": "torchvision fasterrcnn_mobilenet_v3_large_320_fpn",
         "sam_model": byface.SAM_MODEL_NAME,
         "face_model": f"insightface {byface.FACE_MODEL_PACK} (ArcFace)",
         "threshold": threshold,
@@ -537,9 +605,75 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         "person_crop_tta": True,
         "subject_item_min_frac": SUBJECT_ITEM_MIN_FRAC,
         "item_inside_person_frac": ITEM_INSIDE_PERSON_FRAC,
+        "subject_box_from_face": subject_box_from_face,
         "device": DEVICE,
     }
     return result
+
+
+# Box "bottom" trên ảnh grid D1 phải đạt điểm này mới bị coi là một cái quần D1 vẽ thừa.
+# Đo trên 25 grid thật (2 job): cái quần thừa duy nhất (ảnh 33, dính dưới gấu áo) 0.56; các
+# grid không xin quần không có box "bottom" nào >= 0.4; grid có xin quần: 0.50-0.79.
+GRID_EXTRA_BOTTOM_MIN = 0.5
+
+
+def scrub_unasked_lower_body(grid, detected):
+    """(grid, info) - the D1 grid with a lower-body garment the prompt did NOT ask for painted
+    over with the background, before D3 cuts it into items; info None when nothing changed.
+
+    D1 draws from the photo, not only from the prompt: ảnh 33 (job cc8cfc49) chỉ xin một món
+    thân trên, nhưng dưới gấu áo của chủ thể là chiếc túi đeo chéo màu đen bị mép ảnh cắt, và
+    D1 vẽ thêm một cái quần đen dính liền dưới gấu áo - D3 cắt áo + quần thành một món. Che
+    phần đó trên ẢNH VÀO D1 không được: chỉ còn quai túi, D1 vẽ thành quần yếm (4/4 lần).
+
+    Trên ảnh grid (nền trắng, từng món tách bạch) detector trang phục phân biệt rất rõ, nên
+    kiểm tra ở đây: không xin quần/đầm mà grid có box "bottom" đủ điểm thì tô phần box nằm
+    DƯỚI các món thân trên bằng màu nền. Một lần detector 1 scale trên ảnh ~1MP (~20ms)."""
+    if detected.get("bottom") or detected.get("one_piece"):
+        return grid, None
+    cloth_model, procs_full, _, _, _ = load_clothing_models()
+    img = gi.GpuImage.from_pil(grid, DEVICE) if DEVICE.startswith("cuda") else grid
+    with torch.no_grad():
+        boxes, scores, labels = clothing.run_scales(cloth_model, procs_full[:1], img, DEVICE)
+    dets = [(cloth_model.config.id2label[lb], sc, b)
+            for b, sc, lb in zip(boxes.tolist(), scores.tolist(), labels.tolist())]
+    extra = [d for d in dets if d[0] == "bottom" and d[1] >= GRID_EXTRA_BOTTOM_MIN]
+    if not extra:
+        return grid, None
+    uppers = [b for label, sc, b in dets if label in ("top", "outer", "dress") and sc >= THRESHOLD]
+    arr = np.asarray(grid.convert("RGB"))
+    border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]])
+    bg = tuple(int(v) for v in np.median(border, axis=0))
+    out = arr.copy()
+    h, w = arr.shape[:2]
+    pad = 0.02 * max(w, h)
+    painted = []
+    for _, score, (x0, y0, x1, y1) in extra:
+        # Below every upper-body garment it overlaps, the box is the bottom alone: paint it.
+        top_edge = max([y0] + [u[3] for u in uppers if u[0] < x1 and u[2] > x0 and u[3] < y1])
+        rx0, rx1 = int(max(0, x0 - pad)), int(min(w, x1 + pad))
+        ry0, ry1, te = int(max(0, y0)), int(min(h, y1 + pad)), int(top_edge)
+        if ry1 <= te:
+            continue
+        # Above that line it shares rows with the top (a curved hem ends higher at the sides
+        # than the top's box does): there, paint only pixels of the bottom's colour that are
+        # connected to the part already painted - the top's own print is enclosed by its
+        # fabric and stays.
+        region = arr[ry0:ry1, rx0:rx1].astype(np.int32)
+        below = region[te - ry0:]
+        fg = np.abs(below - np.array(bg)).sum(-1) > 60
+        if fg.any():
+            colour = np.median(below[fg], axis=0)
+            close = np.abs(region - colour).sum(-1) < 90
+        else:
+            close = np.zeros(region.shape[:2], bool)
+        close[te - ry0:] = True
+        n, comp = cv2.connectedComponents(close.astype(np.uint8), connectivity=8)
+        keep = np.unique(comp[te - ry0:][close[te - ry0:]])
+        sel = np.isin(comp, keep[keep > 0])
+        out[ry0:ry1, rx0:rx1][sel] = bg
+        painted.append({"score": round(score, 3), "box": [rx0, ry0, rx1, ry1], "below_y": te})
+    return (Image.fromarray(out), {"removed_bottom": painted}) if painted else (grid, None)
 
 
 def models_loaded():
@@ -552,6 +686,7 @@ def unload_models():
     plain numpy and stays."""
     global _clothing_models, _sam, _face_app
     _clothing_models = _sam = _face_app = None
+    clothing._person_raw_cache.update(image=None, out=None)   # holds the last photo on the GPU
     import gc
     gc.collect()
     if torch.cuda.is_available():

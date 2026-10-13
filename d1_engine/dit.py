@@ -35,6 +35,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from . import comfy_lib  # noqa: F401  (puts ComfyUI on sys.path)
+from . import gate
 from . import kernels as K
 
 log = logging.getLogger("d1_engine")
@@ -274,7 +275,9 @@ class QwenEditDiT:
         pe = self._rope(h, w, ref_hw[0], ref_hw[1], T)
         qkv = torch.empty((L, 3 * DIM), device=hs.device, dtype=BF16)
         attn = self.attention
+        pacer = gate.Pacer()          # yields the GPU to D0b between blocks - see gate.py
         for b in self.blocks:
+            pacer.tick()
             i1, i2, t1, t2 = b["mod"][step]
             # joint attention: text rows first, then image + reference rows
             xq, sx = K.ln_mod_quant(hs, i1[0], i1[1], tz)

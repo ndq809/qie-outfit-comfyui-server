@@ -100,12 +100,14 @@ for what each file is.
 | `item_detector_service.py` | Keeps those models warm behind `127.0.0.1:18189` so repeat runs skip the load cost. |
 | `detect_clothing_yolo.py` | Standalone garment detector (multi-scale + person-crop TTA, hue dress arbitration). |
 | `detect_clothing_by_face.py` | Standalone: picks one person out of a group photo by face, isolates them with SAM, then detects their clothes. |
+| `gpu_image.py` | D0b's photo decoded once and kept on the GPU, with every model's CPU preprocessing reproduced there bit for bit. `scripts/check_gpu_image.py` proves the equality on the test photos. |
 | `wardrobe_classifier.py` | Stage 4: the Magic Eye classifier. Also runnable on any folder of item images on its own. |
 | `magic_eye/` | Model definitions for that classifier (`model_phase2.py`, `model_phase3.py`, …), vendored from the MS_Model_Magic_Eye training project. |
 | `models/magic_eye/` | Its trained weights + taxonomy — the committed bundle. [Details](models/magic_eye/README.md). |
 | `scripts/export_magic_eye_bundle.py` | Regenerates that bundle from the training project after a retrain. |
 | `d1_engine/` | The in-process D1 engine the server uses: same workflow as ComfyUI's, run as int8 W8A8 Triton kernels + SageAttention with every model resident. See [D1 engine](#d1-engine-in-process-int8). |
 | `server/ai_server/fast_pipeline.py` | The ai-server worker that drives it: D0b / D1 / D3 in one process, overlapped across three threads. |
+| `d1_engine/gate.py` | Lets D1 park between transformer blocks while D0b has the GPU. |
 | `scripts/sageattention-current-stream.patch` | Makes SageAttention launch on torch's current CUDA stream; required by the pipelined worker. |
 | `result_v4.png` | A saved extraction result, committed as a fixture so stages 3–4 can be exercised without the generation model. |
 
@@ -721,6 +723,35 @@ instead of three, SAM masks upsampled on the GPU, hole filling via an OpenCV flo
 equivalent to `binary_fill_holes`, a contiguous BGR frame for ArcFace alignment, and no
 PNG round trip of the isolated subject (2.97s -> 1.6s standalone, flags/scores/isolated
 pixels identical over the test photos).
+
+**D0b in the pipeline: 2.6s -> 0.48s a photo** (RTX 6000 Ada, the report's D0b figure,
+decode included; p90 0.52s), again without changing a single flag, score, face similarity
+or isolated pixel on the test photos. Under the pipeline's load D0b was slow for two
+reasons, measured separately:
+
+- *CPU pixel work* (~0.6s of its 1.1s standalone): every model call re-did its own 12MP
+  work - PIL -> tensor copies, the HF processors' antialiased resizes (~38ms per DETR
+  call, 8 calls), the person detector's float conversion, the background paint, the BGR
+  copy for ArcFace. Now the photo is decoded once with OpenCV (bit-identical to PIL's
+  decode, 1.5x faster), uploaded once, and all of that runs on the GPU in `gpu_image.py`:
+  the uint8 antialiased resize is a port of torch's AVX2 CPU kernel (same int16 weights,
+  same integer accumulation), normalisation goes through lookup tables built by the CPU
+  code itself, hole filling floods only the mask's bounding box.
+- *Sharing the GPU with D1* (D0b 0.45s alone -> 1.14s with D1 running, the GIL not
+  involved): D0b is thousands of short dependent kernels, each of which queued behind
+  D1's long ones even on a high-priority stream. D1 now parks at its next transformer
+  block while D0b runs (`d1_engine/gate.py`; D1 never queues more than 2 blocks ahead, so
+  alone it runs as before). D0b's own passes overlap: the 4 forwards of a detection pass
+  run on parallel streams, the pass on the original photo and SAM's image encoder start
+  before face matching (neither needs the face), and the host syncs that stalled the
+  queueing are gone (transformers' `padding_mask.all()` check in every DETR forward - the
+  input is never padded - and the 24 host->device copies of SAM's relative-position
+  tables, now computed once).
+
+Throughput is unchanged (~3.3s a photo on this card, set by D1: 2.8s alone here), and
+so is the peak allocated VRAM. Tried and dropped: CUDA graphs for the fixed-shape forwards
+(bit-identical, but no gain end to end and +3.6GB of VRAM); fp16 or padded/batched inputs
+(each would change scores).
 
 ## Benchmarks
 

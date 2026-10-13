@@ -43,6 +43,7 @@ def detect_stage(detected: dict, original: Path, seconds: float) -> dict:
         "person-crop TTA": p.pop("person_crop_tta", None),
         "item phải nằm trong box người ≥": p.pop("subject_item_min_frac", None),
         "item vào mask SAM khi nằm trong ≥": p.pop("item_inside_person_frac", None),
+        "box chủ thể dựng từ khuôn mặt (detector bỏ sót)": p.pop("subject_box_from_face", None),
         "số người trong ảnh": detected.get("persons"),
         "SAM đã chạy": detected.get("isolated_by_sam"),
         "độ giống khuôn mặt": detected.get("face_similarity"),
@@ -56,6 +57,7 @@ def detect_stage(detected: dict, original: Path, seconds: float) -> dict:
               "person_detect": "dò người (Faster R-CNN)",
               "face_load": "nạp ArcFace", "face_ref_embed": "embed ảnh mặt tham chiếu",
               "face_match_group": "so khớp khuôn mặt",
+              "launch_original_pass": "khởi chạy dò trang phục + SAM encoder (chạy song song)",
               "sam_load": "nạp SAM", "sam_segment": "SAM tách nền",
               "fashion_detect_locate": "dò trang phục (vòng định vị)",
               "fashion_detect_final": "dò trang phục (vòng chốt)"}
@@ -112,7 +114,7 @@ def generate_stage_engine(settings: dict, used_isolated: bool, grid_size, second
 
 
 def crop_stage(asked_items: list, crops: list, seconds: float,
-               timing: dict | None = None) -> dict:
+               timing: dict | None = None, scrubbed: dict | None = None) -> dict:
     """D3a — cutting the generated grid back into one image per garment."""
     models = {"segmenter": pipeline.SEGMENTER_MODEL_NAME}
     params = {
@@ -129,6 +131,10 @@ def crop_stage(asked_items: list, crops: list, seconds: float,
     if asked_items and len(asked_items) != len(crops):
         note = (f"Tách được {len(crops)} ô nhưng prompt xin {len(asked_items)} — crop được "
                 "đặt tên theo vị trí thay vì theo nhãn, để không gán nhầm loại trang phục.")
+    if scrubbed:
+        params["xoá quần D1 vẽ thừa (không được xin)"] = scrubbed["removed_bottom"]
+        note = ((note + " ") if note else "") + (
+            "D1 vẽ thêm một món thân dưới mà prompt không xin — đã tô bằng màu nền trước khi cắt.")
     return _stage("d3a", "D3a · Cắt từng trang phục ra khỏi grid", seconds, models, params, note,
                   timing=_with_overhead(timing, seconds, "cắt + ghép nền"))
 

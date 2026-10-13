@@ -14,6 +14,7 @@ from PIL import Image
 
 from . import attention as attn_mod
 from . import comfy_lib
+from . import gate
 from .dit import QwenEditDiT
 from .text_encoder import TextEncoder
 
@@ -109,6 +110,7 @@ class D1Engine:
         scaled = image if prescaled else kontext_scale(image.convert("RGB"))
         img = torch.from_numpy(np.array(scaled)).to(self.device).float().div_(255.0)[None]   # [1,H,W,3]
         t1 = time.perf_counter()
+        gate.wait_open()
         context = self.text_encoder.encode(img, prompt)
         sync(); t2 = time.perf_counter()
         # reference latent: TextEncodeQwenImageEditPlus scales to ~1024x1024 px, multiples of 8
@@ -116,12 +118,14 @@ class D1Engine:
         sb = math.sqrt(1024 * 1024 / (samples.shape[3] * samples.shape[2]))
         rw, rh = round(samples.shape[3] * sb / 8.0) * 8, round(samples.shape[2] * sb / 8.0) * 8
         ref_img = comfy.utils.common_upscale(samples, rw, rh, "area", "disabled").movedim(1, -1)
+        gate.wait_open()
         ref_latent = self.vae.encode(ref_img[:, :, :, :3])
         sync(); t3 = time.perf_counter()
         H, W = img.shape[1], img.shape[2]
         noise = comfy.sample.prepare_noise(torch.zeros((1, 16, 1, H // 8, W // 8)), seed)
         latent = self.dit.sample(noise, context, ref_latent, self.latent_format)
         sync(); t4 = time.perf_counter()
+        gate.wait_open()
         decoded = self.vae.decode(latent.float())
         decoded = decoded.reshape(-1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])[0]
         grid = Image.fromarray((decoded.float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy())

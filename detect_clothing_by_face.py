@@ -44,6 +44,7 @@ from PIL import Image
 from transformers import SamModel, SamProcessor
 
 import detect_clothing_yolo as clothing
+import gpu_image as gi
 
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -81,7 +82,26 @@ def load_face_app():
 def load_sam(device: str):
     model = SamModel.from_pretrained(SAM_MODEL_NAME).to(device).eval()
     processor = SamProcessor.from_pretrained(SAM_MODEL_NAME)
+    _cache_rel_pos(model)
     return model, processor
+
+
+def _cache_rel_pos(model):
+    """SAM's ViT recomputes each attention layer's relative-position table on every call
+    (get_rel_pos), building the index on the CPU - 24 host->device copies per encoder pass,
+    and each of those waits for the GPU to finish everything queued before it. The table
+    depends only on the (fixed) frozen weights and token-grid sizes, so it is computed once
+    per (layer, sizes) and reused: the same tensor, no copies, no waits."""
+    for module in model.modules():
+        if hasattr(module, "get_rel_pos") and hasattr(module, "rel_pos_h"):
+            compute, cache = module.get_rel_pos, {}
+
+            def cached(q_size, k_size, rel_pos, _compute=compute, _cache=cache):
+                key = (q_size, k_size, rel_pos.data_ptr())
+                if key not in _cache:
+                    _cache[key] = _compute(q_size, k_size, rel_pos)
+                return _cache[key]
+            module.get_rel_pos = cached
 
 
 def get_all_person_boxes(person_model, person_pre, image: Image.Image):
@@ -104,10 +124,13 @@ def scored_person_boxes(person_model, person_pre, image: Image.Image, min_score:
 _ref_embedding_cache = {}
 
 
-def _bgr(image: Image.Image) -> np.ndarray:
+def _bgr(image) -> np.ndarray:
     """RGB PIL -> contiguous BGR for insightface. A [:, :, ::-1] view has negative strides,
     which sends every cv2.warpAffine of the face-alignment step down a slow copying path
-    over the whole 12MP frame (~70ms per face); the pixel values are identical."""
+    over the whole 12MP frame (~70ms per face); the pixel values are identical. A GpuImage
+    hands over the BGR array it was decoded to - no 12MP conversion at all."""
+    if isinstance(image, gi.GpuImage):
+        return image.bgr()
     return np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
 
 
@@ -180,8 +203,8 @@ def match_face_to_person_box(face_bbox, person_boxes):
     return min(person_boxes, key=dist) if person_boxes else None
 
 
-def _pick_mask(masks, scores, box):
-    """Chọn 1 trong 3 mask SAM trả về cho 1 box prompt.
+def _pick_masks(masks, scores, boxes):
+    """Chọn 1 trong 3 mask SAM trả về cho mỗi box prompt -> list chỉ số mask.
 
     SAM trả về 3 mask (toàn bộ/1 phần/mảnh nhỏ) kèm điểm iou_score riêng của
     nó, nhưng điểm này thỉnh thoảng bị lệch: đã gặp thực tế 1 ảnh 2 người ngồi
@@ -189,33 +212,83 @@ def _pick_mask(masks, scores, box):
     box người) cao hơn 0.01 so với mask body đầy đủ (phủ 38.3%) -> chọn nhầm
     mask gần như trống. Vì vật thể luôn chiếm phần lớn diện tích box của CHÍNH
     NÓ (đúng với cả box người lẫn box món đồ), loại các mask quá nhỏ so với box
-    trước khi chọn theo score, để tránh lặp lại lỗi này."""
-    box_area = (box[2] - box[0]) * (box[3] - box[1])
-    area_fracs = (masks.flatten(1).sum(dim=1).double() / box_area).tolist()
-    candidates = [i for i, frac in enumerate(area_fracs) if frac >= MIN_MASK_AREA_FRAC]
-    if not candidates:
-        candidates = range(masks.shape[0])  # không mask nào đủ lớn -> đành lấy hết, chọn theo score
-    best = max(candidates, key=lambda i: scores[i].item())
-    return masks[best].cpu().numpy()  # (H, W) bool
+    trước khi chọn theo score, để tránh lặp lại lỗi này.
+
+    masks (num_boxes, 3, H, W), scores (num_boxes, 3). Diện tích của mọi box được đọc về
+    trong MỘT lần đồng bộ GPU (trước đây mỗi box một lần, mỗi lần chờ cả hàng đợi GPU)."""
+    box_areas = torch.tensor([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes],
+                             dtype=torch.float64, device=masks.device)
+    fracs = (masks.flatten(2).sum(dim=2).double() / box_areas[:, None]).tolist()
+    score_rows = scores.tolist()
+    picks = []
+    for area_fracs, row in zip(fracs, score_rows):
+        candidates = [i for i, frac in enumerate(area_fracs) if frac >= MIN_MASK_AREA_FRAC]
+        if not candidates:
+            candidates = range(len(area_fracs))  # không mask nào đủ lớn -> đành lấy hết, chọn theo score
+        picks.append(max(candidates, key=lambda i: row[i]))
+    return picks
+
+
+class SamEmbedding:
+    """SAM's image encoder output for one photo, possibly still computing on a side stream."""
+
+    def __init__(self, image, embeddings, stream=None):
+        self.image, self.embeddings, self.stream = image, embeddings, stream
+
+    def ready(self):
+        """The embeddings, ordered after their computation on the current stream."""
+        if self.stream is not None:
+            cur = torch.cuda.current_stream()
+            cur.wait_stream(self.stream)
+            self.embeddings.record_stream(cur)
+            self.stream = None
+        return self.embeddings
 
 
 @torch.no_grad()
-def segment_boxes(sam_model, sam_processor, image: Image.Image, boxes, device: str):
-    """Mask SAM cho NHIỀU box trong MỘT lần gọi -> list[np.ndarray] cùng thứ tự.
+def launch_sam_embedding(sam_model, sam_processor, image, stream=None):
+    """Start SAM's image encoder - the expensive half, which needs only the photo, not the
+    box prompts - on `stream`, so it runs while the caller is still working out which boxes
+    to prompt with. segment_boxes(..., embedding=) then runs only the cheap mask decoder.
+    Same encoder on the same pixels as a full forward, so the same masks."""
+    cur = torch.cuda.current_stream()
+    if stream is None:
+        stream = cur
+    stream.wait_stream(cur)
+    with torch.cuda.stream(stream):
+        pixels = gi.sam_pixel_values(sam_processor, image)
+        embeddings = sam_model.get_image_embeddings(pixels)
+    return SamEmbedding(image, embeddings, stream if stream is not cur else None)
+
+
+@torch.no_grad()
+def segment_boxes(sam_model, sam_processor, image, boxes, device: str, keep_on_device=False,
+                  embedding=None):
+    """Mask SAM cho NHIỀU box trong MỘT lần gọi -> list mask (H, W) bool cùng thứ tự:
+    np.ndarray, hoặc tensor trên GPU khi keep_on_device.
 
     Phải gộp chung 1 lần gọi chứ không lặp từng box: phần đắt nhất của SAM là
     ViT image encoder chạy trên toàn ảnh, còn mask decoder cho thêm 1 box thì
     rất rẻ. Đo trên ảnh 3024x4032 (CPU): 1 box = 2.46s, 5 box gộp 1 lần gọi =
-    2.78s, nhưng 5 box gọi riêng từng cái = 12.25s (encoder chạy lại 5 lần)."""
-    inputs = sam_processor(image, input_boxes=[list(boxes)], return_tensors="pt").to(device)
-    outputs = sam_model(**inputs)
+    2.78s, nhưng 5 box gọi riêng từng cái = 12.25s (encoder chạy lại 5 lần).
+
+    Với GpuImage, ảnh đầu vào SAM được dựng ngay trên GPU, giống từng bit bản CPU."""
+    if isinstance(image, gi.GpuImage):
+        if embedding is None or embedding.image is not image:
+            embedding = launch_sam_embedding(sam_model, sam_processor, image)
+        inputs = gi.sam_inputs(sam_processor, image, boxes, pixels=False)
+        outputs = sam_model(image_embeddings=embedding.ready(), input_boxes=inputs["input_boxes"])
+    else:
+        inputs = sam_processor(image, input_boxes=[list(boxes)], return_tensors="pt").to(device)
+        outputs = sam_model(pixel_values=inputs["pixel_values"], input_boxes=inputs["input_boxes"])
     # Upsampled to the full frame on the GPU: the same two bilinear interpolations and
     # threshold, but on a 12MP frame they cost ~0.4s on the CPU.
     masks = sam_processor.image_processor.post_process_masks(
         outputs.pred_masks, inputs["original_sizes"], inputs["reshaped_input_sizes"]
     )[0]  # (num_boxes, 3, H, W)
-    scores = outputs.iou_scores[0]  # (num_boxes, 3)
-    return [_pick_mask(masks[i], scores[i], box) for i, box in enumerate(boxes)]
+    picks = _pick_masks(masks, outputs.iou_scores[0], boxes)
+    chosen = [masks[i, j] for i, j in enumerate(picks)]
+    return chosen if keep_on_device else [m.cpu().numpy() for m in chosen]
 
 
 def fill_holes(mask: np.ndarray) -> np.ndarray:
@@ -231,13 +304,36 @@ def fill_holes(mask: np.ndarray) -> np.ndarray:
     return bg[1:-1, 1:-1] != 2
 
 
+def fill_holes_on_device(mask: torch.Tensor) -> torch.Tensor:
+    """fill_holes() for a (H, W) bool mask on the GPU, same result, on the mask's bounding
+    box (+1px) only: every background pixel outside that box reaches the frame edge in a
+    straight line, so whether one inside it is a hole is decided within the box and its
+    1px ring. A person is a fraction of a 12MP frame, so this copies and floods far less."""
+    h, w = mask.shape
+    rows, cols = mask.any(dim=1), mask.any(dim=0)
+    ys = torch.arange(h, device=mask.device)
+    xs = torch.arange(w, device=mask.device)
+    y0, y1, x0, x1 = torch.stack([torch.where(rows, ys, h).min(), torch.where(rows, ys, -1).max(),
+                                  torch.where(cols, xs, w).min(), torch.where(cols, xs, -1).max()]).tolist()
+    if y1 < 0:
+        return mask.clone()
+    y0, x0, y1, x1 = max(y0 - 1, 0), max(x0 - 1, 0), min(y1 + 2, h), min(x1 + 2, w)
+    filled = fill_holes(mask[y0:y1, x0:x1].cpu().numpy())
+    out = mask.clone()
+    out[y0:y1, x0:x1] = torch.from_numpy(filled).to(mask.device)
+    return out
+
+
 def segment_person(sam_model, sam_processor, image: Image.Image, person_box, device: str):
     return fill_holes(
         segment_boxes(sam_model, sam_processor, image, [person_box], device)[0]
     )
 
 
-def isolate_person(image: Image.Image, mask: np.ndarray) -> Image.Image:
+def isolate_person(image, mask):
+    if isinstance(image, gi.GpuImage):
+        bg = torch.tensor(MASK_BG_COLOR, dtype=torch.uint8, device=image.t.device).view(3, 1, 1)
+        return gi.GpuImage(torch.where(mask[None], image.t, bg))
     arr = np.asarray(image.convert("RGB"))
     return Image.fromarray(np.where(mask[:, :, None], arr, np.array(MASK_BG_COLOR, dtype=np.uint8)))
 

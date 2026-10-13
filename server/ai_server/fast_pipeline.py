@@ -15,6 +15,11 @@ in-process instead of behind the item_detector service, which removes an HTTP ro
 and a 12MP PNG encode + decode of the isolated subject per photo.
 
 D0b and D1 issue their GPU work on CUDA streams of their own, D3 on the default stream.
+D0b is a chain of thousands of short dependent kernels, and next to D1's long ones each of
+them queued for an SM: D0b took 1.1s a photo with D1 running against 0.45s alone. So D0b's
+stream has the higher priority, and D1 parks at its next transformer block while D0b runs
+(d1_engine/gate.py): D0b 0.48s a photo in the pipeline (decode included), throughput
+unchanged - D1, ~2.8s a photo on an RTX 6000 Ada, is the limit either way.
 On one shared stream every .item()/.cpu() of the other stages waited for whatever D1 had
 queued (a whole 4-step sampling, ~1.7s): measured, D0b's person-detector step took 1.8s
 instead of 0.1s and the pipeline ran at 3.5s/photo with the GPU idle a third of the time.
@@ -97,7 +102,7 @@ class Pipeline:
         if not torch.cuda.is_available():
             return _NullCtx()
         if name not in self._streams:
-            self._streams[name] = torch.cuda.Stream()
+            self._streams[name] = torch.cuda.Stream(priority=-1 if name == "prep" else 0)
         return torch.cuda.stream(self._streams[name])
 
     # ------------------------------------------------------------------ bookkeeping
@@ -222,8 +227,14 @@ class Pipeline:
         settings = get_settings()
         storage.download_to(settings.minio_raw_bucket, w.object_key, w.raw_path)
         t0 = time.perf_counter()
-        image = Image.open(w.raw_path).convert("RGB")       # what D0b has always read
-        detected = self._detect(image, w.face_ref_key, settings)
+        # What D0b has always read (Image.open(...).convert("RGB"), no EXIF rotation),
+        # decoded straight into a numpy array and uploaded to the GPU once.
+        image = self._load(w.raw_path)
+        # D1 parks at its next block boundary while D0b runs (d1_engine/gate.py): sharing
+        # the GPU with D1, D0b's short kernels each queued behind D1's and it took ~3x longer.
+        from d1_engine import gate
+        with gate.hold():
+            detected = self._detect(image, w.face_ref_key, settings)
         isolated = detected.pop("isolated_image", None)
         w.detected = detected
         w.stages = [params.detect_stage(detected, w.raw_path, time.perf_counter() - t0)]
@@ -234,11 +245,24 @@ class Pipeline:
         w.used_isolated = bool(detected.get("isolated_by_sam")) and isolated is not None
         # The SAM-isolated subject when there is one; otherwise the photo as ComfyUI's
         # LoadImage read it (EXIF orientation applied).
-        gen = isolated if w.used_isolated else ImageOps.exif_transpose(image)
+        if w.used_isolated:
+            gen = isolated.to_pil() if hasattr(isolated, "to_pil") else isolated
+        elif hasattr(image, "to_pil_exif_transposed"):
+            gen = image.to_pil_exif_transposed(w.raw_path)
+        else:
+            gen = ImageOps.exif_transpose(image)
         from d1_engine import kontext_scale
         w.d1_input = kontext_scale(gen)
         if settings.wardrobe_report_dir and w.used_isolated:
-            isolated.save(w.isolated_path, quality=90)
+            gen.save(w.isolated_path, quality=90)
+
+    @staticmethod
+    def _load(path):
+        import torch
+        if torch.cuda.is_available():
+            import gpu_image
+            return gpu_image.GpuImage.open(path, "cuda")
+        return Image.open(path).convert("RGB")
 
     def _detect(self, image, face_ref_key, settings):
         """D0b in-process; same fallback as before: a reference that matches nobody (or
@@ -253,10 +277,10 @@ class Pipeline:
                             face_ref_key)
         if selfie:
             try:
-                return outfit_items.detect_worn_items(image, selfie_path=selfie, return_isolated=True)
+                return outfit_items.detect_worn_items(image, selfie_path=selfie, return_isolated="gpu")
             except Exception as exc:
                 log.info("no face matched the reference (%s); using largest person in frame", exc)
-        return outfit_items.detect_worn_items(image, return_isolated=True)
+        return outfit_items.detect_worn_items(image, return_isolated="gpu")
 
     def _gen_one(self, w):
         """gen: D1."""
@@ -294,8 +318,15 @@ class Pipeline:
         crop_dir = w.tmp / "items"
         t0 = time.perf_counter()
         crop_timing = {}
-        crops = pipeline.crop_items(w.grid, crop_dir, items=w.items, device=None, timing=crop_timing)
-        w.stages.append(params.crop_stage(w.items, crops, time.perf_counter() - t0, crop_timing))
+        import outfit_items
+        grid, scrubbed = outfit_items.scrub_unasked_lower_body(w.grid, w.detected)
+        crop_timing["kiểm tra món thừa trên grid"] = round(time.perf_counter() - t0, 3)
+        if scrubbed:
+            log.info("job %s item %s: removed an unasked lower-body garment from the grid %s",
+                     w.job_id, w.item_id, scrubbed)
+        crops = pipeline.crop_items(grid, crop_dir, items=w.items, device=None, timing=crop_timing)
+        w.stages.append(params.crop_stage(w.items, crops, time.perf_counter() - t0, crop_timing,
+                                          scrubbed))
         t0 = time.perf_counter()
         classify_timing = {}
         records = (pipeline.classify_crops(crop_dir, device=None, timing=classify_timing)
