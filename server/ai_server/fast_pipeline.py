@@ -294,10 +294,36 @@ class Pipeline:
             t0 = time.perf_counter()
             with self._stream("gen"):
                 w.grid = eng.generate(w.d1_input, w.prompt, seed=D1_SEED, timing=timing, prescaled=True)
+                retry = self._regenerate_if_unasked(w, eng, timing)
             w.stages.append(params.generate_stage_engine(eng.settings(D1_SEED), w.used_isolated,
-                                                         w.grid.size, time.perf_counter() - t0, timing))
+                                                         w.grid.size, time.perf_counter() - t0, timing,
+                                                         retry))
             w.d1_input = None
         self.q_post.put(w)
+
+    def _regenerate_if_unasked(self, w, eng, timing):
+        """D1 sometimes draws an item the prompt did not ask for (photo 33, job cc8cfc49: a
+        pair of trousers under the only garment asked for, from a bag at the bottom of the
+        isolated photo). When the garment detector sees one on the grid, generate once more
+        with the next seed and keep whichever grid has fewer unasked items. ~20ms a photo for
+        the check; the second generation only when it fires (1 grid in 275 measured)."""
+        import outfit_items
+        t = time.perf_counter()
+        extra = outfit_items.unasked_items_on_grid(w.grid, w.detected)
+        timing["kiểm tra món không được xin"] = round(time.perf_counter() - t, 3)
+        if not extra:
+            return None
+        t = time.perf_counter()
+        seed = D1_SEED + 1
+        grid = eng.generate(w.d1_input, w.prompt, seed=seed, prescaled=True)
+        extra2 = outfit_items.unasked_items_on_grid(grid, w.detected)
+        timing["sinh lại (seed khác)"] = round(time.perf_counter() - t, 3)
+        kept = len(extra2) < len(extra)
+        if kept:
+            w.grid = grid
+        log.info("job %s item %s: D1 drew unasked %s; seed %d gave %s -> kept %s", w.job_id,
+                 w.item_id, extra, seed, extra2 or "nothing unasked", "the new grid" if kept else "the first")
+        return {"unasked": extra, "seed": seed, "unasked_after": extra2, "kept_new": kept}
 
     def _post_one(self, w):
         """post: D3a/D3b, same-image D2, uploads, report, result."""
@@ -318,15 +344,8 @@ class Pipeline:
         crop_dir = w.tmp / "items"
         t0 = time.perf_counter()
         crop_timing = {}
-        import outfit_items
-        grid, scrubbed = outfit_items.scrub_unasked_lower_body(w.grid, w.detected)
-        crop_timing["kiểm tra món thừa trên grid"] = round(time.perf_counter() - t0, 3)
-        if scrubbed:
-            log.info("job %s item %s: removed an unasked lower-body garment from the grid %s",
-                     w.job_id, w.item_id, scrubbed)
-        crops = pipeline.crop_items(grid, crop_dir, items=w.items, device=None, timing=crop_timing)
-        w.stages.append(params.crop_stage(w.items, crops, time.perf_counter() - t0, crop_timing,
-                                          scrubbed))
+        crops = pipeline.crop_items(w.grid, crop_dir, items=w.items, device=None, timing=crop_timing)
+        w.stages.append(params.crop_stage(w.items, crops, time.perf_counter() - t0, crop_timing))
         t0 = time.perf_counter()
         classify_timing = {}
         records = (pipeline.classify_crops(crop_dir, device=None, timing=classify_timing)

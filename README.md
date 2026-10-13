@@ -606,6 +606,18 @@ python detect_clothing_yolo.py --images-dir images --single-scale --no-person-cr
   with nothing worn over it." had no effect (4/58); "Only the listed clothing, without
   straps or accessories." read shoes and hats as accessories and dropped them. This does
   not generalise to other categories without measuring them the same way.
+- **…and it does not generalise - measured.** After a photo got trousers under its only
+  garment, "No X." was tried for every absent category, judged by eye on each grid over 25
+  real photos × 11 seeds (same inputs and seeds): `No bag.` alone 1/275 grids with an
+  unasked item; `No pants. No bag.` 6/275 (folded jeans and shorts appeared on photos that
+  had none); `No hat. No pants. No bag. No shoes.` 5/275 (`No hat.` alone put an extra top
+  on one photo 4 times in 11); adding `No jacket. No dress.` turned a tank top into a dress
+  on 3/3 seeds. Every extra sentence fixes one generation and breaks others. The rare
+  unasked item is instead caught after D1: the garment detector checks the grid (bottom /
+  shoes / hat / bag that was not asked for, score >= 0.5 - the one real case scored 0.51,
+  734 clean grids at most 0.36) and D1 runs once more with the next seed
+  (`fast_pipeline._regenerate_if_unasked`, ~20ms a photo, +1 generation when it fires; the
+  report's D1 panel says when it did).
 - **Ask for small items to keep them apart.** Adding "Items are drawn small, with plenty
   of empty white space between them." to multi-item prompts took generations where two
   items came out touching from 6/52 to **0/52** (26 real photos × 2 seeds). "Separate

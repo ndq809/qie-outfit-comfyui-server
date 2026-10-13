@@ -102,19 +102,28 @@ def generate_stage(workflow: dict, used_isolated: bool, grid: Path, seconds: flo
 
 
 def generate_stage_engine(settings: dict, used_isolated: bool, grid_size, seconds: float,
-                          timing: dict | None = None) -> dict:
+                          timing: dict | None = None, retry: dict | None = None) -> dict:
     """D1 through the in-process d1_engine: its settings come from the engine itself
-    (D1Engine.settings), the same way the ComfyUI path reads them out of the workflow."""
+    (D1Engine.settings), the same way the ComfyUI path reads them out of the workflow.
+    retry: what fast_pipeline._regenerate_if_unasked did, when it fired."""
     params = dict(settings.get("params") or {})
     params["ảnh đưa vào"] = ("ảnh isolate (SAM)" if used_isolated else "ảnh gốc") + " → FluxKontextImageScale"
     params["ảnh grid sinh ra"] = f"{grid_size[0]}×{grid_size[1]}"
+    note = None
+    if retry:
+        params["món không được xin trên grid"] = retry["unasked"]
+        params["sinh lại với seed"] = retry["seed"]
+        note = (f"D1 vẽ thêm món prompt không xin ({', '.join(retry['unasked'])}) nên đã sinh lại với "
+                f"seed {retry['seed']}: " + ("dùng grid mới" + (f" (vẫn còn {', '.join(retry['unasked_after'])})"
+                                                                if retry["unasked_after"] else " (sạch)")
+                                             if retry["kept_new"] else "grid mới không tốt hơn, giữ grid đầu"))
     return _stage("d1", "D1 · Sinh ảnh grid trang phục (d1_engine)", seconds,
-                  dict(settings.get("models") or {}), params,
+                  dict(settings.get("models") or {}), params, note,
                   timing=_with_overhead(timing, seconds, "khác"))
 
 
 def crop_stage(asked_items: list, crops: list, seconds: float,
-               timing: dict | None = None, scrubbed: dict | None = None) -> dict:
+               timing: dict | None = None) -> dict:
     """D3a — cutting the generated grid back into one image per garment."""
     models = {"segmenter": pipeline.SEGMENTER_MODEL_NAME}
     params = {
@@ -131,10 +140,6 @@ def crop_stage(asked_items: list, crops: list, seconds: float,
     if asked_items and len(asked_items) != len(crops):
         note = (f"Tách được {len(crops)} ô nhưng prompt xin {len(asked_items)} — crop được "
                 "đặt tên theo vị trí thay vì theo nhãn, để không gán nhầm loại trang phục.")
-    if scrubbed:
-        params["xoá quần D1 vẽ thừa (không được xin)"] = scrubbed["removed_bottom"]
-        note = ((note + " ") if note else "") + (
-            "D1 vẽ thêm một món thân dưới mà prompt không xin — đã tô bằng màu nền trước khi cắt.")
     return _stage("d3a", "D3a · Cắt từng trang phục ra khỏi grid", seconds, models, params, note,
                   timing=_with_overhead(timing, seconds, "cắt + ghép nền"))
 

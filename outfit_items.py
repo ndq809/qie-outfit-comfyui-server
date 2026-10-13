@@ -49,8 +49,6 @@ import os
 import time
 from pathlib import Path
 
-import cv2
-import numpy as np
 import torch
 from PIL import Image
 
@@ -337,14 +335,64 @@ FACE_BODY_SIDE = 1.0
 FACE_BODY_ABOVE = 0.15
 
 
+# Khuôn mặt chỉ có thể là đầu của một box người khi nó nằm ở phần TRÊN của box đó: tâm mặt
+# trong nửa trên của box, và mặt không nhô lên khỏi mép trên box quá nửa chiều cao mặt (box
+# detector đôi khi cắt sát trán/đỉnh đầu, không bao giờ cắt ngang cằm của chính người đó).
+HEAD_MAX_ABOVE_BOX = 0.5     # x chiều cao mặt
+HEAD_MAX_DOWN_BOX = 0.5      # x chiều cao box: tâm mặt không thấp hơn nửa box
+
+
+def _face_can_head_box(face_box, box):
+    """Khuôn mặt này có thể là đầu của người trong box này không (vị trí, không phải nhận dạng).
+
+    Mặt nằm giữa box hay dưới đáy box là của một người KHÁC đang ở trước/sau người đó: em bé
+    ngồi trong lòng bố có box từ ngực bố trở xuống, mặt bố nằm trên mép box đó; người đứng sau
+    có mặt lọt vào giữa box người phía trước. Mượn những box như vậy làm box chủ thể là cách
+    SAM cô lập nhầm người (ảnh 474, job cc8cfc49)."""
+    fx0, fy0, fx1, fy1 = face_box
+    fh = fy1 - fy0
+    cx, cy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
+    return (box[0] <= cx <= box[2]
+            and fy0 >= box[1] - HEAD_MAX_ABOVE_BOX * fh
+            and cy <= box[1] + HEAD_MAX_DOWN_BOX * (box[3] - box[1]))
+
+
+# Một box mà cả khuôn mặt chủ thể lẫn mặt người khác đều có thể là đầu: box thuộc về mặt
+# nằm gần giữa box hơn (theo chiều ngang, tính bằng bề rộng box), nếu hơn ít nhất ngần này.
+HEAD_CLAIM_MARGIN = 0.15
+
+
+def _head_offset(face_box, box):
+    return abs((face_box[0] + face_box[2]) / 2 - (box[0] + box[2]) / 2) / max(box[2] - box[0], 1e-6)
+
+
+def _box_claimed_by_other(face_box, box, other_faces):
+    """Box này là của người khác: một khuôn mặt khác cỡ tương đương cũng có thể là đầu của
+    box và nằm giữa box rõ hơn mặt chủ thể.
+
+    Mặt chủ thể nằm sát mép một box người (vai kề vai, ôm nhau) không làm box đó thành của
+    anh ta khi mặt chủ nhân thật của box nằm ngay giữa: mô phỏng detector bỏ sót chủ thể trên
+    ảnh 1221, mặt anh ta lệch 0.50 bề rộng box của người bên cạnh, mặt người đó lệch 0.14 -
+    trước đây box đó được chọn và SAM cô lập nhầm người."""
+    mine = _head_offset(face_box, box)
+    fh = face_box[3] - face_box[1]
+    return any(_face_can_head_box(o, box)
+               and (o[3] - o[1]) >= SPLIT_FACE_MIN_REL_HEIGHT * fh
+               and _head_offset(o, box) + HEAD_CLAIM_MARGIN < mine
+               for o in other_faces)
+
+
 def _body_box_from_face(face_box, width, height):
-    """Box người cho khuôn mặt chủ thể mà KHÔNG box người nào chứa tâm của nó.
+    """Box người cho khuôn mặt chủ thể khi không box người nào có thể nhận nó làm đầu
+    (_face_can_head_box).
 
     Detector người (Faster R-CNN) có thể bỏ sót hẳn chủ thể khi người đó bị che: ảnh 474
     (job cc8cfc49), người cha ngồi sau em bé và vợ - 5 box người (kể cả ở ngưỡng 0.2),
     không box nào chứa khuôn mặt anh ta. match_face_to_person_box() khi đó rơi vào nhánh
     "box gần tâm mặt nhất" và chọn box của EM BÉ trong lòng anh ta: SAM cô lập em bé, tủ
-    đồ nhận áo của em bé.
+    đồ nhận áo của em bé. Cùng lỗi đó xảy ra khi box của người khác có chứa tâm mặt chủ thể
+    nhưng mặt không ở vị trí đầu của box (vd em bé được bế cao hơn) - nên điều kiện là
+    "không box nào có thể nhận mặt này làm đầu", không chỉ "không box nào chứa tâm mặt".
 
     Khuôn mặt khớp là bằng chứng chắc chắn về vị trí chủ thể, nên dựng box thân người từ
     nó thay vì mượn box của người khác. Người khác vẫn giữ box của mình trong person_boxes,
@@ -377,7 +425,7 @@ def _owned_by_subject(item_box, target_box, person_boxes):
 
 
 def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
-                  person_boxes=None, embedding=None):
+                  person_boxes=None, embedding=None, face_points=None):
     """Pixel mask of the subject INCLUDING the things they are wearing/carrying.
 
     SAM prompted with a person box returns only the PERSON. Anything carried is a
@@ -403,6 +451,12 @@ def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
     on_gpu = isinstance(image, gi.GpuImage)
     masks = byface.segment_boxes(sam_model, sam_processor, image, [target_box] + inside, DEVICE,
                                  keep_on_device=on_gpu, embedding=embedding)
+    if face_points is not None:
+        # A box built from the face is a rough guess that can take in a neighbour: point SAM
+        # at the subject's face and away from the other faces inside it.
+        positive, negative = face_points
+        masks[0] = byface.segment_box_with_points(sam_model, sam_processor, image, target_box,
+                                                  positive, negative, DEVICE, embedding=embedding)
     mask = byface.fill_holes_on_device(masks[0]) if on_gpu else byface.fill_holes(masks[0])
     for item_mask in masks[1:]:
         mask |= item_mask
@@ -478,6 +532,7 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
                                       face_box=face_box)
 
     target_box, face_similarity, face_box = None, None, None
+    other_faces = []
     subject_box_from_face = False
     if selfie_path:
         t = time.time()
@@ -503,13 +558,15 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         if rescued is not None:
             person_boxes = person_boxes + [rescued]
         fb = face.bbox.tolist()
-        fcx, fcy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
-        if not any(b[0] <= fcx <= b[2] and b[1] <= fcy <= b[3] for b in person_boxes):
+        other_faces = [f.bbox.tolist() for f in all_faces if f is not face]
+        headed = [b for b in person_boxes
+                  if _face_can_head_box(fb, b) and not _box_claimed_by_other(fb, b, other_faces)]
+        if not headed:
             target_box = _body_box_from_face(fb, image.width, image.height)
             person_boxes = person_boxes + [target_box]
             subject_box_from_face = True
         else:
-            target_box = byface.match_face_to_person_box(fb, person_boxes)
+            target_box = byface.match_face_to_person_box(fb, headed)
         if target_box is not None:
             split = _split_box_by_faces(target_box, face.bbox.tolist(),
                                         [f.bbox.tolist() for f in all_faces if f is not face],
@@ -543,8 +600,17 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
         pre = detect_on_original()
         timing["fashion_detect_locate"] = time.time() - t
         t = time.time()
+        face_points = None
+        if subject_box_from_face:
+            def center(b):
+                return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2]
+            inside = [center(f) for f in other_faces
+                      if target_box[0] <= center(f)[0] <= target_box[2]
+                      and target_box[1] <= center(f)[1] <= target_box[3]]
+            face_points = ([center(face_box)], inside)
         mask = _subject_mask(sam_model, sam_processor, image, target_box,
-                             [d["box"] for d in pre], person_boxes, embedding=sam_embedding)
+                             [d["box"] for d in pre], person_boxes, embedding=sam_embedding,
+                             face_points=face_points)
         timing["sam_segment"] = time.time() - t
         isolated = byface.isolate_person(image, mask)
         if save_isolated_to:
@@ -611,69 +677,34 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     return result
 
 
-# Box "bottom" trên ảnh grid D1 phải đạt điểm này mới bị coi là một cái quần D1 vẽ thừa.
-# Đo trên 25 grid thật (2 job): cái quần thừa duy nhất (ảnh 33, dính dưới gấu áo) 0.56; các
-# grid không xin quần không có box "bottom" nào >= 0.4; grid có xin quần: 0.50-0.79.
-GRID_EXTRA_BOTTOM_MIN = 0.5
+# Món mà prompt KHÔNG xin nhưng detector trang phục vẫn thấy rõ trên ảnh grid D1 (nền trắng,
+# từng món tách bạch). Đo trên 746 grid của 25 ảnh thật (3 cách viết prompt x 11 seed, phân
+# loại sạch/lỗi bằng mắt): cái quần thừa với prompt hiện tại (ảnh 33, dính dưới gấu áo) đạt
+# bottom 0.51; trên 734 grid sạch, món không được xin cao nhất chỉ 0.36 ("bag" trên đôi giày
+# của 0912). Không bắt được quần nhỏ gấp gọn, nhưng loại đó chỉ xuất hiện khi prompt có chữ
+# "pants" (xem build_prompt).
+GRID_UNASKED_MIN = 0.5
+# flag của detect_worn_items -> nhãn detector; "dress" không kiểm vì detector hay gọi áo dài
+# là dress, và "outer" lẫn với "top".
+_GRID_CHECK = (("bottom", ("bottom", "one_piece")), ("shoes", ("footwear",)),
+               ("hat", ("headwear",)), ("bag", ("bag",)))
 
 
-def scrub_unasked_lower_body(grid, detected):
-    """(grid, info) - the D1 grid with a lower-body garment the prompt did NOT ask for painted
-    over with the background, before D3 cuts it into items; info None when nothing changed.
+def unasked_items_on_grid(grid, detected):
+    """{nhãn: điểm} các món prompt không xin mà detector thấy trên ảnh grid D1 (rỗng = sạch).
 
-    D1 draws from the photo, not only from the prompt: ảnh 33 (job cc8cfc49) chỉ xin một món
-    thân trên, nhưng dưới gấu áo của chủ thể là chiếc túi đeo chéo màu đen bị mép ảnh cắt, và
-    D1 vẽ thêm một cái quần đen dính liền dưới gấu áo - D3 cắt áo + quần thành một món. Che
-    phần đó trên ẢNH VÀO D1 không được: chỉ còn quai túi, D1 vẽ thành quần yếm (4/4 lần).
-
-    Trên ảnh grid (nền trắng, từng món tách bạch) detector trang phục phân biệt rất rõ, nên
-    kiểm tra ở đây: không xin quần/đầm mà grid có box "bottom" đủ điểm thì tô phần box nằm
-    DƯỚI các món thân trên bằng màu nền. Một lần detector 1 scale trên ảnh ~1MP (~20ms)."""
-    if detected.get("bottom") or detected.get("one_piece"):
-        return grid, None
+    Một lượt detector 1 scale trên ảnh ~1MP (~20ms). Dùng để sinh lại grid khi D1 vẽ thừa -
+    xem fast_pipeline._gen_one."""
     cloth_model, procs_full, _, _, _ = load_clothing_models()
     img = gi.GpuImage.from_pil(grid, DEVICE) if DEVICE.startswith("cuda") else grid
     with torch.no_grad():
-        boxes, scores, labels = clothing.run_scales(cloth_model, procs_full[:1], img, DEVICE)
-    dets = [(cloth_model.config.id2label[lb], sc, b)
-            for b, sc, lb in zip(boxes.tolist(), scores.tolist(), labels.tolist())]
-    extra = [d for d in dets if d[0] == "bottom" and d[1] >= GRID_EXTRA_BOTTOM_MIN]
-    if not extra:
-        return grid, None
-    uppers = [b for label, sc, b in dets if label in ("top", "outer", "dress") and sc >= THRESHOLD]
-    arr = np.asarray(grid.convert("RGB"))
-    border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]])
-    bg = tuple(int(v) for v in np.median(border, axis=0))
-    out = arr.copy()
-    h, w = arr.shape[:2]
-    pad = 0.02 * max(w, h)
-    painted = []
-    for _, score, (x0, y0, x1, y1) in extra:
-        # Below every upper-body garment it overlaps, the box is the bottom alone: paint it.
-        top_edge = max([y0] + [u[3] for u in uppers if u[0] < x1 and u[2] > x0 and u[3] < y1])
-        rx0, rx1 = int(max(0, x0 - pad)), int(min(w, x1 + pad))
-        ry0, ry1, te = int(max(0, y0)), int(min(h, y1 + pad)), int(top_edge)
-        if ry1 <= te:
-            continue
-        # Above that line it shares rows with the top (a curved hem ends higher at the sides
-        # than the top's box does): there, paint only pixels of the bottom's colour that are
-        # connected to the part already painted - the top's own print is enclosed by its
-        # fabric and stays.
-        region = arr[ry0:ry1, rx0:rx1].astype(np.int32)
-        below = region[te - ry0:]
-        fg = np.abs(below - np.array(bg)).sum(-1) > 60
-        if fg.any():
-            colour = np.median(below[fg], axis=0)
-            close = np.abs(region - colour).sum(-1) < 90
-        else:
-            close = np.zeros(region.shape[:2], bool)
-        close[te - ry0:] = True
-        n, comp = cv2.connectedComponents(close.astype(np.uint8), connectivity=8)
-        keep = np.unique(comp[te - ry0:][close[te - ry0:]])
-        sel = np.isin(comp, keep[keep > 0])
-        out[ry0:ry1, rx0:rx1][sel] = bg
-        painted.append({"score": round(score, 3), "box": [rx0, ry0, rx1, ry1], "below_y": te})
-    return (Image.fromarray(out), {"removed_bottom": painted}) if painted else (grid, None)
+        _, scores, labels = clothing.run_scales(cloth_model, procs_full[:1], img, DEVICE)
+    best = {}
+    for score, label in zip(scores.tolist(), labels.tolist()):
+        name = cloth_model.config.id2label[label]
+        best[name] = max(best.get(name, 0.0), score)
+    return {label: round(best[label], 3) for label, flags in _GRID_CHECK
+            if best.get(label, 0.0) >= GRID_UNASKED_MIN and not any(detected.get(f) for f in flags)}
 
 
 def models_loaded():

@@ -303,6 +303,17 @@ def build_prompt(detected):
         # Softer wordings lost: "Each item is shown on its own, with nothing worn over it."
         # 4/58 (no effect); "Only the listed clothing, without straps or accessories."
         # 1/58 but read shoes and hats as accessories and dropped them (707, 0912, 55).
+        #
+        # Extending it to every absent category was measured and LOST (2026-10-13, after photo
+        # 33 of job cc8cfc49 got trousers under its only garment). Judged by eye on each grid,
+        # 25 real photos x 11 seeds, same inputs and seeds, only the ending changed:
+        #   "No bag." (this)                                 1/275 grids with an unasked item
+        #   "No pants. No bag."                              6/275 - folded jeans/shorts drawn
+        #   "No hat. No pants. No bag. No shoes."            5/275 - an extra top on 657 (4/11,
+        #                                                    from "No hat." alone), shorts for shoes
+        #   + "No jacket. No dress."                         tank top drawn as a dress 3/3 (9668)
+        # Each sentence fixes one generation and breaks others, so the rare unasked item is
+        # caught after generation instead - see fast_pipeline._regenerate_if_unasked.
         parts.append("No bag.")
     parts.append("Professional flat mockup photography.")
     return " ".join(parts)

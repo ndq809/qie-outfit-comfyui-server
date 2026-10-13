@@ -291,6 +291,40 @@ def segment_boxes(sam_model, sam_processor, image, boxes, device: str, keep_on_d
     return chosen if keep_on_device else [m.cpu().numpy() for m in chosen]
 
 
+@torch.no_grad()
+def segment_box_with_points(sam_model, sam_processor, image, box, positive, negative, device: str,
+                            embedding=None):
+    """Mask SAM cho MỘT box kèm điểm gợi ý: `positive` (điểm thuộc vật cần lấy) và `negative`
+    (điểm của vật khác nằm trong box) -> mask (H, W) bool trên GPU (np.ndarray nếu ảnh PIL).
+
+    Dùng khi box chỉ là ước lượng thô và chứa cả người khác (box chủ thể dựng từ khuôn mặt):
+    chỉ với box, SAM lấy vật "nổi bật nhất" trong box, có khi là người bên cạnh. Điểm dương ở
+    mặt chủ thể + điểm âm ở mặt những người khác cho SAM biết đúng người cần tách."""
+    points = [list(map(float, q)) for q in positive] + [list(map(float, q)) for q in negative]
+    labels = [1] * len(positive) + [0] * len(negative)
+    H, W = image.height, image.width
+    longest = sam_processor.image_processor.size["longest_edge"]
+    norm = sam_processor._normalize_coordinates(longest, np.array(points, dtype=np.float32), (H, W))
+    on_gpu = isinstance(image, gi.GpuImage)
+    if on_gpu:
+        if embedding is None or embedding.image is not image:
+            embedding = launch_sam_embedding(sam_model, sam_processor, image)
+        inputs = gi.sam_inputs(sam_processor, image, [box], pixels=False)
+        dev = image.t.device
+        outputs = sam_model(image_embeddings=embedding.ready(), input_boxes=inputs["input_boxes"],
+                            input_points=torch.from_numpy(np.array([[norm]])).to(dev),
+                            input_labels=torch.tensor([[labels]], device=dev))
+    else:
+        inputs = sam_processor(image, input_boxes=[[list(box)]], input_points=[[points]],
+                               input_labels=[[labels]], return_tensors="pt").to(device)
+        outputs = sam_model(pixel_values=inputs["pixel_values"], input_boxes=inputs["input_boxes"],
+                            input_points=inputs["input_points"], input_labels=inputs["input_labels"])
+    masks = sam_processor.image_processor.post_process_masks(
+        outputs.pred_masks, inputs["original_sizes"], inputs["reshaped_input_sizes"])[0]
+    pick = _pick_masks(masks, outputs.iou_scores[0], [box])[0]
+    return masks[0, pick] if on_gpu else masks[0, pick].cpu().numpy()
+
+
 def fill_holes(mask: np.ndarray) -> np.ndarray:
     """scipy.ndimage.binary_fill_holes(mask), same result: background pixels 4-connected to
     the frame stay background, every other one becomes mask. One OpenCV flood fill from a
