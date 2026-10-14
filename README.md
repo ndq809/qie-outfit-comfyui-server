@@ -645,6 +645,18 @@ python detect_clothing_yolo.py --images-dir images --single-scale --no-person-cr
 
   The region wording ties with naming a subtype and wins on not inventing one. Dropping
   the noun altogether loses badly — see the next point.
+- **Skirts and trousers need different bottom phrases, so D0b classifies the bottom.**
+  `lower-body garment with both legs visible` is what keeps trousers as two straight legs
+  at their real length; without "both legs" (4 alternatives, 26 photos × 2 seeds, 8 steps)
+  trousers turned into shorts (657, 192, 287) or lost a leg to a fold (0168, 259). Under a
+  skirt the same words draw legs: 651 (pleated skirt over tights) came out as a skirt
+  with beige legs below it, 238 (denim skirt) as jeans - skirt drawn alone in 5/8
+  generations of the 4 skirt photos. So D0b runs SigLIP zero-shot (skirt vs trousers,
+  jeans, shorts, leggings, dress) on the detector's bottom box grown up by half its
+  height (on 651 the box sits on the tights, below the skirt), ~10ms a photo: skirts
+  0.96-0.99, trousers ≤ 0.55, threshold 0.8. A skirt gets `lower-body garment in flat
+  lay` (8/8 skirt alone); trousers keep their phrase, so their grids are unchanged.
+  `outfit_items.bottom_skirt_probability`, `test_extract_outfit.SKIRT_BOTTOM_PHRASE`.
 - **"top" and "bottom" alone are not garment nouns.** Stripped to just `top` and
   `bottom`, the model drew pouches, briefcases and backpacks where clothes belonged,
   and one generation returned a single item out of three. There is nothing in those

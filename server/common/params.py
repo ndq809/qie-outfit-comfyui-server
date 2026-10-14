@@ -47,6 +47,9 @@ def detect_stage(detected: dict, original: Path, seconds: float) -> dict:
         "số người trong ảnh": detected.get("persons"),
         "SAM đã chạy": detected.get("isolated_by_sam"),
         "độ giống khuôn mặt": detected.get("face_similarity"),
+        "phần dưới là váy? (SigLIP, ngưỡng 0.8)": (
+            f'{detected["bottom_kind"]} (p={detected.get("bottom_skirt_p")})'
+            if detected.get("bottom_kind") else None),
     }
     params.update(p)  # anything the detector added since this was written
     note = None
@@ -56,7 +59,7 @@ def detect_stage(detected: dict, original: Path, seconds: float) -> dict:
     labels = {"decode_image": "giải mã ảnh gốc", "save_isolated": "ghi ảnh isolate (PNG)",
               "person_detect": "dò người (Faster R-CNN)",
               "face_load": "nạp ArcFace", "face_ref_embed": "embed ảnh mặt tham chiếu",
-              "face_match_group": "so khớp khuôn mặt",
+              "face_match_group": "so khớp khuôn mặt", "bottom_kind": "phân loại váy/quần",
               "launch_original_pass": "khởi chạy dò trang phục + SAM encoder (chạy song song)",
               "sam_load": "nạp SAM", "sam_segment": "SAM tách nền",
               "fashion_detect_locate": "dò trang phục (vòng định vị)",

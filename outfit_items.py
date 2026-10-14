@@ -654,6 +654,16 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
             ]
 
     result = _flags_from_detections(detections)
+    # Where the bottom garment is in the photo (full-image pixels), for the caller to tell
+    # a skirt from trousers before asking D1 for it (test_extract_outfit.bottom_kind).
+    if result["bottom"]:
+        best = max((d for d in detections if d["label"] == "bottom"), key=lambda d: d["score"])
+        result["bottom_box"] = [round(float(v), 1) for v in best["box"]]
+        t = time.time()
+        skirt_p = bottom_skirt_probability(image, best["box"])
+        timing["bottom_kind"] = time.time() - t
+        result["bottom_skirt_p"] = round(skirt_p, 3)
+        result["bottom_kind"] = "skirt" if skirt_p >= SKIRT_MIN_P else "trousers"
     if return_isolated and isolated_by_sam:
         if isinstance(isolated, gi.GpuImage) and return_isolated != "gpu":
             isolated = isolated.to_pil()
@@ -724,16 +734,72 @@ def unasked_items_on_grid(grid, detected):
             and not any(detected.get(f) for f in flags)}
 
 
+# Skirt or trousers? The detector only says "bottom", and the prompt has to ask for the
+# two differently. "lower-body garment with both legs visible" (test_extract_outfit
+# ITEM_PHRASES) is what keeps trousers drawn as two straight legs at their real length -
+# measured 2026-10-14 on 26 real photos x 2 seeds at 8 steps, dropping "both legs" turned
+# trousers into shorts (657, 192, 287) or folded a leg (0168, 259). But on a skirt it draws
+# legs: 651 (pleated skirt over tights) came out as a skirt with a pair of beige legs under
+# it, and 238 (denim skirt) as jeans. So the photo's bottom is classified first: SigLIP
+# zero-shot on the detector's bottom box, grown upward by half its height - on 651 the box
+# sits on the tights below the skirt (skirt p 0.39 on the box alone, 0.96 grown). Over the
+# same 26 photos: skirts 0.96-0.99 (155, 238, 651, 672), every pair of trousers/jeans/
+# shorts <= 0.55 (287, seated trousers), the rest <= 0.11; 578, dark and unclear, 0.66.
+SKIRT_MODEL = "google/siglip-base-patch16-224"
+SKIRT_LABELS = ("a photo of a skirt", "a photo of trousers", "a photo of jeans",
+                "a photo of shorts", "a photo of leggings", "a photo of a dress")
+SKIRT_CROP_UP = 0.5
+SKIRT_MIN_P = 0.8
+_skirt_classifier = None
+
+
+def _load_skirt_classifier():
+    global _skirt_classifier
+    if _skirt_classifier is None:
+        from transformers import AutoProcessor, SiglipModel
+        model = SiglipModel.from_pretrained(SKIRT_MODEL).to(DEVICE).eval()
+        processor = AutoProcessor.from_pretrained(SKIRT_MODEL)
+        with torch.no_grad():
+            text = processor(text=list(SKIRT_LABELS), padding="max_length", return_tensors="pt").to(DEVICE)
+            text_embeds = _pooled(model.get_text_features(**text))
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        _skirt_classifier = (model, processor, text_embeds)
+    return _skirt_classifier
+
+
+def _pooled(out):
+    """get_*_features returns the embedding tensor, or (newer transformers) an output
+    object whose pooler_output is that same tensor."""
+    return out.pooler_output if hasattr(out, "pooler_output") else out
+
+
+def bottom_skirt_probability(image, box) -> float:
+    """P(skirt) of the bottom garment at box (full-image pixels), against the other
+    SKIRT_LABELS - the same numbers as SiglipModel(text + image).logits_per_image."""
+    model, processor, text_embeds = _load_skirt_classifier()
+    x0, y0, x1, y1 = box
+    crop_box = (int(x0), int(max(0.0, y0 - SKIRT_CROP_UP * (y1 - y0))), int(x1), int(y1))
+    crop = image.crop(crop_box)
+    if isinstance(crop, gi.GpuImage):
+        crop = crop.to_pil()
+    with torch.no_grad():
+        pixels = processor(images=crop, return_tensors="pt").to(DEVICE)
+        image_embeds = _pooled(model.get_image_features(**pixels))
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        logits = image_embeds @ text_embeds.T * model.logit_scale.exp() + model.logit_bias
+    return float(torch.softmax(logits[0], -1)[0])
+
+
 def models_loaded():
-    return any(m is not None for m in (_clothing_models, _sam, _face_app))
+    return any(m is not None for m in (_clothing_models, _sam, _face_app, _skirt_classifier))
 
 
 def unload_models():
     """Drop every detector model so its VRAM goes back to the card. The next
     detect_worn_items() call reloads them lazily. The selfie ArcFace embedding cache is
     plain numpy and stays."""
-    global _clothing_models, _sam, _face_app
-    _clothing_models = _sam = _face_app = None
+    global _clothing_models, _sam, _face_app, _skirt_classifier
+    _clothing_models = _sam = _face_app = _skirt_classifier = None
     clothing._person_raw_cache.update(image=None, out=None)   # holds the last photo on the GPU
     import gc
     gc.collect()

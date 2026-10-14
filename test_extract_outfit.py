@@ -92,6 +92,15 @@ ITEM_PHRASES = [
     ("bag", "bag"),
     ("footwear", "shoes"),
 ]
+# The bottom phrase when D0b classified the bottom as a skirt (outfit_items.SKIRT_MIN_P).
+# "both legs visible" draws legs under a skirt - 651: a pleated skirt with a pair of beige
+# legs below it, cut out as "leggings"; 238: a denim skirt drawn as jeans. Measured
+# 2026-10-14, 8 steps, the 4 skirt photos (155, 238, 651, 672) x 2 seeds: this wording drew
+# the skirt alone in 8/8, against 5/8 for the trousers phrase. "in symmetric flat lay",
+# "laid flat on its own" and the bare region did as well on skirts; "in flat lay" matches
+# the top's phrase. None of them may replace the trousers phrase (see outfit_items, skirt
+# classifier notes).
+SKIRT_BOTTOM_PHRASE = "lower-body garment in flat lay"
 
 
 def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None, save_isolated_to=None,
@@ -217,7 +226,8 @@ def prompt_items(detected):
     # nothing there; clothing.py now offers its best below-threshold upper-body
     # candidate instead (_last_resort_upper_body), and if even that is empty the honest
     # answer is no items, which callers must handle.
-    return [phrase for key, phrase in ITEM_PHRASES if detected.get(key)]
+    return [SKIRT_BOTTOM_PHRASE if key == "bottom" and detected.get("bottom_kind") == "skirt" else phrase
+            for key, phrase in ITEM_PHRASES if detected.get(key)]
 
 
 # Asking for smaller items is what actually keeps them apart. "wide gap between items" alone
