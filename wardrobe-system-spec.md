@@ -6,6 +6,8 @@ Quy ước đánh số: các mục lớn dùng số thập phân (1.1, 2.3.2...)
 
 Lưu ý về ba thay đổi so với thiết kế gốc, đã phản ánh trong tài liệu này: (1) **thứ tự chạy thực tế trên mobile không theo thứ tự mã giai đoạn** — B1 chạy trước A2/A3/A4 (xem [1.1](#11-pipeline-xử-lý-on-device)); (2) **B2 và C1 không còn chạy trên mobile** — B2 bị bỏ hẳn, C1 chuyển sang server thành bước D0b (xem [2.1](#21-kiến-trúc-chung)); (3) **thứ tự chạy trên server cũng không theo thứ tự mã giai đoạn** — D2 chạy sau D3 vì dùng lại embedding do D3 sinh ra, thay vì thêm một model riêng (xem [2.1](#21-kiến-trúc-chung)).
 
+**Thay đổi 2026-10-14 — server không còn database.** Bản hiện thực bỏ hẳn postgres-db: (a) **tủ đồ nằm trên điện thoại** — xác nhận món đồ là `POST /v1/jobs/{jobId}/garments/confirm`, trả về ảnh + tag + embedding để app tự lưu; `POST`/`GET /v1/wardrobe/items` không còn; so trùng với tủ đồ là việc của app; (b) **app gửi embedding khuôn mặt tham chiếu kèm mỗi job** — ảnh khuôn mặt không rời điện thoại ([2.3.7](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job)); (c) bearer token khai tĩnh trong cấu hình (`API_TOKENS`). Job và kết quả chờ duyệt vẫn ở queue/Redis có thời hạn như trước. Các mục 1.2 E1, 2.1 D4, 2.3.7 và Phần 3 đã cập nhật theo; phần triển khai 2.2/2.3 đã bỏ postgres-db khỏi danh sách thành phần.
+
 ## Mục lục
 
 - [0. Mục tiêu và nguyên tắc thiết kế](#0-mục-tiêu-và-nguyên-tắc-thiết-kế)
@@ -18,7 +20,7 @@ Lưu ý về ba thay đổi so với thiết kế gốc, đã phản ánh trong 
   - [2.1 Kiến trúc chung](#21-kiến-trúc-chung)
   - [2.2 Triển khai Production](#22-triển-khai-production)
   - [2.3 Triển khai Test (1 máy vast.ai)](#23-triển-khai-test-1-máy-vastai)
-    - [2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)
+    - [2.3.7 Khuôn mặt tham chiếu (client gửi embedding kèm mỗi job)](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job)
   - [2.4 Giấy phép model/dữ liệu](#24-giấy-phép-modeldữ-liệu)
 - [Phần 3 — API Spec](#phần-3--api-spec)
   - [3.1 Data server API](#31-data-server-api)
@@ -120,15 +122,15 @@ Gồm giai đoạn D (góc nhìn từ Mobile, ký hiệu D0) và giai đoạn E 
 4. Sau khi upload xong, Mobile gọi `POST /v1/jobs` để Data server tạo batch job (gắn với user/account của session hiện tại) và đẩy vé việc vào hàng đợi cho AI server xử lý (chi tiết xử lý phía server xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4) ở mục 2.1).
 
 **E1. Theo dõi tiến độ, duyệt kết quả và đăng ký vào wardrobe**
-Kết quả tách trang phục **không tự vào wardrobe**: model có thể tách sai món, gắn sai tag, hoặc tách lại một món user đã có, nên người dùng phải xem và xác nhận trước khi món đồ được ghi vào database. Mobile:
+Kết quả tách trang phục **không tự vào wardrobe**: model có thể tách sai món, gắn sai tag, hoặc tách lại một món user đã có, nên người dùng phải xem và xác nhận trước khi món đồ vào wardrobe. Wardrobe nằm **trên điện thoại** — server không có database. Mobile:
 - Gọi định kỳ `GET /v1/jobs/{jobId}` (hoặc nhận thông báo đẩy) để theo dõi tiến độ.
 - Gọi `GET /v1/jobs/{jobId}/garments` để lấy các món đồ đề xuất (ảnh + tag của AI) và hiển thị màn hình duyệt — được phép gọi khi job còn đang chạy, danh sách lớn dần theo từng ảnh xử lý xong.
-- Với món user giữ lại (có thể sửa tag trước): gọi `POST /v1/wardrobe/items` — đây là bước **duy nhất** ghi wardrobe vào database. Với món user bỏ: gọi `POST /v1/jobs/{jobId}/garments/reject`. Món không được duyệt tự hết hạn cùng job (mặc định 7 ngày).
-- Gọi `GET /v1/wardrobe/items` để hiển thị wardrobe (chỉ gồm món đã xác nhận; Data server tự lọc theo user/account của session hiện tại).
+- Với món user giữ lại (có thể sửa tag trước): gọi `POST /v1/jobs/{jobId}/garments/confirm`; response mang ảnh, tag cuối cùng, mô tả và embedding — Mobile tải ảnh về và lưu món đó vào wardrobe cục bộ. Với món user bỏ: gọi `POST /v1/jobs/{jobId}/garments/reject`. Mọi thứ trên server (job, kết quả, ảnh món đồ) tự hết hạn cùng job (mặc định 7 ngày).
+- Hiển thị wardrobe từ dữ liệu cục bộ của app.
 - Nếu người dùng muốn dừng giữa chừng, gọi `POST /v1/jobs/{jobId}/cancel`.
 
 **E2. Cập nhật index ảnh đã quét**
-Khi job chuyển sang "completed", Mobile đối chiếu danh sách kết quả theo từng ảnh (trường `items[]` trong response của `GET /v1/jobs/{jobId}`, xem [3.1](#31-data-server-api)) để biết ảnh nào xử lý thành công. Chỉ những ảnh thành công mới được thêm asset ID vào index cục bộ mô tả ở [1.1](#11-pipeline-xử-lý-on-device) (bước A0); ảnh xử lý lỗi không được thêm vào, để lần quét sau thử lại. Vì index chỉ tồn tại cục bộ, nếu người dùng gỡ app hoặc đổi thiết bị, index mất và ảnh cũ có thể bị quét lại — khi đó D2 so với wardrobe (nếu bật) gắn gợi ý "có thể đã có món này" vào món đồ ở màn hình duyệt, và người dùng là người quyết định bỏ bản trùng.
+Khi job chuyển sang "completed", Mobile đối chiếu danh sách kết quả theo từng ảnh (trường `items[]` trong response của `GET /v1/jobs/{jobId}`, xem [3.1](#31-data-server-api)) để biết ảnh nào xử lý thành công. Chỉ những ảnh thành công mới được thêm asset ID vào index cục bộ mô tả ở [1.1](#11-pipeline-xử-lý-on-device) (bước A0); ảnh xử lý lỗi không được thêm vào, để lần quét sau thử lại. Vì index chỉ tồn tại cục bộ, nếu người dùng gỡ app hoặc đổi thiết bị, index mất và ảnh cũ có thể bị quét lại — khi đó Mobile so embedding của món chờ duyệt (`GET /v1/jobs/{jobId}/garments?includeEmbeddings=true`) với wardrobe cục bộ theo đúng quy tắc D2 của server, gắn gợi ý "có thể đã có món này", và người dùng là người quyết định bỏ bản trùng.
 
 **Xử lý gián đoạn phía Mobile**: nếu mất mạng hoặc app bị tắt giữa lúc đang upload, chỉ ảnh đã upload xong mới có vé việc; khi mở lại app, Mobile hỏi lại những ảnh nào đã upload thành công để chỉ tải nốt phần thiếu, không tạo lại cả batch. Nếu mất kết nối trong lúc chờ kết quả, quá trình xử lý ở server vẫn tiếp tục bình thường; Mobile chỉ cần hỏi lại trạng thái job khi hoạt động trở lại, không mất tiến độ đã xử lý xong.
 
@@ -166,7 +168,7 @@ Dùng để: kiểm chứng nhanh tác động của việc đổi ngưỡng (`h
 
 #### Thành phần chính
 
-- **Data server**: cấp quyền upload, tạo và theo dõi job, giữ kết quả chờ người dùng duyệt, là chủ sở hữu duy nhất của database. Hiện thực toàn bộ API public. Luồng xử lý job (upload → tách → kết quả) **không ghi database**: trạng thái job và kết quả chờ duyệt nằm trong kho tạm có thời hạn (Test: Redis); database chỉ nhận món đồ người dùng đã xác nhận.
+- **Data server**: cấp quyền upload, tạo và theo dõi job, giữ kết quả chờ người dùng duyệt, Hiện thực toàn bộ API public. **Không có database**: trạng thái job và kết quả chờ duyệt nằm trong kho tạm có thời hạn (Test: Redis); món đồ người dùng xác nhận được trả về cho Mobile lưu vào wardrobe trên máy.
 - **AI server (worker pool)**: liên tục lấy việc từ job queue, xử lý D0b→D1→D3→D2 nối tiếp trên cùng một ảnh (thứ tự thực tế, xem [Luồng xử lý D0→D4](#luồng-xử-lý-d0d4)), rồi báo kết quả qua result queue. Không có API nghiệp vụ, không đụng trực tiếp vào database.
 - **Object Storage**: kho lưu ảnh gốc chờ xử lý và ảnh trang phục đã tách. Mobile và AI server đọc/ghi trực tiếp bằng đường dẫn có giới hạn quyền và thời hạn.
 - **Message Queue (job queue)**: nơi Data server đặt vé việc cho AI server lấy về làm.
@@ -181,7 +183,7 @@ Nguyên tắc xuyên suốt: **hai server không gọi thẳng vào nhau**, ch�
 3. **D1 — Tách trang phục**: model chuyên sâu, cần GPU, không phù hợp chạy trên mobile. Từ 1 ảnh gốc, các trang phục tách ra nằm trên cùng 1 ảnh output nên cần crop để tách riêng từng trang phục. Hiện thực tham chiếu dùng **image-edit model + LoRA** để *vẽ lại* trang phục thành ảnh mockup phẳng, không phải segmentation cắt pixel từ ảnh gốc (hệ quả xem phần dưới).
 4. **D2 — Khử trùng lặp giữa các ảnh trang phục đã tách**: nhiều item có thể trùng nhau (cùng một áo xuất hiện ở nhiều ảnh gốc). Dùng embedding tương đồng tính cosine similarity giữa các ảnh trang phục để lọc; nếu muốn nhẹ hơn, dùng lại perceptual hashing như B1. Bước này càng quan trọng hơn sau khi B1 trên mobile được nới ngưỡng gom cụm (xem [1.1](#11-pipeline-xử-lý-on-device)) — mobile ưu tiên gom mạnh để giảm tải, phần trùng lặp còn sót lại do server bắt. **Thay đổi so với thiết kế gốc: D2 chạy *sau* D3**, và không cần thêm model CLIP riêng — xem giải thích ở phần dưới.
 5. **D3 — Gắn tag phân loại**: model classification đa nhãn nhận diện loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... Chạy ngay sau D1 trên cùng AI server để tránh tải ảnh lên/xuống lần nữa. Ngoài tag, bước này còn sinh **embedding** dùng cho D2 và cho tìm kiếm wardrobe sau này.
-6. **D4 — Lưu kết quả chờ duyệt (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage (vùng `pending/`) rồi đặt kết quả (đường dẫn ảnh + tag + embedding) vào result queue. Data server tiêu thụ result queue để cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`) và giữ các món đồ ở trạng thái **chờ duyệt** — **không ghi database**. Chỉ khi người dùng xác nhận (`POST /v1/wardrobe/items`, xem [1.2](#12-tương-tác-với-server) E1), Data server mới chuyển ảnh sang vùng wardrobe và ghi bản ghi vào database, kèm tag người dùng đã sửa (tag gốc của AI được giữ lại riêng). Món bị bỏ thì ảnh bị xoá; món không được duyệt hết hạn cùng job. Lưu ý **một ảnh gốc sinh ra nhiều item**, nên một bản tin kết quả chứa một danh sách item chứ không phải một item (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
+6. **D4 — Lưu kết quả chờ duyệt (Data server)**: AI server ghi ảnh trang phục kết quả lên Object Storage (vùng `pending/`) rồi đặt kết quả (đường dẫn ảnh + tag + embedding) vào result queue. Data server tiêu thụ result queue để cập nhật tiến độ job (phản ánh qua `GET /v1/jobs/{jobId}`) và giữ các món đồ ở trạng thái **chờ duyệt** — **không ghi database**. Khi người dùng xác nhận (`POST /v1/jobs/{jobId}/garments/confirm`, xem [1.2](#12-tương-tác-với-server) E1), Data server đánh dấu món đó đã xác nhận, dựng lại mô tả nếu tag bị sửa (tag gốc của AI được giữ lại riêng) và trả về ảnh + tag + embedding cho Mobile lưu — không ghi gì lâu dài phía server. Món bị bỏ thì ảnh bị xoá; mọi món (kể cả đã xác nhận) hết hạn cùng job, nên Mobile phải tải ảnh về ngay khi xác nhận. Món trùng giữa các ảnh của cùng job được đánh dấu `duplicate` và không đưa ra duyệt. Lưu ý **một ảnh gốc sinh ra nhiều item**, nên một bản tin kết quả chứa một danh sách item chứ không phải một item (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
 
 Cấu trúc bản tin của job queue và result queue được định nghĩa chi tiết ở [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue).
 
@@ -364,7 +366,7 @@ Mỗi vé việc trong hàng đợi được thử lại độc lập nếu xử
 Nguyên tắc quan trọng: một khi ảnh đã upload xong và vé việc đã vào hàng đợi, việc xử lý ở AI server hoàn toàn độc lập với tình trạng kết nối/hoạt động của thiết bị Mobile.
 
 - **Người dùng chủ động hủy**: Mobile gọi `POST /v1/jobs/{jobId}/cancel`, Data server đánh dấu batch job "đang hủy". Không cần rút message khỏi Message Queue — AI server kiểm tra trạng thái batch trước khi xử lý mỗi vé việc, bỏ qua ngay nếu đã bị đánh dấu hủy. Ảnh đang xử lý dở khi lệnh hủy đến vẫn được cho hoàn tất (công sức GPU đã gần như bỏ ra hết). Khi hết vé việc đang chạy, Data server chuyển trạng thái "đã hủy" và dọn ảnh gốc còn sót trong Object Storage.
-- **Batch job bị bỏ quên**: nếu Mobile không bao giờ quay lại hỏi trạng thái hay duyệt kết quả (gỡ app, đổi máy...), batch job, kết quả chờ duyệt và ảnh liên quan có thời hạn tồn tại tối đa (mặc định 7 ngày kể từ lần thay đổi cuối); quá hạn, job và các món chưa duyệt tự biến mất. Món đã xác nhận nằm trong database nên không bị ảnh hưởng.
+- **Batch job bị bỏ quên**: nếu Mobile không bao giờ quay lại hỏi trạng thái hay duyệt kết quả (gỡ app, đổi máy...), batch job, kết quả chờ duyệt và ảnh liên quan có thời hạn tồn tại tối đa (mặc định 7 ngày kể từ lần thay đổi cuối); quá hạn, job và mọi món đồ của nó tự biến mất trên server. Món đã xác nhận nằm trong wardrobe trên điện thoại nên không bị ảnh hưởng.
 
 (Xem thêm cách Mobile xử lý gián đoạn khi đang upload/đang chờ kết quả ở [1.2](#12-tương-tác-với-server).)
 
@@ -378,7 +380,7 @@ Lựa chọn thay thế đơn giản hơn là để AI server gọi thẳng mộ
 
 - **AI server**: một hoặc nhiều máy GPU riêng, autoscale số lượng worker theo độ dài job queue thật (không giới hạn bởi tài nguyên của 1 máy như ở Test).
 - **Object Storage**: nên dùng dịch vụ managed (S3, GCS...) thay vì tự vận hành, để có sẵn khả năng chịu lỗi và chính sách vòng đời dữ liệu.
-- **postgres-db và queue**: có thể đặt gần Data server (cùng khu vực mạng) để giảm độ trễ giữa hai thành phần này.
+- **queue**: có thể đặt gần Data server (cùng khu vực mạng) để giảm độ trễ giữa hai thành phần này.
 - **Khả năng chịu lỗi phần cứng**: vì nhiều máy vật lý độc lập, một máy gặp sự cố không làm sập toàn hệ thống — khác với môi trường Test (xem [2.3.5](#235-khác-biệt-so-với-production)).
 
 Thứ tự ưu tiên khi tách dần từ môi trường Test sang Production: tách **ai-server** ra máy GPU riêng trước (phần đắt và nặng tải nhất), rồi chuyển **object-storage** sang dịch vụ managed.
@@ -399,23 +401,22 @@ Tạo một Docker network riêng dạng bridge với subnet cố định (ví d
 
 | Thành phần | Vai trò | IP nội bộ | Port | Expose ra ngoài? |
 |---|---|---|---|---|
-| data-server | API cho Mobile, quản lý job, ghi database | 172.28.0.10 | 8080 | Có — map ra IP public của vast.ai |
+| data-server | API cho Mobile, quản lý job | 172.28.0.10 | 8080 | Có — map ra IP public của vast.ai |
 | ai-server | Worker xử lý D0b–D3, cần GPU | 172.28.0.20 | 8090 (chỉ health check nội bộ) | Không |
-| postgres-db | Database chính (user, job, wardrobe) | 172.28.0.30 | 5432 | Không |
 | object-storage (MinIO) | Lưu ảnh gốc và ảnh trang phục đã tách | 172.28.0.40 | 9000 (API), 9001 (console quản trị) | Không, trừ khi tạm mở console để debug thủ công |
 | queue (Redis) | Job queue và Result queue (hai danh sách riêng trong cùng một Redis) | 172.28.0.50 | 6379 | Không |
 
 #### 2.3.3 Cấu hình gọi nhau giữa các thành phần
 
-**data-server** cần biết địa chỉ của: postgres-db (ghi wardrobe người dùng đã xác nhận; trạng thái job nằm ở queue/Redis, không ở database), object-storage (tạo đường dẫn upload/tải có thời hạn cho Mobile), queue (đẩy vé việc vào job queue, đọc kết quả từ result queue, giữ trạng thái job và kết quả chờ duyệt). Đây là thành phần duy nhất có quyền ghi vào database, và là nơi hiện thực toàn bộ API public ở [3.1](#31-data-server-api).
+**data-server** cần biết địa chỉ của: object-storage (tạo đường dẫn upload/tải có thời hạn cho Mobile), queue (đẩy vé việc vào job queue, đọc kết quả từ result queue, giữ trạng thái job và kết quả chờ duyệt). Đây là nơi hiện thực toàn bộ API public ở [3.1](#31-data-server-api).
 
-**ai-server** cần biết địa chỉ của: object-storage (tải ảnh về xử lý, ghi ảnh kết quả lên) và queue (lấy vé việc từ job queue, đẩy kết quả vào result queue). ai-server không cần và không nên biết địa chỉ của postgres-db — giữ đúng nguyên tắc AI server không đụng trực tiếp vào database, tách rời hoàn toàn khỏi Data server dù đang chạy chung một máy vật lý.
+**ai-server** cần biết địa chỉ của: object-storage (tải ảnh về xử lý, ghi ảnh kết quả lên) và queue (lấy vé việc từ job queue, đẩy kết quả vào result queue). ai-server không gọi data-server — tách rời hoàn toàn khỏi Data server dù đang chạy chung một máy vật lý.
 
 Mỗi thành phần đọc các địa chỉ IP:port trên từ file cấu hình môi trường riêng của nó, không hard-code trong logic xử lý.
 
 #### 2.3.4 Expose ra bên ngoài để test từ Mobile
 
-Chỉ data-server cần mở cổng ra ngoài (map port 8080 nội bộ ra một port trên IP public của vast.ai) để app Mobile hoặc Postman gọi vào trong lúc test. Các thành phần còn lại (ai-server, postgres-db, object-storage, queue) chỉ lắng nghe trong mạng nội bộ Docker, không map port ra ngoài — đúng nguyên tắc AI server và Object Storage không nên lộ trực tiếp ra internet, kể cả trong môi trường test.
+Chỉ data-server cần mở cổng ra ngoài (map port 8080 nội bộ ra một port trên IP public của vast.ai) để app Mobile hoặc Postman gọi vào trong lúc test. Các thành phần còn lại (ai-server, object-storage, queue) chỉ lắng nghe trong mạng nội bộ Docker, không map port ra ngoài — đúng nguyên tắc AI server và Object Storage không nên lộ trực tiếp ra internet, kể cả trong môi trường test.
 
 #### 2.3.5 Khác biệt so với Production
 
@@ -430,53 +431,59 @@ Không có autoscale GPU thật vì chỉ có một máy; nếu muốn giả l�
 1. Xác nhận instance vast.ai hỗ trợ chạy Docker/Docker Compose bên trong; nếu không, đổi template trước khi tiếp tục — không cố chạy tiếp nếu bước này chưa xác nhận được.
 2. Cài Docker và Docker Compose trên máy nếu chưa có sẵn.
 3. Tạo Docker network riêng với subnet cố định như bảng ở [2.3.2](#232-mạng-nội-bộ-và-bảng-phân-bổ-ip).
-4. Khởi tạo lần lượt postgres-db, object-storage, queue — gán đúng IP tĩnh cho từng container, kiểm tra từng dịch vụ chạy healthy trước khi sang bước tiếp theo.
+4. Khởi tạo lần lượt object-storage, queue — gán đúng IP tĩnh cho từng container, kiểm tra từng dịch vụ chạy healthy trước khi sang bước tiếp theo.
 5. Build và chạy ai-server, cấu hình trỏ tới IP của object-storage và queue theo bảng 2.3.2; xác nhận container nhận diện đúng GPU của máy. Image của ai-server cần có sẵn: ComfyUI + các checkpoint/LoRA của D1, bộ nhận diện của D0b, và bộ trọng số phân loại của D3 (`models/magic_eye/`, lấy qua `git lfs pull` lúc build — nếu quên, file `.pt` chỉ là con trỏ LFS và bước D3 sẽ báo lỗi rõ ràng). Danh sách đầy đủ ở mục "Models required" của [README.md](README.md). Nếu chỉ có một GPU dùng chung cho D1 và D0b, đặt `OUTFIT_ITEMS_DEVICE=cpu` cho bộ nhận diện để không tranh VRAM với ComfyUI.
-6. Build và chạy data-server, cấu hình trỏ tới IP của postgres-db, object-storage, queue; map port ra IP public của vast.ai.
-7. Đặt `TEST_FIXED_FACE_REF_IMAGE` trỏ tới ảnh khuôn mặt dùng chung cho môi trường test ([2.3.7](#237-ảnh-khuôn-mặt-tham-chiếu-cố-định-chỉ-môi-trường-test)); xác nhận log khởi động của data-server báo đã nạp được, và `GET /v1/face-reference` trả `source: "test-fixture"`. Bỏ qua bước này nếu muốn test đúng luồng đăng ký khuôn mặt của Production.
-8. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/wardrobe/items` xác nhận data-server đã ghi được wardrobe vào postgres-db. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
+6. Build và chạy data-server, cấu hình trỏ tới IP của object-storage, queue; map port ra IP public của vast.ai.
+7. Đặt `TEST_FIXED_FACE_REF_IMAGE` trỏ tới ảnh khuôn mặt mặc định cho môi trường test (dùng khi job không kèm embedding) ([2.3.7](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job)); xác nhận log khởi động của data-server báo đã nạp được, và một job **không** gửi khuôn mặt trả `faceReference.source: "test-fixture"`, còn job gửi embedding trả `"embedding"`.
+8. Test toàn bộ luồng: gọi `POST /v1/uploads/presign` xin đường dẫn upload có thời hạn → upload ảnh thẳng lên object-storage → gọi `POST /v1/jobs` tạo job → gọi `GET /v1/jobs/{jobId}` để xác nhận ai-server đã nhận vé việc từ queue và đang xử lý → xác nhận ai-server ghi ảnh kết quả lên object-storage và đẩy đúng cấu trúc bản tin vào result queue → gọi lại `GET /v1/jobs/{jobId}` xác nhận status chuyển "completed" → gọi `GET /v1/jobs/{jobId}/garments` rồi `POST /v1/jobs/{jobId}/garments/confirm`, xác nhận response mang đủ ảnh + tag + embedding cho Mobile lưu. Tiện thể thử `POST /v1/jobs/{jobId}/cancel` trên một job khác đang chạy để xác nhận cơ chế hủy hoạt động đúng.
 9. Ghi lại toàn bộ giá trị IP/port đã dùng vào một file cấu hình môi trường mẫu, để khi tách sang nhiều máy thật sau này chỉ cần thay giá trị, không cần sửa code nghiệp vụ.
 
-#### 2.3.7 Ảnh khuôn mặt tham chiếu cố định (chỉ môi trường Test)
+#### 2.3.7 Khuôn mặt tham chiếu (client gửi embedding kèm mỗi job)
 
-D0b cần một ảnh khuôn mặt tham chiếu để biết người nào trong ảnh nhóm là chủ tài khoản
-(xem [2.1](#21-kiến-trúc-chung), bước D0b). Ở Production ảnh này do chính user cung cấp
-lúc đăng ký khuôn mặt. Ở môi trường Test, để rút ngắn vòng lặp thử nghiệm, **server cố
-định sẵn một ảnh dùng chung cho mọi account** — client không cần upload ảnh khuôn mặt,
-và bắt đầu thẳng từ `POST /v1/uploads/presign`.
+D0b cần biết người nào trong ảnh nhóm là chủ tài khoản (xem [2.1](#21-kiến-trúc-chung),
+bước D0b). Server không có database nên không lưu khuôn mặt của user giữa các lần quét:
+**app gửi embedding khuôn mặt kèm mỗi job** — `POST /v1/jobs` có thêm
+`faceReference: {"embedding": [512 số], "model": "w600k_mbf"}` (chi tiết:
+[MOBILE_CLIENT_API.md](MOBILE_CLIENT_API.md) mục 3).
 
-Cấu hình bằng một biến môi trường duy nhất của data-server:
-
-```
-TEST_FIXED_FACE_REF_IMAGE=/workspace/qie-outfit-comfyui-server/face-image/selfie.jpg
-```
+Gửi được embedding vì app và server dùng **cùng một model**: app tính nó cho bước A4
+([1.1](#11-pipeline-xử-lý-on-device)) bằng MobileFaceNet `w600k_mbf`, và D0b đối chiếu bằng
+`insightface/buffalo_s`, mà model nhận diện bên trong chính là `w600k_mbf` — hai bên cùng một
+không gian embedding, cùng ngưỡng 0.35. Lợi ích: **ảnh khuôn mặt không rời khỏi điện
+thoại** (đúng nguyên tắc ưu tiên on-device), app không phải upload thêm gì, server không
+phải detect + embed ảnh selfie.
 
 Cách hoạt động:
 
-1. Lúc khởi động, data-server đọc file này và **upload lên object-storage** một lần vào
-   key cố định `face/_test_fixture/reference.jpg`. Phải upload chứ không đọc thẳng từ đĩa
-   lúc chạy job, vì bên tiêu thụ là ai-server — ở Production nó nằm trên máy khác, không
-   nhìn thấy filesystem của data-server.
-2. Khi tạo job, data-server lấy `face_ref_key` theo thứ tự ưu tiên:
-   **ảnh của chính account** (nếu đã đăng ký qua `/v1/face-reference`) → **ảnh cố định
-   này** → không có gì. Giá trị chọn được gắn vào trường `faceRefKey` của vé việc như
-   bình thường (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)).
-3. ai-server không biết và không cần biết ảnh đó từ đâu ra — nó chỉ thấy một `faceRefKey`
-   trong vé việc và tải về từ object-storage, **đúng như luồng Production**. Không có
-   nhánh code riêng cho Test ở phía ai-server.
+1. data-server kiểm tra embedding (`server/common/face_ref.py`): `model` phải là
+   `w600k_mbf`, đúng 512 số hữu hạn, không phải vector 0; rồi chuẩn hoá L2. Embedding không
+   đạt **không làm job thất bại** — job dùng nguồn dự phòng và response tạo job có
+   `faceReference.warning` nói lý do.
+2. Thứ tự chọn khuôn mặt cho job: **embedding app gửi** → **ảnh khuôn mặt upload kèm batch**
+   (đường dự phòng cho client chưa tính được embedding: `faceReference` trong
+   `POST /v1/uploads/presign`, key `face/<accountId>/<batchId>.<ext>`, xoá cùng ảnh gốc khi
+   job kết thúc) → **ảnh mặc định** `TEST_FIXED_FACE_REF_IMAGE` → không có gì (D0b lùi về
+   "người lớn nhất khung hình"). Response tạo job/xem job báo `faceReference.source` =
+   `"embedding"` / `"image"` / `"test-fixture"` / `null`.
+3. Embedding đi trong từng vé việc của job (trường `faceRefEmbedding`, ~6 KB), ảnh đi dưới
+   dạng `faceRefKey` (xem [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)) — ai-server
+   chỉ cần vé việc như trước. data-server **không lưu** embedding vào bản ghi job.
 
-Ba điểm cần lưu ý:
+**Điểm cần đo trước khi phát hành:** spec [1.1](#11-pipeline-xử-lý-on-device) yêu cầu hai đầu
+so sánh dùng cùng một cách căn chỉnh khuôn mặt. Embedding tham chiếu giờ được căn chỉnh
+theo landmark của ML Kit (trên app), còn khuôn mặt trong ảnh nhóm theo landmark của SCRFD
+(trên server). Cùng template 112×112 nên chênh lệch dự kiến nhỏ, nhưng phải đo: cosine
+giữa embedding app và embedding server của cùng một ảnh selfie (nên ≥ 0.9), và độ giống
+khuôn mặt trên ảnh nhóm thật vẫn trên ngưỡng 0.35 (với embedding server: 0.44–0.60 trên ảnh
+test; gửi embedding thay ảnh cho ra đúng từng điểm số đó).
 
-- **Key nằm ngoài namespace `face/<account_id>/`** vì ảnh này không thuộc account nào và
-  được mọi account dùng chung — để không bao giờ bị nhầm là ảnh do user thật đăng ký.
-- **Ảnh của account vẫn thắng.** Biến này chỉ là giá trị lùi, nên hành vi Production
-  không đổi khi không cấu hình nó. `GET /v1/face-reference` trả thêm trường `source`
-  (`"account"` / `"test-fixture"` / `null`) để biết cái nào đang thực sự có hiệu lực.
-- **File thiếu không làm sập server**: chỉ ghi cảnh báo vào log rồi bỏ qua, D0b lùi về
-  suy đoán "người lớn nhất khung hình" — cùng hành vi như khi không cấu hình gì.
+Ảnh mặc định: lúc khởi động, data-server upload file `TEST_FIXED_FACE_REF_IMAGE` lên
+object-storage vào key cố định `face/_test_fixture/reference.jpg` — nằm ngoài namespace
+`face/<accountId>/` để không bao giờ bị nhầm là ảnh của một user; phải upload chứ không đọc
+từ đĩa vì ai-server ở Production nằm trên máy khác. File thiếu chỉ ghi cảnh báo vào log.
 
 **Bắt buộc bỏ trống `TEST_FIXED_FACE_REF_IMAGE` ở Production.** Để nguyên nghĩa là mọi
-user chưa đăng ký khuôn mặt đều bị đối chiếu với khuôn mặt của một người lạ, và wardrobe
+job mà app không gửi khuôn mặt đều bị đối chiếu với khuôn mặt của một người lạ, và tủ đồ
 sẽ chứa quần áo của người đó.
 
 ### 2.4 Giấy phép model/dữ liệu
@@ -506,7 +513,7 @@ Hai bài học rút ra khi chọn model:
 
 ## Phần 3 — API Spec
 
-Dùng chung cho cả Production và Test — toàn bộ endpoint dưới đây giống hệt nhau giữa hai môi trường, khác biệt duy nhất là base URL (xem [1.3](#13-cấu-hình-theo-môi-trường)). Chỉ **data-server** có API public gọi từ Mobile; **ai-server** hoạt động theo mô hình worker kéo việc từ hàng đợi nên không có API nghiệp vụ, chỉ có một endpoint kiểm tra tình trạng nội bộ. Toàn bộ endpoint public xác thực bằng token (Bearer token). Với các request tạo/đọc dữ liệu gắn với người dùng, data-server tự lấy `user_id` (định danh user sở hữu wardrobe) và `account_id` (định danh tài khoản đã đăng nhập) từ session hiện tại ứng với token đó — Mobile không truyền trực tiếp hai giá trị này trong body/query, tránh trường hợp client giả mạo user_id/account_id của người khác.
+Dùng chung cho cả Production và Test — toàn bộ endpoint dưới đây giống hệt nhau giữa hai môi trường, khác biệt duy nhất là base URL (xem [1.3](#13-cấu-hình-theo-môi-trường)). Chỉ **data-server** có API public gọi từ Mobile; **ai-server** hoạt động theo mô hình worker kéo việc từ hàng đợi nên không có API nghiệp vụ, chỉ có một endpoint kiểm tra tình trạng nội bộ. Toàn bộ endpoint public xác thực bằng token (Bearer token). Với các request tạo/đọc dữ liệu gắn với người dùng, data-server tự lấy `account_id` (định danh tài khoản) từ token — Mobile không truyền trực tiếp giá trị này trong body/query, tránh trường hợp client đọc job của người khác. Bản hiện thực không có database: token hợp lệ khai tĩnh trong cấu hình (`API_TOKENS`), và wardrobe nằm trên điện thoại.
 
 ### 3.1 Data server API
 
@@ -519,6 +526,7 @@ Public, gọi từ Mobile.
 | items[].localId | string | Id tạm do Mobile sinh, dùng đối chiếu kết quả |
 | items[].contentType | string | Kiểu file ảnh |
 | items[].checksum | string (tùy chọn) | Hash nội dung, tránh upload trùng |
+| faceReference.contentType | string (tùy chọn) | Đường dự phòng: xin thêm URL upload cho ảnh khuôn mặt của user, dùng cho job của lô này khi job không kèm embedding ([2.3.7](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job)) |
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
@@ -526,6 +534,7 @@ Public, gọi từ Mobile.
 | items[].objectKey | string | Đường dẫn ảnh trên object-storage |
 | items[].uploadUrl | string | URL có chữ ký, thời hạn ngắn |
 | items[].expiresAt | thời điểm | Thời điểm uploadUrl hết hạn |
+| faceReference | object (khi có yêu cầu) | `{objectKey, uploadUrl, expiresAt}` cho ảnh khuôn mặt |
 
 **POST /v1/jobs** — tạo batch job sau khi Mobile đã upload xong toàn bộ ảnh trong batch.
 
@@ -533,6 +542,8 @@ Public, gọi từ Mobile.
 |---|---|---|
 | batchId | string | Id phiên upload đã xin ở bước presign |
 | uploadedItems | danh sách localId | Ảnh đã upload thành công (cho phép job chỉ chứa một phần batch) |
+| faceReference.embedding | 512 số thực (tùy chọn) | Embedding khuôn mặt của user, model `w600k_mbf` (cùng embedding app dùng ở A4) — [2.3.7](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job) |
+| faceReference.model | string (bắt buộc khi có embedding) | Phải là `"w600k_mbf"` |
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
@@ -540,6 +551,8 @@ Public, gọi từ Mobile.
 | status | enum | Luôn là "pending" |
 | totalItems | số nguyên | Tổng số ảnh sẽ xử lý |
 | createdAt | thời điểm | Thời điểm tạo job |
+| faceReference.source | enum hoặc null | Khuôn mặt job dùng: "embedding" (app gửi) / "image" (ảnh upload kèm lô) / "test-fixture" (ảnh mặc định) / null |
+| faceReference.warning | string (khi có) | Lý do embedding app gửi bị từ chối (job vẫn chạy với nguồn dự phòng) |
 
 **GET /v1/jobs/{jobId}** — lấy tiến độ xử lý (Mobile dùng để polling).
 
@@ -552,8 +565,10 @@ Public, gọi từ Mobile.
 | updatedAt | thời điểm | Lần cập nhật gần nhất |
 | items[].localId | string | Id ảnh phía Mobile (đối chiếu ngược lại asset gốc để cập nhật index quét — xem [1.2](#12-tương-tác-với-server), bước E2) |
 | items[].status | enum | "success" / "failed", chỉ có giá trị sau khi ảnh đó đã được AI server xử lý xong |
-| items[].garmentCount | số nguyên | Số món đồ tách được từ ảnh (chỉ khi "success") |
-| review | object | Số món đồ của job theo trạng thái duyệt: `pending`, `confirmed`, `rejected` |
+| items[].garmentCount | số nguyên | Số món đồ cần duyệt tách được từ ảnh (chỉ khi "success") |
+| items[].duplicateCount | số nguyên (khi > 0) | Số món của ảnh trùng với món đã tách từ ảnh khác của job |
+| review | object | Số món đồ của job theo trạng thái duyệt: `pending`, `confirmed`, `rejected`, `duplicate` |
+| faceReference.source | enum hoặc null | Như ở `POST /v1/jobs` |
 
 **POST /v1/jobs/{jobId}/cancel** — người dùng chủ động hủy job đang chạy.
 
@@ -561,7 +576,11 @@ Public, gọi từ Mobile.
 |---|---|---|
 | status | enum | "cancelling" nếu còn ảnh xử lý dở, "cancelled" nếu dừng ngay được |
 
-**GET /v1/jobs/{jobId}/garments** — các món đồ AI tách được, để người dùng duyệt (giai đoạn E1). Gọi được khi job còn đang chạy.
+**GET /v1/jobs/{jobId}/garments** — các món đồ AI tách được, để người dùng duyệt (giai đoạn E1). Gọi được khi job còn đang chạy. Món trùng với món đã tách từ ảnh khác của cùng job (`duplicate`) không được liệt kê.
+
+| Input (query param) | Kiểu | Mô tả |
+|---|---|---|
+| includeEmbeddings | bool (tùy chọn) | Kèm `visualEmbedding`/`textEmbedding`, để Mobile so với wardrobe cục bộ |
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
@@ -571,10 +590,10 @@ Public, gọi từ Mobile.
 | garments[].imageUrl | string hoặc null | Ảnh món đồ (null khi đã bỏ) |
 | garments[].tags | object | Tag D3 đề xuất (cấu trúc như [3.3](#33-cấu-trúc-bản-tin-job-queue-và-result-queue)) |
 | garments[].description | string | Mô tả sinh từ tag |
-| garments[].wardrobeItemId | string (khi confirmed) | Id bản ghi trong wardrobe |
-| garments[].possibleDuplicate | object hoặc null (khi bật D2) | `{wardrobeItemId, score}` — gợi ý trùng với món đã có trong wardrobe; người dùng quyết định |
+| garments[].aiTags, tagsEdited | object, bool (khi confirmed) | Tag gốc của AI và cờ người dùng đã sửa tag |
+| garments[].duplicates | danh sách (khi có) | `{garmentId, localId, score}` — các bản trùng ở ảnh khác của job, đã ẩn |
 
-**POST /v1/jobs/{jobId}/garments/reject** — người dùng bỏ món đồ; ảnh bị xóa, không ghi database.
+**POST /v1/jobs/{jobId}/garments/reject** — người dùng bỏ món đồ; ảnh bị xóa.
 
 | Input | Kiểu | Mô tả |
 |---|---|---|
@@ -586,41 +605,24 @@ Public, gọi từ Mobile.
 | notFound | danh sách string | Id không thuộc job |
 | alreadyConfirmed | danh sách string | Món đã xác nhận, không bỏ được bằng endpoint này |
 
-**POST /v1/wardrobe/items** — người dùng xác nhận món đồ vào wardrobe. **Là đường duy nhất ghi wardrobe vào database.** Idempotent theo `garmentId`.
+**POST /v1/jobs/{jobId}/garments/confirm** — người dùng giữ các món đồ này. Server không có database: response mang đủ thứ để Mobile lưu món đó vào wardrobe trên máy. Idempotent theo `garmentId`.
 
 | Input | Kiểu | Mô tả |
 |---|---|---|
-| jobId | string | Job chứa các món đồ |
 | garments[].garmentId | string | Món được xác nhận |
 | garments[].tags | object (tùy chọn) | Tag người dùng đã sửa; trường không gửi giữ giá trị của AI |
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
-| items[] | danh sách | Món đã vào wardrobe: `id`, `garmentId`, `imageUrl`, `tags`, `jobId` |
-| errors[] | danh sách | `{garmentId, error}` cho món không xác nhận được |
-
-**GET /v1/wardrobe/items** — lấy danh sách item trang phục trong tủ đồ (giai đoạn E) — chỉ gồm món đã xác nhận.
-
-| Input (query param) | Kiểu | Mô tả |
-|---|---|---|
-| jobId | string (tùy chọn) | Chỉ lấy kết quả của một job cụ thể |
-| cursor | string (tùy chọn) | Con trỏ phân trang |
-| limit | số nguyên (tùy chọn) | Số item tối đa mỗi trang |
-
-| Output | Kiểu | Mô tả |
-|---|---|---|
-| items[].id | string | Id bản ghi wardrobe |
-| items[].imageUrl | string | Đường dẫn ảnh trang phục đã tách |
-| items[].tags | danh sách | Loại trang phục, kiểu tay áo, kiểu cổ áo, màu sắc, họa tiết... (đã qua người dùng duyệt) |
-| items[].jobId | string | Job sinh ra item này |
-| nextCursor | string (nếu còn dữ liệu) | Dùng cho lần gọi phân trang tiếp theo |
+| items[] | danh sách | Món đã xác nhận: `garmentId`, `localId`, `imageUrl` (Mobile tải về ngay — ảnh hết hạn cùng job), `tags` (tag cuối cùng), `aiTags`, `tagsEdited`, `description`, `visualEmbedding`, `textEmbedding` |
+| errors[] | danh sách | `{garmentId, error}` cho món không xác nhận được (`not found`, `already rejected`) |
 
 **GET /v1/health** — health-check nội bộ, không cần xác thực.
 
 | Output | Kiểu | Mô tả |
 |---|---|---|
 | status | enum | "ok" / "error" |
-| dependencies | object | Tình trạng kết nối postgres-db, object-storage, queue |
+| dependencies | object | Tình trạng kết nối object-storage, queue |
 
 ### 3.2 AI server API
 
@@ -645,6 +647,9 @@ data-server và ai-server không gọi thẳng nhau qua HTTP — toàn bộ trao
 | jobId | string | Job mà ảnh này thuộc về |
 | itemId | string | Id riêng của ảnh trong job |
 | objectKey | string | Đường dẫn ảnh gốc trên object-storage |
+| faceRefEmbedding | 512 số thực (tùy chọn) | Embedding khuôn mặt tham chiếu app gửi kèm job, đã chuẩn hoá L2 ([2.3.7](#237-khuôn-mặt-tham-chiếu-client-gửi-embedding-kèm-mỗi-job)) |
+| faceRefKey | string hoặc null | Ảnh khuôn mặt tham chiếu trên object-storage, khi job không có embedding |
+| retryCount | số nguyên | Số lần vé việc đã được thử lại |
 
 **Result queue (ai-server → data-server)**
 

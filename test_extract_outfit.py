@@ -94,7 +94,8 @@ ITEM_PHRASES = [
 ]
 
 
-def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None, save_isolated_to=None):
+def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=None, save_isolated_to=None,
+                      ref_embedding=None):
     """Presence check for every item category the outfit-extraction LoRA is unreliable
     at inferring from pixels alone: headwear, footwear, bag, outerwear, and whether the
     worn outfit is a single one-piece dress vs a separate top+bottom (the LoRA defaults
@@ -123,7 +124,7 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
     if that service isn't running."""
     try:
         payload = json.dumps({
-            "image_path": image_path, "selfie_path": selfie,
+            "image_path": image_path, "selfie_path": selfie, "ref_embedding": ref_embedding,
             "threshold": threshold, "face_match_threshold": face_threshold,
             "save_isolated_to": save_isolated_to,
         }).encode()
@@ -142,7 +143,7 @@ def detect_worn_items(image_path, selfie=None, threshold=None, face_threshold=No
         print("  (item_detector service unreachable, loading the detector in-process instead)")
         import outfit_items
         return outfit_items.detect_worn_items(
-            image_path, selfie_path=selfie,
+            image_path, selfie_path=selfie, ref_embedding=ref_embedding,
             threshold=threshold, face_match_threshold=face_threshold,
             save_isolated_to=save_isolated_to,
         )

@@ -3,7 +3,7 @@
 data-server and ai-server never call each other directly — this module is the
 only thing either side imports to talk to the other, via two lists plus a
 cancellation set (see the plan's "cancellation needs a channel ai-server is
-allowed to use" note for why cancellation rides on Redis rather than postgres).
+allowed to use" note for why cancellation rides on Redis).
 """
 import json
 
@@ -26,12 +26,16 @@ def redis_client() -> redis.Redis:
     return _client
 
 
-def push_job(job_id: str, item_id: str, object_key: str, face_ref_key: str = None, retry_count: int = 0):
-    redis_client().lpush(JOB_QUEUE, json.dumps({
-        "jobId": job_id, "itemId": item_id, "objectKey": object_key,
-        "faceRefKey": face_ref_key,
-        "retryCount": retry_count,
-    }))
+def push_job(job_id: str, item_id: str, object_key: str, face_ref_key: str = None, retry_count: int = 0,
+             face_ref_embedding: list[float] | None = None):
+    """face_ref_embedding: the user's face embedding the phone sent (server.common.face_ref),
+    which D0b matches against instead of the photo at face_ref_key. Carried by every ticket
+    of the job (~6KB) so ai-server needs nothing but the ticket, as before."""
+    ticket = {"jobId": job_id, "itemId": item_id, "objectKey": object_key,
+              "faceRefKey": face_ref_key, "retryCount": retry_count}
+    if face_ref_embedding:
+        ticket["faceRefEmbedding"] = face_ref_embedding
+    redis_client().lpush(JOB_QUEUE, json.dumps(ticket))
 
 
 def pop_job(timeout: int = 5):

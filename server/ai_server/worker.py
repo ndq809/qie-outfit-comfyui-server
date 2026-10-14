@@ -2,7 +2,7 @@
 in that order — D2 needs D3's embeddings, see §2.1's note on why D2 moved after
 D3). Pulls tickets from job_queue, reuses the existing D0b/D1/D3 reference
 pipeline in test_extract_outfit.py verbatim, does same-image D2 dedup, uploads
-crops, and reports back on result_queue. Never touches postgres (§2.3.3) —
+crops, and reports back on result_queue. Never calls data-server (§2.3.3) —
 cancellation is checked via the cancelled_jobs Redis set instead.
 
 This file is the serial path (settings.d1_engine == "comfyui": item_detector service +
@@ -27,11 +27,10 @@ import test_extract_outfit as pipeline  # noqa: E402
 
 from server.common import params, queue, report, storage  # noqa: E402
 from server.common.config import get_settings  # noqa: E402
-from server.common.embeddings import cosine_similarity  # noqa: E402
+from server.common.embeddings import same_garment_score  # noqa: E402
 
 log = logging.getLogger("ai-server.worker")
 
-SAME_IMAGE_DEDUP_THRESHOLD = 0.90
 
 # Once the queue has been empty this long, the worker hands its VRAM back: BiRefNet and
 # the magic_eye classifier are dropped here, and ComfyUI is asked to unload its ~31GB
@@ -91,6 +90,7 @@ def _release_gpu():
 def _handle_ticket(ticket: dict):
     job_id, item_id, object_key = ticket["jobId"], ticket["itemId"], ticket["objectKey"]
     face_ref_key = ticket.get("faceRefKey")
+    face_ref_embedding = ticket.get("faceRefEmbedding")
     retry_count = ticket.get("retryCount", 0)
 
     if queue.is_cancelled(job_id):
@@ -102,7 +102,8 @@ def _handle_ticket(ticket: dict):
     with tempfile.TemporaryDirectory(prefix="wardrobe_") as tmp:
         tmp_dir = Path(tmp)
         try:
-            garments = _process_image(job_id, item_id, object_key, face_ref_key, tmp_dir, settings)
+            garments = _process_image(job_id, item_id, object_key, face_ref_key, tmp_dir, settings,
+                                      face_ref_embedding)
             queue.push_result(job_id, item_id, "success", garments=garments)
             log.info("job %s item %s done: %d garment(s)", job_id, item_id, len(garments))
         except Exception as exc:
@@ -110,21 +111,22 @@ def _handle_ticket(ticket: dict):
             if retry_count < settings.max_job_retries:
                 log.info("requeueing job %s item %s (retry %d)", job_id, item_id, retry_count + 1)
                 queue.push_job(job_id, item_id, object_key, face_ref_key=face_ref_key,
-                               retry_count=retry_count + 1)
+                               retry_count=retry_count + 1, face_ref_embedding=face_ref_embedding)
             else:
                 queue.push_dead(ticket)
                 queue.push_result(job_id, item_id, "failed", error_reason=str(exc)[:500])
 
 
 def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str | None,
-                   tmp_dir: Path, settings) -> list[dict]:
+                   tmp_dir: Path, settings, face_ref_embedding: list[float] | None = None) -> list[dict]:
     ext = Path(object_key).suffix or ".jpg"
     raw_path = tmp_dir / f"input{ext}"
     storage.download_to(settings.minio_raw_bucket, object_key, raw_path)
 
     isolated_path = tmp_dir / "isolated.png"
     t0 = time.perf_counter()
-    detected = _detect_with_face_ref(raw_path, face_ref_key, isolated_path, tmp_dir, settings)
+    detected = _detect_with_face_ref(raw_path, face_ref_key, isolated_path, tmp_dir, settings,
+                                     face_ref_embedding)
     stages = [params.detect_stage(detected, raw_path, time.perf_counter() - t0)]
 
     items = pipeline.prompt_items(detected)
@@ -168,8 +170,7 @@ def _process_image(job_id: str, item_id: str, object_key: str, face_ref_key: str
     if settings.wardrobe_dedup_enabled:
         t0 = time.perf_counter()
         kept = _drop_same_image_duplicates(records) if records else []
-        stages.append(params.dedup_stage(records, kept, SAME_IMAGE_DEDUP_THRESHOLD,
-                                         settings.wardrobe_dedup_threshold,
+        stages.append(params.dedup_stage(records, kept,
                                          time.perf_counter() - t0))
     else:
         kept = list(records)
@@ -235,10 +236,11 @@ def _cached_face_ref(face_ref_key: str, settings) -> Path:
     never hit and the selfie was re-embedded per photo (measured ~0.15s each; that
     cache's own comment reports 216-391ms on other machines).
 
-    Named by ETag, not by key: face_object_key() is stable per account, so re-registering
-    a different selfie reuses the key and a key-named cache would keep serving the old
-    face forever. The ETag is the object's content hash, so new content is a new path and
-    both caches miss exactly when they should. The HEAD costs ~1ms against local MinIO."""
+    Named by ETag, not by key: the phone sends its face with every batch, each under a
+    key of its own (face_object_key), and it is usually the same selfie - so the same
+    content keeps one path and one ArcFace embedding across jobs, while a different face
+    is a new path and both caches miss exactly when they should. The HEAD costs ~1ms
+    against local MinIO."""
     head = storage.s3_client().head_object(Bucket=settings.minio_raw_bucket, Key=face_ref_key)
     etag = "".join(c for c in head["ETag"] if c.isalnum() or c == "-")
     dest = _FACE_REF_DIR / f"{etag}{Path(face_ref_key).suffix or '.jpg'}"
@@ -249,13 +251,21 @@ def _cached_face_ref(face_ref_key: str, settings) -> Path:
 
 
 def _detect_with_face_ref(raw_path: Path, face_ref_key: str | None, isolated_path: Path,
-                          tmp_dir: Path, settings) -> dict:
-    """D0b. The ticket carries only a key (wardrobe-system-spec.md §2.3.7) — where it
-    came from, a real registration or the test fixture, is data-server's business.
+                          tmp_dir: Path, settings, face_ref_embedding: list[float] | None = None) -> dict:
+    """D0b. The ticket carries the phone's face embedding or a key to a face photo
+    (wardrobe-system-spec.md §2.3.7) — where they came from is data-server's business.
 
     A reference that matches nobody in the photo is not a failure: the spec's fallback
     is "largest person in frame", which is exactly what the detector does with no
     reference at all, so retry that way rather than failing the ticket."""
+    if face_ref_embedding:
+        try:
+            return pipeline.detect_worn_items(str(raw_path), ref_embedding=face_ref_embedding,
+                                              save_isolated_to=str(isolated_path))
+        except Exception as exc:
+            log.info("no face matched the reference (%s); using largest person in frame", exc)
+        return pipeline.detect_worn_items(str(raw_path), save_isolated_to=str(isolated_path))
+
     selfie_path = None
     if face_ref_key:
         try:
@@ -280,8 +290,7 @@ def _drop_same_image_duplicates(records: list[dict]) -> list[dict]:
     here than let it into the database."""
     kept: list[dict] = []
     for record in records:
-        emb = record["visual_embedding"]
-        if any(cosine_similarity(emb, k["visual_embedding"]) >= SAME_IMAGE_DEDUP_THRESHOLD for k in kept):
+        if any(same_garment_score(record, k) is not None for k in kept):
             log.info("dropping same-image duplicate crop %s", record["image_name"])
             continue
         kept.append(record)

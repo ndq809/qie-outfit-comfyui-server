@@ -183,9 +183,9 @@ Jupyter sends `Content-Security-Policy: sandbox`, which puts the page in an opaq
 where no cookie is sent.
 
 The page is built by `server/common/report.py`: ai-server writes each photo's stages,
-and data-server adds, per crop, whether wardrobe-level D2 put it in the wardrobe or dropped
-it as a duplicate of an item already owned (with the similarity) — a dropped garment is
-never stored in postgres, so this is the only record of it.
+and data-server adds, per crop, what the user decided on the review screen (confirmed or
+rejected) — the server keeps no database, and a rejected crop is deleted, so this is the
+only record of it.
 
 Each photo gets a card showing **original → SAM-isolated subject → generated grid →
 per-item crops**, plus what the detector found, the face-match similarity, how many items
@@ -726,8 +726,19 @@ how fast: reusing the reference image's attention K/V across steps (-30% samplin
 steps instead of 4 (-25%) both turned a hooded jacket into a collared jacket or a blazer
 on both seeds of IMG_0912, where every exact variant kept the hood.
 
+**8 steps by default (`D1_STEPS`, since 2026-10-14).** The engine takes the Lightning
+4-step or 8-step LoRA (one ~13GB cache file each). Over 59 real photos x 3 seeds, judged
+by eye against the photo: grids with a garment the photo does not have, 7/177 at 4 steps
+(33, 216, 657 - trousers under a lone shirt, a second pair beside the asked one) and
+2/177 at 8 (216, which the grid check then redraws); the rest of what gets drawn is a
+wash (each variant gets a few colours/garments closer to the photo than the other).
+Sampling 3.4s instead of 1.7s: D1 took ~4.1s a photo in the server (job 7664af2a, 18
+photos) instead of ~2.1s, and D1 is what limits throughput.
+Garments the photo *does* have but D0b missed (98's shorts, 651's socks) come out at
+either step count - that is D0b's miss, not D1 inventing.
+
 **Server throughput** (`fast_pipeline.py`): D0b (on its own CUDA stream), D1 and D3 +
-uploads run on three threads; a 30-photo job takes **~2.4s per photo** after the first
+uploads run on three threads; a 30-photo job takes **~2.4s per photo** at 4 steps after the first
 (the old serial worker: ~11s per photo - D0b 3.0s via HTTP, D1 7.8s, D3 0.35s). At that
 point the GPU is the limit: D1's ~2.0s plus the ~0.4s of D0b/D3 kernels per photo. D0b's
 plumbing was sped up without changing a single score: one person-detector pass per image

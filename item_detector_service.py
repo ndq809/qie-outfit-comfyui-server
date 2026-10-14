@@ -82,6 +82,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = outfit_items.detect_worn_items(
                         body["image_path"],
                         selfie_path=body.get("selfie_path"),
+                        ref_embedding=body.get("ref_embedding"),
                         threshold=body.get("threshold"),
                         face_match_threshold=body.get("face_match_threshold"),
                         save_isolated_to=body.get("save_isolated_to"),

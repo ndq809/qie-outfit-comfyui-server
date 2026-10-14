@@ -12,13 +12,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
 
-    # postgres-db (data-server only; ai-server must never read these)
-    postgres_host: str = "127.0.0.1"
-    postgres_port: int = 5432
-    postgres_db: str = "wardrobe"
-    postgres_user: str = "wardrobe_app"
-    postgres_password: str = ""
-
     # object-storage (MinIO, S3-compatible)
     minio_endpoint: str = "127.0.0.1:9000"
     # Host:port Mobile reaches storage on. Presigned URLs are signed for this host
@@ -39,6 +32,11 @@ class Settings(BaseSettings):
     # data-server
     data_server_host: str = "127.0.0.1"
     data_server_port: int = 18080
+    # Bearer tokens the API accepts, "token:accountId" pairs separated by commas. There is
+    # no database: the account is only the namespace a token's batches and jobs live in
+    # (Redis keys, raw/<accountId>/ in storage), and the wardrobe itself is kept on the
+    # phone. Stands in for the login/session system the spec assumes upstream.
+    api_tokens: str = ""
 
     # ai-server
     ai_server_health_port: int = 18090
@@ -50,17 +48,21 @@ class Settings(BaseSettings):
     # Converted D1 weights (LoRAs merged, int8) are cached here: ~13GB, turns a ~25s
     # conversion at every start into a few seconds of reading.
     d1_cache_dir: str = "/workspace/.cache/d1_engine"
+    # Lightning LoRA of the "fast" engine: 4 or 8 sampling steps. Measured 2026-10-14 over
+    # 59 real photos x 3 seeds, garments the photo does not have drawn into the grid (by
+    # eye): 4 steps 7/177 grids (33, 216, 657 - trousers under a lone shirt, a second pair
+    # beside the asked one), 8 steps 2/177 (216 only, caught by the grid check), same
+    # garments otherwise, 3.8s a grid instead of 2.0s. One cache file per value (~13GB).
+    d1_steps: int = 8
     comfyui_url: str = "http://127.0.0.1:18188"
     item_detector_url: str = "http://127.0.0.1:18189"
 
     # pipeline tuning
-    # D2 (both the same-image and the wardrobe-level pass). Off by default: on the
-    # test box the wardrobe pass pulled every stored embedding of the account out of
-    # postgres per garment and compared them in the process serving the public API,
-    # which is what the report's "trùng" badges were paying for. Set true to turn it
-    # back on; the comparison itself is vectorised (server.common.embeddings).
+    # D2: same garment twice in one photo (ai-server drops the copy) and across the photos
+    # of one job (data-server marks it "duplicate", jobs._mark_job_duplicates). Matching
+    # against the wardrobe is the phone's job now that the wardrobe lives there - the
+    # confirm response hands it the embeddings, and server.common.embeddings has the rule.
     wardrobe_dedup_enabled: bool = False
-    wardrobe_dedup_threshold: float = 0.90
     max_job_retries: int = 3
 
     # How long a job, its per-photo results and its unreviewed garments are kept (Redis
@@ -78,8 +80,10 @@ class Settings(BaseSettings):
     # requires the original to be deleted once extraction is done.
     keep_raw_images: bool = False
 
-    # Test-only shared face reference (wardrobe-system-spec.md §2.3.7).
-    # MUST be empty in production.
+    # Test-only face reference for jobs that came without one (the phone sends the user's
+    # face embedding with each job - POST /v1/jobs "faceReference", server.common.face_ref).
+    # MUST be empty in production: a job without a face would be matched against a
+    # stranger instead of falling back to the largest person in frame.
     test_fixed_face_ref_image: str = ""
 
     # Test-only: keep every pipeline stage of each photo on disk (original, the
@@ -96,12 +100,14 @@ class Settings(BaseSettings):
     wardrobe_report_page_jobs: int = 5
 
     @property
-    def postgres_dsn(self) -> str:
-        return (
-            f"host={self.postgres_host} port={self.postgres_port} "
-            f"dbname={self.postgres_db} user={self.postgres_user} "
-            f"password={self.postgres_password}"
-        )
+    def api_token_accounts(self) -> dict:
+        """{token: accountId} from api_tokens."""
+        out = {}
+        for pair in self.api_tokens.split(","):
+            token, _, account = pair.strip().partition(":")
+            if token and account:
+                out[token] = account
+        return out
 
     @property
     def minio_url(self) -> str:

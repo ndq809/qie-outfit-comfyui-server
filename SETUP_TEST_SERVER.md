@@ -11,13 +11,12 @@
 
 ## Kết quả cuối cùng
 
-Trên **một** instance, 5 service chạy dưới supervisor (không dùng Docker — instance là
+Trên **một** instance, 4 service chạy dưới supervisor (không dùng Docker — instance là
 container không chạy được Docker lồng bên trong; mọi thành phần nói chuyện qua
 `127.0.0.1:port`, địa chỉ nằm trong `/workspace/.env`):
 
 | Service supervisor | Vai trò | Lắng nghe | Ra ngoài |
 |---|---|---|---|
-| `postgres` | database | 127.0.0.1:5432 | không |
 | `redis` | job/result queue | 127.0.0.1:6379 | không |
 | `minio` | object-storage | 127.0.0.1:9000 | có, qua Caddy, external port `10200` |
 | `ai-server` | worker D0b→D1→D3→D2 **trong cùng process** (`d1_engine`, int8 + SageAttention) | 127.0.0.1:18090 | không |
@@ -29,13 +28,17 @@ hình mặc định `D1_ENGINE=fast`: ComfyUI chỉ được dùng như thư vi�
 A/B), và khi đó để `autostart=false` — không bao giờ chạy ComfyUI có model nạp sẵn cạnh
 ai-server nhanh trên cùng một card (cả hai đều giữ transformer ~20 GB).
 
-Ảnh khuôn mặt tham chiếu cố định: `face-image/selfie.jpg`. Trang report từng bước xử lý:
-`wardrobe_report_test/`, phục vụ tại `/report/`.
+**Không có database.** Job và kết quả chờ duyệt nằm trong Redis (có hạn 7 ngày), tủ đồ nằm
+trên điện thoại (app lưu những món user xác nhận), bearer token khai trong `API_TOKENS` của
+`/workspace/.env`. Khuôn mặt tham chiếu: app gửi **embedding** (`w600k_mbf`, 512 chiều)
+kèm mỗi job; job nào không có thì dùng ảnh mặc định `face-image/selfie.jpg`
+(`TEST_FIXED_FACE_REF_IMAGE`). Trang report
+từng bước xử lý: `wardrobe_report_test/`, phục vụ tại `/report/`.
 
 ## Yêu cầu instance
 
 - Image vast.ai **PyTorch** (có `/venv/main`, supervisor, Caddy, `vast-capabilities`).
-  Ubuntu 24.04 (có sẵn gói `postgresql-16` qua apt).
+  Ubuntu 24.04.
 - GPU ≥ **40 GB** VRAM cho `D1_ENGINE=fast` (ai-server giữ ~33 GB: transformer int8
   12.7 GB + text encoder fp16 14.5 GB + VAE/D0b/D3). Đã chạy trên RTX 4090 48 GB. Card
   24 GB chỉ chạy được đường cũ `D1_ENGINE=comfyui`. Blackwell cần torch cu128+.
@@ -82,20 +85,19 @@ Nếu **không có** 10100/10200: chọn hai port khác có `in_use:false` và *
 export DATA_EXT=10100 STORAGE_EXT=10200     # đổi nếu phải chọn port khác
 ```
 
-## Bước 2 — Gói hệ thống (postgres, redis)
+## Bước 2 — Gói hệ thống (redis)
 
 ```bash
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq postgresql-16 postgresql-client-16 redis-server
-# apt tự tạo service systemd; supervisor sẽ quản lý thay, nên không để chúng chạy
-service postgresql stop 2>/dev/null || true
+apt-get install -y -qq redis-server
+# apt tự tạo service; supervisor sẽ quản lý thay, nên không để nó chạy
 service redis-server stop 2>/dev/null || true
-ls /usr/lib/postgresql/16/bin/postgres /etc/postgresql/16/main/postgresql.conf
+which redis-server redis-cli
 ```
 
-**Kỳ vọng:** hai đường dẫn cuối tồn tại. Dòng `invoke-rc.d: policy-rc.d denied execution`
-trong log là bình thường.
+**Kỳ vọng:** in ra hai đường dẫn. Dòng `invoke-rc.d: policy-rc.d denied execution` trong
+log là bình thường. Không cài postgres — server không dùng database.
 
 ## Bước 3 — MinIO: build từ mã nguồn (chạy nền, ~3 phút)
 
@@ -134,6 +136,7 @@ dl Comfy-Org/Qwen-Image-Edit_ComfyUI split_files/diffusion_models/qwen_image_edi
 dl Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors $CM/text_encoders
 dl Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors $CM/vae
 dl prithivMLmods/QIE-2511-Extract-Outfit QIE-2511-Extract-Outfit-4200.safetensors $CM/loras
+dl lightx2v/Qwen-Image-Edit-2511-Lightning Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors $CM/loras
 dl lightx2v/Qwen-Image-Edit-2511-Lightning Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors $CM/loras
 rm -rf /workspace/.hfdl
 echo MODELS_DONE
@@ -147,7 +150,7 @@ Không chờ — làm tiếp Bước 5. Kiểm tra ở Bước 9.
 ```bash
 source /venv/main/bin/activate
 cd /workspace/ComfyUI && uv pip install -r requirements.txt
-uv pip install fastapi "uvicorn[standard]" pydantic-settings boto3 redis psycopg2-binary \
+uv pip install fastapi "uvicorn[standard]" pydantic-settings boto3 redis \
     transformers scipy opencv-python-headless insightface timm einops
 # InsightFace (so khớp khuôn mặt ở D0b) chạy qua onnxruntime: bản `onnxruntime` thường
 # chỉ có CPU (đo được 2-6s/ảnh thay vì 0.2-0.4s). Bản GPU từ 1.23 trên PyPI build cho
@@ -158,7 +161,7 @@ uv pip install "onnxruntime-gpu==1.22.0"
 cd /workspace/qie-outfit-comfyui-server
 python -c "
 import torch; from transformers import SamModel, SamProcessor, AutoModelForObjectDetection, SiglipModel, AutoModelForImageSegmentation
-import insightface, onnxruntime, cv2, boto3, redis, psycopg2, fastapi
+import insightface, onnxruntime, cv2, boto3, redis, fastapi
 import detect_clothing_by_face as b
 print('imports ok, cuda =', torch.cuda.is_available())
 print('face providers =', {m.session.get_providers()[0] for m in b.load_face_app().models.values()})" 2>&1 | tail -2
@@ -239,26 +242,24 @@ nguyên bản dựng của image.
 
 ## Bước 6 — Tạo `/workspace/.env`
 
-Sinh mật khẩu ngẫu nhiên. `MINIO_ENDPOINT` **phải** là `localhost:9000` (không phải
+Sinh mật khẩu MinIO và bearer token test ngẫu nhiên. `API_TOKENS` là danh sách token API
+chấp nhận (`token:accountId`, phân cách bằng dấu phẩy) — thay cho bảng token trong database
+cũ; `TEST_BEARER_TOKEN`/`TEST_ACCOUNT_ID` là cùng giá trị đó, để script test và người tích
+hợp mobile đọc ra. `MINIO_ENDPOINT` **phải** là `localhost:9000` (không phải
 `127.0.0.1`) — Caddy ghi đè Host header thành đúng chuỗi đó, và chữ ký presigned URL
 được kiểm theo Host; sai là `403 SignatureDoesNotMatch`. Không dùng comment cuối dòng.
 
 ```bash
 python3 - <<'EOF'
-import os, secrets, pathlib
+import os, secrets, pathlib, uuid
 p = pathlib.Path("/workspace/.env")
-if p.exists() and "POSTGRES_PASSWORD=" in p.read_text() and "MINIO_ROOT_PASSWORD=" in p.read_text():
+if p.exists() and "API_TOKENS=" in p.read_text() and "MINIO_ROOT_PASSWORD=" in p.read_text():
     print("/workspace/.env đã có, giữ nguyên (xoá file nếu muốn tạo lại từ đầu)"); raise SystemExit
 storage_ext = os.environ.get("STORAGE_EXT", "10200")
 public_storage = f'{os.environ["PUBLIC_IPADDR"]}:{os.environ["VAST_TCP_PORT_" + storage_ext]}'
-pg, mu, mp = secrets.token_urlsafe(24), "wardrobe_minio", secrets.token_urlsafe(24)
+mu, mp = "wardrobe_minio", secrets.token_urlsafe(24)
+token, account = secrets.token_hex(24), str(uuid.uuid4())
 p.write_text(f"""# Live test config — KHÔNG commit. Template: .env.test.sample
-POSTGRES_HOST=127.0.0.1
-POSTGRES_PORT=5432
-POSTGRES_DB=wardrobe
-POSTGRES_USER=wardrobe_app
-POSTGRES_PASSWORD={pg}
-
 MINIO_ROOT_USER={mu}
 MINIO_ROOT_PASSWORD={mp}
 MINIO_ENDPOINT=localhost:9000
@@ -273,17 +274,18 @@ REDIS_PORT=6379
 
 DATA_SERVER_HOST=127.0.0.1
 DATA_SERVER_PORT=18080
+API_TOKENS={token}:{account}
 
 AI_SERVER_HEALTH_PORT=18090
 D1_ENGINE=fast
+D1_STEPS=8
 D1_CACHE_DIR=/workspace/.cache/d1_engine
 COMFYUI_URL=http://127.0.0.1:18188
 ITEM_DETECTOR_URL=http://127.0.0.1:18189
 OUTFIT_ITEMS_DEVICE=cuda
 MODEL_IDLE_UNLOAD_SECONDS=60
 
-WARDROBE_DEDUP_ENABLED=false
-WARDROBE_DEDUP_THRESHOLD=0.90
+WARDROBE_DEDUP_ENABLED=true
 MAX_JOB_RETRIES=3
 
 OMP_NUM_THREADS=8
@@ -298,9 +300,8 @@ WARDROBE_REPORT_DIR=/workspace/qie-outfit-comfyui-server/wardrobe_report_test
 WARDROBE_REPORT_MAX_JOBS=10
 WARDROBE_REPORT_PAGE_JOBS=5
 
-TEST_ACCOUNT_ID=
-TEST_USER_ID=
-TEST_BEARER_TOKEN=
+TEST_ACCOUNT_ID={account}
+TEST_BEARER_TOKEN={token}
 """)
 p.chmod(0o600)
 print("wrote /workspace/.env, MINIO_PUBLIC_ENDPOINT =", public_storage)
@@ -310,7 +311,9 @@ mkdir -p /workspace/qie-outfit-comfyui-server/wardrobe_report_test
 
 `COMFYUI_VRAM_ARGS` chỉ có tác dụng với `D1_ENGINE=comfyui` (trên card 48 GB đặt
 `"--reserve-vram 8"`, xem `scripts/comfyui.sh`). `D1_CACHE_DIR` giữ trọng số D1 đã chuyển
-đổi (~13 GB, tạo ở lần chạy đầu ~25s; các lần sau đọc trong ~4s).
+đổi (~13 GB cho mỗi giá trị `D1_STEPS`, tạo ở lần chạy đầu ~25s; các lần sau đọc trong ~4s).
+`D1_STEPS=8` (Lightning 8 bước) vẽ thừa món ít hơn hẳn bản 4 bước nhưng D1 mất ~4.1s/ảnh
+thay vì ~2.1s - số đo ở README "8 steps by default". Đặt `4` nếu cần tốc độ hơn.
 
 Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạt ảnh:
 
@@ -334,8 +337,13 @@ Giữ server nhẹ để SSH không bị lag/rớt khi mobile đẩy một loạ
   python -c "from pathlib import Path; from server.common import storage; from server.common.config import get_settings as g; storage.download_to(g().minio_raw_bucket, '<rawObjectKey>', Path('/tmp/raw.jpg'))"
   ```
   Thêm dòng này vào `.env` của instance cũ rồi `supervisorctl restart data-server ai-server`.
-- `WARDROBE_DEDUP_ENABLED=false`: tắt D2 (cả so trùng trong cùng ảnh lẫn so với tủ
-  đồ). Đặt `true` nếu cần.
+- `WARDROBE_DEDUP_ENABLED=true`: bật D2 - so trùng trong cùng ảnh và giữa các ảnh của cùng
+  một job (món trùng có `reviewStatus: "duplicate"`, không hiện ở danh sách duyệt, xem
+  `MOBILE_CLIENT_API.md` §6.1). So với tủ đồ là việc của app (tủ đồ nằm trên máy, §6.4).
+  Quy tắc so trùng: `server/common/embeddings.py` (`same_garment_score`).
+- `TEST_FIXED_FACE_REF_IMAGE`: khuôn mặt dùng cho job mà app **không** gửi embedding (hay
+  ảnh) khuôn mặt hợp lệ. App gửi thì cái của app thắng (`faceReference.source:
+  "embedding"` trong response tạo job). Production phải để trống.
 - Report chỉ lưu JPEG thu nhỏ của từng bước và trang `/report/` chỉ render khi có
   người mở (có cache), không còn rebuild sau mỗi ảnh.
 
@@ -346,54 +354,35 @@ Hai lưu ý bắt buộc:
 - Thư mục report phải **tồn tại trước khi** data-server khởi động, nếu không `/report`
   không được mount (chỉ ghi warning).
 
-## Bước 7 — Chạy postgres, redis, minio
+## Bước 7 — Chạy redis, minio
 
 ```bash
 tail -2 /tmp/build_minio.log          # phải thấy MINIO_BUILD_DONE; chưa có thì chờ
 /opt/minio/minio --version | head -1  # phải in "minio version ..."
 cd /workspace/qie-outfit-comfyui-server
-cp scripts/postgres.sh scripts/redis.sh scripts/minio.sh /opt/supervisor-scripts/
-chmod +x /opt/supervisor-scripts/{postgres,redis,minio}.sh
-cp scripts/postgres.conf scripts/redis.conf scripts/minio.conf /etc/supervisor/conf.d/
+cp scripts/redis.sh scripts/minio.sh /opt/supervisor-scripts/
+chmod +x /opt/supervisor-scripts/{redis,minio}.sh
+cp scripts/redis.conf scripts/minio.conf /etc/supervisor/conf.d/
 supervisorctl reread && supervisorctl update
 sleep 8
-pg_isready -h 127.0.0.1 -p 5432
 redis-cli -h 127.0.0.1 ping
 curl -s -o /dev/null -w "minio %{http_code}\n" http://127.0.0.1:9000/minio/health/live
 ```
 
-**Kỳ vọng:** `accepting connections`, `PONG`, `minio 200`.
+**Kỳ vọng:** `PONG`, `minio 200`.
 
-## Bước 8 — Database, bucket, account test
+## Bước 8 — Token test (không còn database)
+
+Không có bước tạo database hay seed account: bucket MinIO do data-server tự tạo lúc khởi
+động (Bước 10), token test đã sinh ở Bước 6. Chỉ kiểm tra:
 
 ```bash
-cd /workspace/qie-outfit-comfyui-server
-set -a; . /workspace/.env; set +a
-su -s /bin/bash postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='$POSTGRES_USER'\"" | grep -q 1 \
-  || su -s /bin/bash postgres -c "psql -c \"CREATE ROLE $POSTGRES_USER LOGIN PASSWORD '$POSTGRES_PASSWORD'\""
-su -s /bin/bash postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$POSTGRES_DB'\"" | grep -q 1 \
-  || su -s /bin/bash postgres -c "createdb -O $POSTGRES_USER $POSTGRES_DB"
-source /venv/main/bin/activate
-python -m server.data_server.scripts.init_db
-
-# Seed account test đúng MỘT lần (chạy lại sẽ tạo thêm account)
-if ! grep -q '^TEST_BEARER_TOKEN=.\+' /workspace/.env; then
-  python -m server.data_server.scripts.seed_test_account "mobile-test" | tee /tmp/seed.txt
-  python3 - <<'EOF'
-import re, pathlib
-seed = dict(re.findall(r"^(account_id|user_id|token):\s+(\S+)", pathlib.Path("/tmp/seed.txt").read_text(), re.M))
-p = pathlib.Path("/workspace/.env"); t = p.read_text()
-for k, v in (("TEST_ACCOUNT_ID", seed["account_id"]), ("TEST_USER_ID", seed["user_id"]), ("TEST_BEARER_TOKEN", seed["token"])):
-    t = re.sub(rf"^{k}=.*$", f"{k}={v}", t, flags=re.M)
-p.write_text(t); print("saved test identity to /workspace/.env")
-EOF
-  rm -f /tmp/seed.txt
-fi
+grep -c '^API_TOKENS=.\+' /workspace/.env
 grep -c '^TEST_BEARER_TOKEN=.\+' /workspace/.env
 ```
 
-**Kỳ vọng:** `schema applied ...`, `buckets ready: wardrobe-raw, wardrobe-items`, dòng
-cuối là `1`.
+**Kỳ vọng:** cả hai dòng in `1`. Thêm token cho account test khác:
+`python -m server.data_server.scripts.add_api_token` rồi `supervisorctl restart data-server`.
 
 ## Bước 9 — Đưa data-server và object-storage ra ngoài qua Caddy
 
@@ -420,8 +409,8 @@ tail -1 /tmp/models.log        # phải là MODELS_DONE; chưa có thì chờ (k
 ls -la /workspace/ComfyUI/models/{diffusion_models,text_encoders,vae,loras}/*.safetensors
 ```
 
-**Kỳ vọng:** 5 file: fp8mixed ~20.5 GB, qwen_2.5_vl ~9.4 GB, vae ~254 MB,
-Extract-Outfit ~236 MB, Lightning-4steps ~850 MB.
+**Kỳ vọng:** 6 file: fp8mixed ~20.5 GB, qwen_2.5_vl ~9.4 GB, vae ~254 MB,
+Extract-Outfit ~236 MB, Lightning-8steps ~850 MB, Lightning-4steps ~850 MB.
 
 ```bash
 cd /workspace/qie-outfit-comfyui-server
@@ -430,7 +419,7 @@ chmod +x /opt/supervisor-scripts/{data-server,ai-server}.sh
 cp scripts/data-server.conf scripts/ai-server.conf /etc/supervisor/conf.d/
 supervisorctl reread && supervisorctl update
 sleep 20
-supervisorctl status postgres redis minio data-server ai-server
+supervisorctl status redis minio data-server ai-server
 curl -s http://127.0.0.1:18080/v1/health; echo
 curl -s http://127.0.0.1:18090/health; echo
 grep -E "fixture|report mounted|result_consumer thread" /var/log/portal/data-server.log | tail -3
@@ -438,8 +427,8 @@ grep -E "pipelined worker starting" /var/log/portal/ai-server.log | tail -1
 ```
 
 **Kỳ vọng:**
-- 5 service `RUNNING`.
-- data-server: `{"status":"ok","dependencies":{"postgres":"ok","objectStorage":"ok","queue":"ok"}}`
+- 4 service `RUNNING`.
+- data-server: `{"status":"ok","dependencies":{"objectStorage":"ok","queue":"ok"}}`
 - ai-server: `{"status":"ok","activeWorkers":1,...}` và log có `pipelined worker starting`.
 - log data-server có đủ 3 dòng: `test face fixture uploaded`, `test extraction report mounted at /report`, `result_consumer thread started`.
 
@@ -464,16 +453,18 @@ container lên IP public của chính nó đi vòng qua NAT (hairpin) chỉ ~5 K
 ảnh 6 MB. Cờ này gửi cùng URL đã ký + cùng cookie tới cùng Caddy edge qua địa chỉ nội bộ.
 Client thật ở ngoài máy không cần.
 
-**Kỳ vọng** (10 ảnh: ~2.4s/ảnh sau khi model đã nạp, tức ~25s; cộng ~40s-2 phút nạp
+**Kỳ vọng** (10 ảnh: ~4-5s/ảnh sau khi model đã nạp, tức ~45s; cộng ~40s-2 phút nạp
 model nếu ai-server đang nguội):
-- `face-reference {'registered': True, ..., 'source': 'test-fixture'}`
-- `upload 10/10 ok`
+- `upload 10/10 ok`, `job {... 'faceReference': {'source': 'embedding'}}` — script gửi
+  embedding của `face-image/selfie.jpg` kèm job như app thật (`--face <file>` để đổi ảnh;
+  `--face-mode image` gửi ảnh khuôn mặt → `'image'`; `--face-mode none` → `'test-fixture'`)
 - `completed processed 10/10 failed 0`
 - `review N garment(s) waiting for the user` với N > 0, `review imageUrl GET 200`
-- `wardrobe before confirm: 0 item(s)` — luồng xử lý không ghi database
-- `reject {'rejected': [<1 id>], ...}`, `confirm N-1 added, errors []`,
-  `confirm again 1 returned (idempotent, same id: True)`
-- `wardrobe N-1 item(s)`, `imageUrl GET 200`, `job review {'pending': 0, 'confirmed': N-1, 'rejected': 1}`
+- `reject {'rejected': [<1 id>], ...}`,
+  `confirm N-1 returned, errors []; first: tagsEdited True, embeddings 768/768`,
+  `confirm again 1 returned (idempotent, same tags: True)`, `imageUrl GET 200`
+- `job review {'pending': 0, 'confirmed': N-1, 'rejected': 1, 'duplicate': D}` — D là số
+  món trùng giữa các ảnh, bị ẩn khỏi danh sách duyệt (đo được: N = 16, D = 4)
 
 Kiểm thử huỷ job (spec §2.3.6 bước 8):
 
@@ -500,10 +491,10 @@ EOF
 
 **Kỳ vọng:** `cancel -> {'status': 'cancelling'}`, rồi cuối cùng `cancelled N M` với
 N + M = 3 và M ≥ 1: ảnh đang ở giữa pipeline (đã qua bước kiểm tra huỷ trước D1) vẫn chạy
-xong, phần còn lại báo `failed`/"cancelled". Ảnh xử lý nhanh (~2.4s/ảnh), nên gửi lệnh huỷ
+xong, phần còn lại báo `failed`/"cancelled". Ảnh xử lý nhanh (~4-5s/ảnh), nên gửi lệnh huỷ
 ngay sau khi tạo job; nếu job đã `completed` trước khi lệnh huỷ tới, tăng số ảnh lên.
 
-Dọn job huỷ khỏi report (nó không ghi gì vào tủ đồ vì không ai xác nhận):
+Dọn job huỷ khỏi report:
 
 ```bash
 JID=<giá trị in ra ở dòng CANCEL_JOB>
@@ -557,7 +548,11 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 | PUT presigned `403 SignatureDoesNotMatch` | `MINIO_ENDPOINT` không phải `localhost:9000`; hoặc thêm `?token=` vào uploadUrl; hoặc `Content-Type` khác lúc presign | Sửa `.env` rồi `supervisorctl restart data-server ai-server`; edge token đi bằng Cookie `<VAST_CONTAINERLABEL>_auth_token` |
 | PUT file lớn treo/timeout, file vài byte thì 200 | Gọi IP public từ bên trong chính máy đó (NAT hairpin ~5 KB/s) | Dùng `--storage-host localhost:10200` khi test trên server |
 | `/report/` trả 404 | Thư mục `WARDROBE_REPORT_DIR` chưa tồn tại lúc data-server khởi động | `mkdir -p` thư mục rồi `supervisorctl restart data-server` |
-| `/v1/face-reference` trả `source: null` | `TEST_FIXED_FACE_REF_IMAGE` sai đường dẫn hoặc MinIO chưa chạy khi data-server khởi động | Kiểm tra file tồn tại, `supervisorctl restart data-server`, xem `/var/log/portal/data-server.log` |
+| Tạo job trả `faceReference.source: null` | App không gửi khuôn mặt **và** `TEST_FIXED_FACE_REF_IMAGE` sai đường dẫn, hoặc MinIO chưa chạy khi data-server khởi động | Kiểm tra file tồn tại, `supervisorctl restart data-server`, xem `/var/log/portal/data-server.log` |
+| App gửi embedding nhưng job báo `source: "test-fixture"` kèm `faceReference.warning` | Embedding bị từ chối: sai `model` (phải `w600k_mbf`), không đủ 512 số, toàn 0, NaN | Đọc `warning` trong response (cũng có trong log data-server: `job face embedding rejected`), sửa phía app |
+| Ảnh nhóm tách nhầm người dù gửi embedding | Embedding của app lệch embedding server (căn chỉnh ML Kit vs SCRFD), độ giống mặt xuống dưới 0.35 | Xem "độ giống khuôn mặt" trong report; đo theo cuối mục 3 `MOBILE_CLIENT_API.md` |
+| App gửi ảnh khuôn mặt nhưng job báo `source: "test-fixture"` | PUT ảnh khuôn mặt hỏng/chưa xong khi gọi `POST /v1/jobs` (server chốt khuôn mặt lúc tạo job) | PUT `faceReference.uploadUrl` trả 200 rồi mới tạo job |
+| `401 {"detail":"invalid token"}` | Token không có trong `API_TOKENS` của `.env`, hoặc sửa `.env` mà chưa restart | Thêm token (`add_api_token`), `supervisorctl restart data-server` |
 | Bước D3 báo file `.pt` là LFS pointer | Clone không có LFS | `git lfs install && git lfs pull`, restart ai-server |
 | Mọi ảnh grid trong report **đen**, `0 garment(s)` cho mọi ảnh | SageAttention build **không** có `scripts/sageattention-current-stream.patch` (kernel chạy sai stream, ra NaN) | Làm lại Bước 5a (áp patch, build lại), `supervisorctl restart ai-server` |
 | Log ai-server: `sageattention not installed - D1 falls back to PyTorch SDPA` | Chưa làm Bước 5a | Vẫn chạy đúng, chỉ chậm hơn ~0.7s/ảnh; làm Bước 5a để nhanh lại |
@@ -565,7 +560,7 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 | Job đứng ở `processing`, log ai-server có `ComfyUI rejected workflow` | Thiếu/sai tên file model | So tên file ở Bước 10 với bảng "Models required" trong README |
 | CUDA OOM ở ai-server hoặc ComfyUI | GPU < 24 GB dùng chung cho detector và ComfyUI | Đặt `OUTFIT_ITEMS_DEVICE=cpu` trong `.env`, restart `item_detector ai-server` (D0b chậm hơn ~4 lần) |
 | Ảnh đen / NaN | Có ai thêm `--use-sage-attention` vào ComfyUI | Bỏ cờ đó khỏi `scripts/comfyui.sh` |
-| Wardrobe ít item hơn số crop trong report | D2 loại món trùng với đồ đã có trong tủ (ngưỡng 0.90) — chỉ khi `WARDROBE_DEDUP_ENABLED=true` | Không phải lỗi — report ghi rõ "trùng đồ đã có trong tủ (sim …)" |
+| Wardrobe ít item hơn số crop trong report | D2 loại món trùng trong cùng ảnh, hoặc ẩn món đã có ở ảnh khác của cùng job (`review.duplicate` của job) — chỉ khi `WARDROBE_DEDUP_ENABLED=true` | Không phải lỗi — món trùng nằm ở `duplicates` của món đại diện trong `GET /v1/jobs/{jobId}/garments` |
 | D0b chậm (vài giây), "so khớp khuôn mặt" chiếm 2-6s trong report | InsightFace chạy trên CPU (`onnxruntime` bản CPU hoặc bản CUDA 13) | Làm lại phần onnxruntime ở Bước 5, `supervisorctl restart item_detector` |
 | SSH lag/rớt kết nối khi đang chạy job | Thread CPU không giới hạn, hoặc service ML chạy cùng độ ưu tiên với sshd | Kiểm tra `.env` có `OMP_NUM_THREADS`/`OMP_WAIT_POLICY` và script dùng `nice`; `supervisorctl restart comfyui item_detector ai-server` |
 | Log service | — | `tail -f /var/log/portal/<service>.log` |
@@ -575,5 +570,5 @@ Bàn giao cho người dùng: base URL, link report (nói họ tự thêm `OPEN_
 - Sửa code server: `supervisorctl restart ai-server data-server` (job đang chạy dở sẽ
   mất vé việc đang xử lý — chỉ restart khi queue rỗng: `redis-cli llen job_queue` = 0 và
   không có job `processing`).
-- Tạo thêm account test: `python -m server.data_server.scripts.seed_test_account "<tên>"`
-  (sau khi `set -a; . /workspace/.env; set +a`).
+- Tạo thêm account test: `python -m server.data_server.scripts.add_api_token` (thêm vào
+  `API_TOKENS` trong `/workspace/.env`), rồi `supervisorctl restart data-server`.

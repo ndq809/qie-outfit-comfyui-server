@@ -1,12 +1,14 @@
 """data-server — the only publicly-callable component (wardrobe-system-spec.md
-§3.1). Issues presigned upload URLs, creates jobs and pushes job-queue tickets, and
-(via result_consumer, a background thread) collects ai-server's results for the user
-to review. Job state and unreviewed results live in Redis (jobs.py); postgres only
-receives what the user confirms (POST /v1/wardrobe/items).
+§3.1). Issues presigned upload URLs, creates jobs (with the user's face embedding the
+phone sends, or a face photo) and pushes job-queue tickets, and (via result_consumer,
+a background thread) collects ai-server's results for the user to review.
+
+No database: job state and results live in Redis with a TTL (jobs.py), the wardrobe
+lives on the phone - confirming a garment hands it the image URL, tags and embeddings
+to keep - and API tokens come from API_TOKENS in the environment.
 """
 import logging
 import threading
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -16,10 +18,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from garment_description import build_description
-from server.common import queue, report, storage
+from server.common import face_ref, queue, report, storage
 from server.common.config import get_settings
-from server.common.embeddings import most_similar
-from server.data_server import db, jobs
+from server.data_server import jobs
 from server.data_server.result_consumer import run_result_consumer
 
 logging.basicConfig(level=logging.INFO)
@@ -79,16 +80,17 @@ def _startup():
 
 
 def _upload_test_face_fixture():
-    """wardrobe-system-spec.md §2.3.7. Uploaded rather than read from disk at job time
-    because the consumer is ai-server, which in production sits on another machine and
-    cannot see this filesystem. A missing file is a warning, not a crash — D0b then
-    falls back to the largest person in frame."""
+    """wardrobe-system-spec.md §2.3.7: the face used for a job whose batch came without
+    one. Uploaded rather than read from disk at job time because the consumer is
+    ai-server, which in production sits on another machine and cannot see this
+    filesystem. A missing file is a warning, not a crash — D0b then falls back to the
+    largest person in frame."""
     configured = get_settings().test_fixed_face_ref_image
     if not configured:
         return
     path = Path(configured)
     if not path.is_file():
-        log.warning("TEST_FIXED_FACE_REF_IMAGE=%s not found; no shared test face reference", configured)
+        log.warning("TEST_FIXED_FACE_REF_IMAGE=%s not found; no fallback face reference", configured)
         return
     storage.upload_file(get_settings().minio_raw_bucket, storage.TEST_FIXTURE_FACE_KEY,
                         path, content_type="image/jpeg")
@@ -104,11 +106,29 @@ def _test_fixture_face_key() -> Optional[str]:
     return storage.TEST_FIXTURE_FACE_KEY
 
 
-def _resolve_face_ref_key(account_id: str) -> Optional[str]:
-    """Account's own registration wins, then the shared test fixture, then nothing
-    (wardrobe-system-spec.md §2.3.7) — so configuring the fixture cannot change
-    production behaviour for an account that registered a face."""
-    return db.get_face_ref_key(account_id) or _test_fixture_face_key()
+def _job_face(account_id: str, batch_id: str, sent: Optional["FaceEmbedding"]) -> dict:
+    """What D0b matches the user against (wardrobe-system-spec.md §2.3.7), in this order:
+    the face embedding the phone sent with the job; the face photo it uploaded with the
+    batch; the shared test fixture; nothing - ai-server then takes the largest person in
+    frame. An embedding that fails validation (wrong model, size, NaN) is not an error: the
+    job falls back and the response carries the reason as a warning, so a bad client
+    build still gets its photos processed. A face slot that was presigned but never
+    uploaded counts as no photo, so a failed upload cannot point every photo at nothing.
+
+    Returns {"key", "embedding", "source", "warning"}; source is "embedding" / "image" /
+    "test-fixture" / None."""
+    warning = None
+    if sent is not None:
+        embedding, warning = face_ref.validate(sent.embedding, sent.model)
+        if embedding:
+            return {"key": None, "embedding": embedding, "source": "embedding", "warning": None}
+        log.warning("job face embedding rejected: %s", warning)
+    key = jobs.batch_face_ref_key(account_id, batch_id)
+    if key and storage.object_exists(get_settings().minio_raw_bucket, key):
+        return {"key": key, "embedding": None, "source": "image", "warning": warning}
+    fixture = _test_fixture_face_key()
+    return {"key": fixture, "embedding": None, "source": "test-fixture" if fixture else None,
+            "warning": warning}
 
 
 # --- auth -------------------------------------------------------------------
@@ -117,11 +137,10 @@ def current_account(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    identity = db.lookup_token(token)
-    if not identity:
+    account_id = get_settings().api_token_accounts.get(token)
+    if not account_id:
         raise HTTPException(status_code=401, detail="invalid token")
-    account_id, user_id = identity
-    return {"account_id": account_id, "user_id": user_id}
+    return {"account_id": account_id}
 
 
 # --- schemas ------------------------------------------------------------------
@@ -132,13 +151,29 @@ class PresignItem(BaseModel):
     checksum: Optional[str] = None
 
 
+class FaceReferenceSlot(BaseModel):
+    contentType: str = "image/jpeg"
+
+
 class PresignRequest(BaseModel):
     items: list[PresignItem]
+    # A face *photo* for D0b to pick the user out of group photos - for a client that
+    # cannot send the embedding with POST /v1/jobs, which is preferred (the photo then
+    # never leaves the phone). Without either the job uses TEST_FIXED_FACE_REF_IMAGE.
+    faceReference: Optional[FaceReferenceSlot] = None
+
+
+class FaceEmbedding(BaseModel):
+    # The user's face embedding as the phone computes it (§1.1 A4): 512 floats from
+    # InsightFace w600k_mbf. See server/common/face_ref.py.
+    embedding: list[float]
+    model: str
 
 
 class CreateJobRequest(BaseModel):
     batchId: str
     uploadedItems: list[str]
+    faceReference: Optional[FaceEmbedding] = None
 
 
 class ConfirmGarment(BaseModel):
@@ -149,7 +184,6 @@ class ConfirmGarment(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
-    jobId: str
     garments: list[ConfirmGarment]
 
 
@@ -157,23 +191,27 @@ class RejectRequest(BaseModel):
     garmentIds: list[str]
 
 
-class FaceRefPresignRequest(BaseModel):
-    contentType: str = "image/jpeg"
-
-
-class FaceRefRegisterRequest(BaseModel):
-    objectKey: str
-
-
 # --- routes -------------------------------------------------------------------
 
 @app.post("/v1/uploads/presign")
 def presign(req: PresignRequest, identity=Depends(current_account)):
     settings = get_settings()
-    batch_id = jobs.create_upload_batch(identity["account_id"], identity["user_id"])
+    account_id = identity["account_id"]
+    batch_id = jobs.new_batch_id()
+    face = None
+    if req.faceReference:
+        key = storage.face_object_key(account_id, batch_id, req.faceReference.contentType)
+        face = {
+            "objectKey": key,
+            "uploadUrl": storage.presign_put(settings.minio_raw_bucket, key,
+                                             req.faceReference.contentType,
+                                             settings.presign_expires_seconds),
+            "expiresAt": _expires_at(settings.presign_expires_seconds),
+        }
+    jobs.create_upload_batch(account_id, batch_id, face["objectKey"] if face else None)
     out_items, stored = [], []
     for item in req.items:
-        key = storage.raw_object_key(identity["account_id"], batch_id, item.localId, item.contentType)
+        key = storage.raw_object_key(account_id, batch_id, item.localId, item.contentType)
         stored.append({"localId": item.localId, "objectKey": key,
                        "contentType": item.contentType, "checksum": item.checksum})
         url = storage.presign_put(settings.minio_raw_bucket, key, item.contentType, settings.presign_expires_seconds)
@@ -185,41 +223,10 @@ def presign(req: PresignRequest, identity=Depends(current_account)):
         })
     if stored:
         jobs.add_batch_items(batch_id, stored)
-    return {"batchId": batch_id, "items": out_items}
-
-
-@app.post("/v1/face-reference/presign")
-def face_reference_presign(req: FaceRefPresignRequest, identity=Depends(current_account)):
-    settings = get_settings()
-    key = storage.face_object_key(identity["account_id"], req.contentType)
-    return {
-        "objectKey": key,
-        "uploadUrl": storage.presign_put(settings.minio_raw_bucket, key, req.contentType,
-                                         settings.presign_expires_seconds),
-        "expiresAt": _expires_at(settings.presign_expires_seconds),
-    }
-
-
-@app.put("/v1/face-reference")
-def face_reference_register(req: FaceRefRegisterRequest, identity=Depends(current_account)):
-    settings = get_settings()
-    expected = storage.face_object_key(identity["account_id"], "image/jpeg").rsplit(".", 1)[0]
-    if not req.objectKey.startswith(expected):
-        raise HTTPException(status_code=400, detail="objectKey does not belong to this account")
-    # Recorded only once the bytes are actually there, so a failed upload can't leave
-    # every later job pointing at an empty key.
-    if not storage.object_exists(settings.minio_raw_bucket, req.objectKey):
-        raise HTTPException(status_code=400, detail="no object uploaded at that objectKey")
-    db.set_face_ref_key(identity["account_id"], req.objectKey)
-    return {"registered": True, "objectKey": req.objectKey, "source": "account"}
-
-
-@app.get("/v1/face-reference")
-def face_reference_get(identity=Depends(current_account)):
-    own = db.get_face_ref_key(identity["account_id"])
-    key = own or _test_fixture_face_key()
-    source = "account" if own else ("test-fixture" if key else None)
-    return {"registered": key is not None, "objectKey": key, "source": source}
+    out = {"batchId": batch_id, "items": out_items}
+    if face:
+        out["faceReference"] = face
+    return out
 
 
 @app.post("/v1/jobs")
@@ -227,10 +234,13 @@ def create_job(req: CreateJobRequest, identity=Depends(current_account)):
     rows = jobs.get_batch_items(identity["account_id"], req.batchId, req.uploadedItems)
     if not rows:
         raise HTTPException(status_code=400, detail="no matching uploaded items for this batch")
-    job = jobs.create_job(identity["account_id"], identity["user_id"], req.batchId, rows)
-    face_ref_key = _resolve_face_ref_key(identity["account_id"])
+    face = _job_face(identity["account_id"], req.batchId, req.faceReference)
+    job = jobs.create_job(identity["account_id"], req.batchId, rows, face["key"], face["source"])
     for it in rows:
-        queue.push_job(job["jobId"], it["localId"], it["objectKey"], face_ref_key=face_ref_key)
+        queue.push_job(job["jobId"], it["localId"], it["objectKey"], face_ref_key=face["key"],
+                       face_ref_embedding=face["embedding"])
+    if face["warning"]:
+        job["faceReference"]["warning"] = face["warning"]
     return job
 
 
@@ -253,44 +263,51 @@ def cancel_job(job_id: str, identity=Depends(current_account)):
 
 
 @app.get("/v1/jobs/{job_id}/garments")
-def job_garments(job_id: str, identity=Depends(current_account)):
+def job_garments(job_id: str, includeEmbeddings: bool = Query(False),
+                 identity=Depends(current_account)):
     """What the user reviews: every garment extracted so far, with the AI's tags. Can be
-    called while the job is still running."""
+    called while the job is still running. includeEmbeddings: also return the D3
+    embeddings, for the phone to match garments against the wardrobe it keeps."""
     settings = get_settings()
     garments = jobs.list_garments(identity["account_id"], job_id)
     if garments is None:
         raise HTTPException(status_code=404, detail="job not found")
+    # D2 across the job's photos (jobs._mark_job_duplicates): the copies are not listed,
+    # the garment they copy says which other photos it was also extracted from.
+    copies = {}
+    for g in garments:
+        if g["reviewStatus"] == "duplicate":
+            copies.setdefault(g.get("duplicateOf"), []).append(
+                {"garmentId": g["garmentId"], "localId": g["localId"], "score": g.get("duplicateScore")})
     out = []
     for g in garments:
-        key = g["objectKey"]
-        if g["reviewStatus"] == "confirmed":
-            key = storage.wardrobe_object_key(identity["account_id"], g["wardrobeItemId"])
-        entry = {
-            "garmentId": g["garmentId"],
-            "localId": g["localId"],
-            "reviewStatus": g["reviewStatus"],
-            "imageUrl": (storage.presign_get(settings.minio_items_bucket, key,
-                                             settings.read_url_expires_seconds)
-                         if g["reviewStatus"] != "rejected" else None),
-            "tags": g["tags"],
-            "description": g["description"],
-        }
-        if g.get("wardrobeItemId"):
-            entry["wardrobeItemId"] = g["wardrobeItemId"]
-        if settings.wardrobe_dedup_enabled and g["reviewStatus"] == "pending":
-            entry["possibleDuplicate"] = _possible_duplicate(identity["account_id"], g, settings)
+        if g["reviewStatus"] == "duplicate":
+            continue
+        entry = _garment_out(g, settings, includeEmbeddings)
+        if g["garmentId"] in copies:
+            entry["duplicates"] = copies[g["garmentId"]]
         out.append(entry)
     return {"jobId": job_id, "garments": out}
 
 
-def _possible_duplicate(account_id: str, garment: dict, settings) -> Optional[dict]:
-    """D2 against the wardrobe, as a hint for the review screen rather than a silent drop:
-    the user decides whether it is really the same piece."""
-    candidates = db.wardrobe_candidates_for_dedup(account_id, (garment.get("tags") or {}).get("type"))
-    match_id, score = most_similar(garment["visualEmbedding"], candidates)
-    if match_id and score >= settings.wardrobe_dedup_threshold:
-        return {"wardrobeItemId": match_id, "score": round(score, 4)}
-    return None
+def _garment_out(g: dict, settings, embeddings: bool) -> dict:
+    entry = {
+        "garmentId": g["garmentId"],
+        "localId": g["localId"],
+        "reviewStatus": g["reviewStatus"],
+        "imageUrl": (storage.presign_get(settings.minio_items_bucket, g["objectKey"],
+                                         settings.read_url_expires_seconds)
+                     if g["reviewStatus"] != "rejected" else None),
+        "tags": g["tags"],
+        "description": g["description"],
+    }
+    if g["reviewStatus"] == "confirmed":
+        entry["aiTags"] = g.get("aiTags", g["tags"])
+        entry["tagsEdited"] = g.get("tagsEdited", False)
+    if embeddings:
+        entry["visualEmbedding"] = g["visualEmbedding"]
+        entry["textEmbedding"] = g["textEmbedding"]
+    return entry
 
 
 @app.post("/v1/jobs/{job_id}/garments/reject")
@@ -302,8 +319,8 @@ def reject_garments(job_id: str, req: RejectRequest, identity=Depends(current_ac
     rejected = []
     for gid, g in found.items():
         if g["reviewStatus"] == "confirmed":
-            continue  # already in the wardrobe - removing it is a different operation
-        if g["reviewStatus"] == "pending":
+            continue  # already handed to the phone's wardrobe - removing it is the app's call
+        if g["reviewStatus"] in ("pending", "duplicate"):
             storage.delete_object(settings.minio_items_bucket, g["objectKey"])
             jobs.set_review(job_id, gid, "rejected")
             _mark_report(job_id, g, {"added": False, "rejected": True}, settings)
@@ -313,17 +330,18 @@ def reject_garments(job_id: str, req: RejectRequest, identity=Depends(current_ac
             "alreadyConfirmed": [gid for gid, g in found.items() if g["reviewStatus"] == "confirmed"]}
 
 
-@app.post("/v1/wardrobe/items")
-def confirm_wardrobe_items(req: ConfirmRequest, identity=Depends(current_account)):
-    """The only way anything enters the wardrobe: the user confirmed these garments
-    (optionally with corrected tags) after reviewing the job's results. Idempotent per
-    garmentId, so a retried request does not create a second copy."""
+@app.post("/v1/jobs/{job_id}/garments/confirm")
+def confirm_garments(job_id: str, req: ConfirmRequest, identity=Depends(current_account)):
+    """The user keeps these garments (optionally with corrected tags). Nothing is stored
+    for them beyond the job: the response carries what the phone needs to put them in
+    the wardrobe it keeps - image URL (download it; the image expires with the job),
+    final tags, description and the D3 embeddings. Idempotent per garmentId; confirming
+    again with other tags re-applies them on top of the AI's."""
     settings = get_settings()
-    account_id = identity["account_id"]
-    found = jobs.get_garments(account_id, req.jobId, [g.garmentId for g in req.garments])
+    found = jobs.get_garments(identity["account_id"], job_id, [g.garmentId for g in req.garments])
     if found is None:
         raise HTTPException(status_code=404, detail="job not found")
-    created, errors = [], []
+    items, errors = [], []
     for ask in req.garments:
         g = found.get(ask.garmentId)
         if g is None:
@@ -332,38 +350,18 @@ def confirm_wardrobe_items(req: ConfirmRequest, identity=Depends(current_account
         if g["reviewStatus"] == "rejected":
             errors.append({"garmentId": ask.garmentId, "error": "already rejected"})
             continue
-        if g["reviewStatus"] == "confirmed":
-            existing = db.find_by_source_garment(account_id, ask.garmentId)
-            if existing:
-                created.append(_wardrobe_out(existing, settings, ask.garmentId))
-            continue
-
-        tags = {**g["tags"], **(ask.tags or {})}
-        edited = tags != g["tags"]
+        ai_tags = g.get("aiTags", g["tags"])
+        tags = {**ai_tags, **(ask.tags or {})} if ask.tags or g["reviewStatus"] != "confirmed" else g["tags"]
+        edited = tags != ai_tags
         description = _describe(tags) if edited else g["description"]
-        item_id = str(uuid.uuid4())
-        dest_key = storage.wardrobe_object_key(account_id, item_id)
-        try:
-            storage.move_object(settings.minio_items_bucket, g["objectKey"], dest_key)
-        except Exception:
-            log.exception("could not move %s into the wardrobe", g["objectKey"])
-            errors.append({"garmentId": ask.garmentId, "error": "image no longer available"})
-            continue
-        try:
-            db.insert_wardrobe_item(
-                item_id=item_id, account_id=account_id, user_id=g["_user_id"], job_id=req.jobId,
-                source_local_id=g["localId"], source_garment_id=ask.garmentId, object_key=dest_key,
-                tags=tags, ai_tags=g["tags"], tags_edited=edited, description=description,
-                visual_embedding=g["visualEmbedding"], text_embedding=g["textEmbedding"])
-        except Exception:
-            # Put the image back so a retry of this request finds it where it expects.
-            storage.move_object(settings.minio_items_bucket, dest_key, g["objectKey"])
-            raise
-        jobs.set_review(req.jobId, ask.garmentId, "confirmed", item_id)
-        _mark_report(req.jobId, g, {"added": True}, settings)
-        created.append(_wardrobe_out({"id": item_id, "object_key": dest_key, "tags": tags,
-                                      "job_id": req.jobId}, settings, ask.garmentId))
-    return {"items": created, "errors": errors}
+        if g["reviewStatus"] != "confirmed" or tags != g["tags"]:
+            updates = {"tags": tags, "aiTags": ai_tags, "tagsEdited": edited, "description": description}
+            jobs.set_review(job_id, ask.garmentId, "confirmed", updates)
+            if g["reviewStatus"] != "confirmed":
+                _mark_report(job_id, g, {"added": True}, settings)
+            g = {**g, **updates, "reviewStatus": "confirmed"}
+        items.append(_garment_out(g, settings, embeddings=True))
+    return {"items": items, "errors": errors}
 
 
 def _describe(tags: dict) -> str:
@@ -374,19 +372,6 @@ def _describe(tags: dict) -> str:
                                  tags.get("pattern") or [])
     except Exception:
         return ""
-
-
-def _wardrobe_out(row: dict, settings, garment_id: Optional[str] = None) -> dict:
-    out = {
-        "id": str(row["id"]),
-        "imageUrl": storage.presign_get(settings.minio_items_bucket, row["object_key"],
-                                        settings.read_url_expires_seconds),
-        "tags": row["tags"],
-        "jobId": str(row["job_id"]),
-    }
-    if garment_id:
-        out["garmentId"] = garment_id
-    return out
 
 
 def _mark_report(job_id: str, garment: dict, outcome: dict, settings):
@@ -400,21 +385,9 @@ def _mark_report(job_id: str, garment: dict, outcome: dict, settings):
         log.exception("could not update the extraction report for %s", job_id)
 
 
-@app.get("/v1/wardrobe/items")
-def wardrobe_items(jobId: Optional[str] = Query(None), cursor: Optional[str] = Query(None),
-                    limit: int = Query(50, ge=1, le=200), identity=Depends(current_account)):
-    settings = get_settings()
-    rows, next_cursor = db.list_wardrobe_items(identity["account_id"], jobId, cursor, limit)
-    out = {"items": [_wardrobe_out(r, settings) for r in rows]}
-    if next_cursor:
-        out["nextCursor"] = next_cursor
-    return out
-
-
 @app.get("/v1/health")
 def health():
     deps = {
-        "postgres": "ok" if db.ping() else "error",
         "objectStorage": "ok" if _minio_ok() else "error",
         "queue": "ok" if queue.ping() else "error",
     }

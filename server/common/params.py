@@ -112,11 +112,15 @@ def generate_stage_engine(settings: dict, used_isolated: bool, grid_size, second
     note = None
     if retry:
         params["món không được xin trên grid"] = retry["unasked"]
-        params["sinh lại với seed"] = retry["seed"]
-        note = (f"D1 vẽ thêm món prompt không xin ({', '.join(retry['unasked'])}) nên đã sinh lại với "
-                f"seed {retry['seed']}: " + ("dùng grid mới" + (f" (vẫn còn {', '.join(retry['unasked_after'])})"
-                                                                if retry["unasked_after"] else " (sạch)")
-                                             if retry["kept_new"] else "grid mới không tốt hơn, giữ grid đầu"))
+        params["sinh lại với seed"] = ", ".join(
+            f"{r['seed']} ({', '.join(r['unasked']) or 'sạch'})" for r in retry["tried"])
+        params["seed của grid được dùng"] = retry["kept_seed"]
+        kept = (f"dùng grid seed {retry['kept_seed']}" if retry["kept_seed"] != params.get("seed")
+                else "không seed nào tốt hơn, giữ grid đầu")
+        if retry["unasked_after"]:
+            kept += f" (vẫn còn {', '.join(retry['unasked_after'])})"
+        note = (f"D1 vẽ thêm món prompt không xin ({', '.join(retry['unasked'])}) nên đã sinh lại: "
+                + kept)
     return _stage("d1", "D1 · Sinh ảnh grid trang phục (d1_engine)", seconds,
                   dict(settings.get("models") or {}), params, note,
                   timing=_with_overhead(timing, seconds, "khác"))
@@ -169,21 +173,21 @@ def classify_stage(records: list, seconds: float, timing: dict | None = None) ->
                   timing=_with_overhead(named, seconds, "đọc ảnh + tiền xử lý"))
 
 
-def dedup_stage(records: list, kept: list, same_image_threshold: float,
-                wardrobe_threshold: float, seconds: float | None = None) -> dict:
-    """D2 — the two dedup passes. `seconds` covers only the same-image one; the
-    wardrobe-level pass runs in data-server, and its outcome per crop shows on the
-    crop itself."""
+def dedup_stage(records: list, kept: list, seconds: float | None = None) -> dict:
+    """D2 — the dedup passes. `seconds` covers only the same-image one; the cross-photo
+    pass runs in data-server when the result arrives (jobs._mark_job_duplicates)."""
+    from server.common.embeddings import SAME_GARMENT_MEAN_MIN, SAME_GARMENT_VISUAL_MIN
     params = {
-        "so khớp bằng": "cosine similarity trên visual embedding của D3b",
-        "ngưỡng trùng trong cùng ảnh": same_image_threshold,
-        "ngưỡng trùng với đồ đã có trong tủ": wardrobe_threshold,
+        "so khớp bằng": "visual + text embedding của D3b, chung một màu trong 2 màu đầu",
+        "ngưỡng trùng (trong ảnh, giữa các ảnh của job)":
+            f"visual ≥ {SAME_GARMENT_VISUAL_MIN}, trung bình visual/text ≥ {SAME_GARMENT_MEAN_MIN}",
         "loại vì trùng trong cùng ảnh": len(records) - len(kept),
         "gửi sang data-server": len(kept),
     }
     return _stage("d2", "D2 · Loại trang phục trùng", seconds, {}, params,
-                  "Thời gian trên chỉ tính vòng so trong cùng ảnh. Vòng so với tủ đồ chạy ở "
-                  "data-server sau khi nhận kết quả — kết quả từng món hiện ngay dưới ảnh crop.")
+                  "Thời gian trên chỉ tính vòng so trong cùng ảnh. Vòng so giữa các ảnh của "
+                  "job chạy ở data-server khi nhận kết quả; so với tủ đồ là việc của app "
+                  "(tủ đồ nằm trên điện thoại).")
 
 
 def _stage(key, title, seconds, models, params, note=None, timing=None) -> dict:

@@ -53,6 +53,8 @@ from server.common.config import get_settings
 log = logging.getLogger("ai-server.pipeline")
 
 D1_SEED = 42
+# More seeds _regenerate_if_unasked may try when the first grid has an unasked item.
+REGEN_SEEDS = 2
 
 
 class _NullCtx:
@@ -71,6 +73,7 @@ class _Work:
         self.job_id, self.item_id = ticket["jobId"], ticket["itemId"]
         self.object_key = ticket["objectKey"]
         self.face_ref_key = ticket.get("faceRefKey")
+        self.face_ref_embedding = ticket.get("faceRefEmbedding")
         self.retry_count = ticket.get("retryCount", 0)
         self.tmp = Path(tempfile.mkdtemp(prefix="wardrobe_"))
         self.raw_path = self.tmp / f"input{Path(self.object_key).suffix or '.jpg'}"
@@ -124,7 +127,7 @@ class Pipeline:
             if w.retry_count < settings.max_job_retries:
                 log.info("requeueing job %s item %s (retry %d)", w.job_id, w.item_id, w.retry_count + 1)
                 queue.push_job(w.job_id, w.item_id, w.object_key, face_ref_key=w.face_ref_key,
-                               retry_count=w.retry_count + 1)
+                               retry_count=w.retry_count + 1, face_ref_embedding=w.face_ref_embedding)
             else:
                 queue.push_dead(w.ticket)
                 queue.push_result(w.job_id, w.item_id, "failed", error_reason=str(exc)[:500])
@@ -176,7 +179,8 @@ class Pipeline:
             if self._engine is None:
                 from d1_engine import D1Engine
                 t = time.time()
-                self._engine = D1Engine(cache_dir=get_settings().d1_cache_dir or None)
+                settings = get_settings()
+                self._engine = D1Engine(steps=settings.d1_steps, cache_dir=settings.d1_cache_dir or None)
                 self._engine.warm_up()
                 log.info("D1 engine loaded in %.1fs", time.time() - t)
             return self._engine
@@ -234,7 +238,7 @@ class Pipeline:
         # the GPU with D1, D0b's short kernels each queued behind D1's and it took ~3x longer.
         from d1_engine import gate
         with gate.hold():
-            detected = self._detect(image, w.face_ref_key, settings)
+            detected = self._detect(image, w.face_ref_key, w.face_ref_embedding, settings)
         isolated = detected.pop("isolated_image", None)
         w.detected = detected
         w.stages = [params.detect_stage(detected, w.raw_path, time.perf_counter() - t0)]
@@ -264,10 +268,18 @@ class Pipeline:
             return gpu_image.GpuImage.open(path, "cuda")
         return Image.open(path).convert("RGB")
 
-    def _detect(self, image, face_ref_key, settings):
+    def _detect(self, image, face_ref_key, face_ref_embedding, settings):
         """D0b in-process; same fallback as before: a reference that matches nobody (or
-        cannot be fetched) means "largest person in frame"."""
+        cannot be fetched) means "largest person in frame". The phone's face embedding,
+        when the ticket has one, is the reference and no photo is fetched."""
         import outfit_items
+        if face_ref_embedding:
+            try:
+                return outfit_items.detect_worn_items(image, ref_embedding=face_ref_embedding,
+                                                      return_isolated="gpu")
+            except Exception as exc:
+                log.info("no face matched the reference (%s); using largest person in frame", exc)
+            return outfit_items.detect_worn_items(image, return_isolated="gpu")
         selfie = None
         if face_ref_key:
             try:
@@ -304,9 +316,10 @@ class Pipeline:
     def _regenerate_if_unasked(self, w, eng, timing):
         """D1 sometimes draws an item the prompt did not ask for (photo 33, job cc8cfc49: a
         pair of trousers under the only garment asked for, from a bag at the bottom of the
-        isolated photo). When the garment detector sees one on the grid, generate once more
-        with the next seed and keep whichever grid has fewer unasked items. ~20ms a photo for
-        the check; the second generation only when it fires (1 grid in 275 measured)."""
+        isolated photo). When the garment detector sees one on the grid, generate again
+        with the next seeds (up to REGEN_SEEDS more) until one comes out clean, and keep
+        whichever grid has the fewest unasked items. ~20ms a photo for the check; another
+        generation only when it fires (216 of job a10ca1c9: seed 42 drew shorts, 43 clean)."""
         import outfit_items
         t = time.perf_counter()
         extra = outfit_items.unasked_items_on_grid(w.grid, w.detected)
@@ -314,16 +327,20 @@ class Pipeline:
         if not extra:
             return None
         t = time.perf_counter()
-        seed = D1_SEED + 1
-        grid = eng.generate(w.d1_input, w.prompt, seed=seed, prescaled=True)
-        extra2 = outfit_items.unasked_items_on_grid(grid, w.detected)
+        best, best_extra, best_seed, tried = w.grid, extra, D1_SEED, []
+        for seed in range(D1_SEED + 1, D1_SEED + 1 + REGEN_SEEDS):
+            grid = eng.generate(w.d1_input, w.prompt, seed=seed, prescaled=True)
+            found = outfit_items.unasked_items_on_grid(grid, w.detected)
+            tried.append({"seed": seed, "unasked": found})
+            if len(found) < len(best_extra):
+                best, best_extra, best_seed = grid, found, seed
+            if not found:
+                break
         timing["sinh lại (seed khác)"] = round(time.perf_counter() - t, 3)
-        kept = len(extra2) < len(extra)
-        if kept:
-            w.grid = grid
-        log.info("job %s item %s: D1 drew unasked %s; seed %d gave %s -> kept %s", w.job_id,
-                 w.item_id, extra, seed, extra2 or "nothing unasked", "the new grid" if kept else "the first")
-        return {"unasked": extra, "seed": seed, "unasked_after": extra2, "kept_new": kept}
+        w.grid = best
+        log.info("job %s item %s: D1 drew unasked %s; retries %s -> kept seed %d", w.job_id,
+                 w.item_id, extra, tried, best_seed)
+        return {"unasked": extra, "tried": tried, "kept_seed": best_seed, "unasked_after": best_extra}
 
     def _post_one(self, w):
         """post: D3a/D3b, same-image D2, uploads, report, result."""
@@ -354,8 +371,7 @@ class Pipeline:
         if settings.wardrobe_dedup_enabled:
             t0 = time.perf_counter()
             kept = W._drop_same_image_duplicates(records) if records else []
-            w.stages.append(params.dedup_stage(records, kept, W.SAME_IMAGE_DEDUP_THRESHOLD,
-                                               settings.wardrobe_dedup_threshold,
+            w.stages.append(params.dedup_stage(records, kept,
                                                time.perf_counter() - t0))
         else:
             kept = list(records)

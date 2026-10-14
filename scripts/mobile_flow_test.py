@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Drives the public data-server API exactly as the mobile app does (MOBILE_CLIENT_API.md):
-presign -> PUT to object-storage (4 in parallel) -> create job -> poll -> review the
-extracted garments (reject the last one, confirm the rest, correcting one tag on the first)
--> wardrobe items.
+presign -> PUT to object-storage (4 in parallel) -> create job with the user's face embedding
+-> poll -> review the extracted garments (reject the last one, confirm the rest,
+correcting one tag on the first, confirm one again to check idempotency).
 
 Goes through the public vast.ai edge, so it also proves the two-token scheme works from
 outside. Reads BASE/tokens from the instance environment unless given explicitly.
 
-Usage: python scripts/mobile_flow_test.py [--base URL] [--storage-host HOST:PORT] <image dir or files>
+Usage: python scripts/mobile_flow_test.py [--base URL] [--storage-host HOST:PORT]
+                                         [--face FILE] [--face-mode embedding|image|none]
+                                         <image dir or files>
+
+--face-mode embedding (default) sends the face's w600k_mbf embedding with POST /v1/jobs,
+as the app does; it is computed here with the server's own face pipeline, so it does not
+show how the phone's (ML Kit-aligned) embedding compares. image uploads the face photo
+with the batch instead; none sends no face (the job uses TEST_FIXED_FACE_REF_IMAGE).
 """
 import argparse
 import json
@@ -28,6 +35,13 @@ def env_file(key):
         if line.startswith(key + "="):
             return line.split("=", 1)[1].strip()
     return ""
+
+
+def face_embedding(path: Path) -> list[float]:
+    """The face's w600k_mbf embedding, as the app computes it at registration (§1.1 A4)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import detect_clothing_by_face as byface
+    return [float(x) for x in byface.find_reference_embedding(byface.load_face_app(), path)]
 
 
 def local_id(path: Path) -> str:
@@ -68,7 +82,10 @@ def main():
     # Point the PUTs at the same Caddy edge locally instead; signature and cookie are unchanged.
     ap.add_argument("--storage-host", help="e.g. localhost:10200 when running on the server itself")
     ap.add_argument("--poll", type=int, default=10)
-    ap.add_argument("--out", help="write the final job + wardrobe JSON here")
+    ap.add_argument("--out", help="write the final job + confirmed garments JSON here")
+    ap.add_argument("--face", default=str(Path(__file__).resolve().parent.parent / "face-image" / "selfie.jpg"),
+                    help="the user's face photo (default: face-image/selfie.jpg)")
+    ap.add_argument("--face-mode", choices=("embedding", "image", "none"), default="embedding")
     args = ap.parse_args()
 
     files = []
@@ -82,13 +99,17 @@ def main():
 
     c.storage_host = args.storage_host
     print("health        ", c.call("GET", "/v1/health"))
-    print("face-reference", c.call("GET", "/v1/face-reference"))
 
     by_id = {local_id(f): f for f in files}
     ctype = {i: (mimetypes.guess_type(f.name)[0] or "image/jpeg") for i, f in by_id.items()}
-    pre = c.call("POST", "/v1/uploads/presign",
-                 {"items": [{"localId": i, "contentType": ctype[i]} for i in by_id]})
-    print(f"presign        batch {pre['batchId']}, {len(pre['items'])} url(s)")
+    body = {"items": [{"localId": i, "contentType": ctype[i]} for i in by_id]}
+    if args.face_mode == "image":
+        body["faceReference"] = {"contentType": "image/jpeg"}
+    pre = c.call("POST", "/v1/uploads/presign", body)
+    print(f"presign        batch {pre['batchId']}, {len(pre['items'])} url(s)"
+          f"{', face slot' if pre.get('faceReference') else ''}")
+    if pre.get("faceReference"):
+        print("  PUT face      ", c.put(pre["faceReference"]["uploadUrl"], Path(args.face), "image/jpeg"))
 
     def upload(it):
         try:
@@ -106,7 +127,10 @@ def main():
     if not ok:
         sys.exit("nothing uploaded")
 
-    job = c.call("POST", "/v1/jobs", {"batchId": pre["batchId"], "uploadedItems": ok})
+    body = {"batchId": pre["batchId"], "uploadedItems": ok}
+    if args.face_mode == "embedding":
+        body["faceReference"] = {"embedding": face_embedding(Path(args.face)), "model": "w600k_mbf"}
+    job = c.call("POST", "/v1/jobs", body)
     jid = job["jobId"]
     print("job           ", job)
 
@@ -120,6 +144,7 @@ def main():
         time.sleep(args.poll)
 
     review = c.call("GET", f"/v1/jobs/{jid}/garments")["garments"]
+    print("job faceReference", st.get("faceReference"))
     print(f"review         {len(review)} garment(s) waiting for the user")
     for g in review:
         t = g["tags"]
@@ -131,32 +156,31 @@ def main():
             if c.storage_host else review[0]["imageUrl"], headers={"Cookie": c.cookie})).status
         print(f"review imageUrl GET {code}")
 
-    before = len(c.call("GET", f"/v1/wardrobe/items?jobId={jid}&limit=200")["items"])
-    print(f"wardrobe before confirm: {before} item(s)")
     rejected = review[-1:] if len(review) > 1 else []
     to_confirm = review[:len(review) - len(rejected)]
     if rejected:
         print("reject        ", c.call("POST", f"/v1/jobs/{jid}/garments/reject",
                                        {"garmentIds": [g["garmentId"] for g in rejected]}))
+    confirmed = []
     if to_confirm:
         body = [{"garmentId": g["garmentId"]} for g in to_confirm]
         body[0]["tags"] = {"gender": "women" if to_confirm[0]["tags"].get("gender") == "men" else "men"}
-        res = c.call("POST", "/v1/wardrobe/items", {"jobId": jid, "garments": body})
-        print(f"confirm        {len(res['items'])} added, errors {res['errors']}")
-        again = c.call("POST", "/v1/wardrobe/items", {"jobId": jid, "garments": body[:1]})
-        print(f"confirm again  {len(again['items'])} returned (idempotent, same id: "
-              f"{again['items'][0]['id'] == res['items'][0]['id']})")
-
-    wardrobe = c.call("GET", f"/v1/wardrobe/items?jobId={jid}&limit=200")
-    print(f"wardrobe       {len(wardrobe['items'])} item(s)")
-    if wardrobe["items"]:
+        res = c.call("POST", f"/v1/jobs/{jid}/garments/confirm", {"garments": body})
+        confirmed = res["items"]
+        first = confirmed[0]
+        print(f"confirm        {len(confirmed)} returned, errors {res['errors']}; first: "
+              f"tagsEdited {first['tagsEdited']}, embeddings {len(first['visualEmbedding'])}/"
+              f"{len(first['textEmbedding'])}")
+        again = c.call("POST", f"/v1/jobs/{jid}/garments/confirm", {"garments": [{"garmentId": first["garmentId"]}]})
+        print(f"confirm again  {len(again['items'])} returned (idempotent, same tags: "
+              f"{again['items'][0]['tags'] == first['tags']})")
         code = urllib.request.urlopen(urllib.request.Request(
-            re.sub(r"^http://[^/]+", f"http://{c.storage_host}", wardrobe["items"][0]["imageUrl"])
-            if c.storage_host else wardrobe["items"][0]["imageUrl"], headers={"Cookie": c.cookie})).status
+            re.sub(r"^http://[^/]+", f"http://{c.storage_host}", first["imageUrl"])
+            if c.storage_host else first["imageUrl"], headers={"Cookie": c.cookie})).status
         print(f"imageUrl GET   {code}")
     print("job review    ", c.call("GET", f"/v1/jobs/{jid}")["review"])
     if args.out:
-        Path(args.out).write_text(json.dumps({"job": st, "wardrobe": wardrobe}, indent=1))
+        Path(args.out).write_text(json.dumps({"job": st, "confirmed": confirmed}, indent=1))
 
 
 if __name__ == "__main__":

@@ -102,8 +102,9 @@ def save_stages(report_dir: str, job_id: str, item_id: str, *, original: Path,
 
 
 def mark_review(report_dir: str, job_id: str, item_id: str, object_key: str, outcome: dict):
-    """Record the user's decision on one garment. A rejected garment is never stored in
-    postgres, so this is the only place the page can learn why it is missing."""
+    """Record the user's decision on one garment. A rejected garment is deleted from storage
+    and the job's record expires, so this is the only place the page can learn why it is
+    missing."""
     out = Path(report_dir) / job_id / _safe(item_id)
     if not out.is_dir():
         return

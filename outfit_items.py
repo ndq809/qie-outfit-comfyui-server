@@ -49,6 +49,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -464,12 +465,16 @@ def _subject_mask(sam_model, sam_processor, image, target_box, item_boxes,
 
 
 def detect_worn_items(image_path, selfie_path=None, threshold=None,
-                      face_match_threshold=None, save_isolated_to=None, return_isolated=False):
+                      face_match_threshold=None, save_isolated_to=None, return_isolated=False,
+                      ref_embedding=None):
     """Return the item flags build_prompt() needs, plus the raw per-label scores.
 
     selfie_path: optional reference photo of the person whose outfit should be
         extracted. Only needed when the input holds several people and the
         subject isn't the biggest one in frame.
+    ref_embedding: that person's face embedding instead of a photo (512 floats,
+        L2-normalised, from the same w600k_mbf model - the phone sends it, see
+        server/common/face_ref.py). Wins over selfie_path when both are given.
     threshold: detector confidence floor (default THRESHOLD).
     face_match_threshold: minimum ArcFace cosine similarity for the selfie match
         (default FACE_MATCH_THRESHOLD). Below it no face is accepted as the
@@ -534,14 +539,17 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
     target_box, face_similarity, face_box = None, None, None
     other_faces = []
     subject_box_from_face = False
-    if selfie_path:
+    if selfie_path or ref_embedding is not None:
         t = time.time()
         face_app = _load_face_app()
         timing["face_load"] = time.time() - t
         t = time.time()
-        # Cached per selfie file inside find_reference_embedding, so this is only
-        # paid once per worker process rather than once per image.
-        ref_embedding = byface.find_reference_embedding(face_app, Path(selfie_path))
+        if ref_embedding is not None:
+            ref_embedding = np.asarray(ref_embedding, dtype=np.float32)
+        else:
+            # Cached per selfie file inside find_reference_embedding, so this is only
+            # paid once per worker process rather than once per image.
+            ref_embedding = byface.find_reference_embedding(face_app, Path(selfie_path))
         timing["face_ref_embed"] = time.time() - t
         t = time.time()
         face, face_similarity, all_faces = byface.match_face_in_group(
@@ -684,6 +692,14 @@ def detect_worn_items(image_path, selfie_path=None, threshold=None,
 # của 0912). Không bắt được quần nhỏ gấp gọn, nhưng loại đó chỉ xuất hiện khi prompt có chữ
 # "pants" (xem build_prompt).
 GRID_UNASKED_MIN = 0.5
+# Riêng quần: đo lại 2026-10-14 trên 354 grid (59 ảnh thật x 3 seed x 4/8 bước), detector
+# chấm quần nằm phẳng thấp hơn nhiều so với quần đang mặc. Quần bịa ra: 0.396 (ảnh 33 job
+# c78bd68a, đúng grid lọt qua ngưỡng 0.5), 0.445-0.715 (216). Trên các grid sạch, "bottom"
+# không được xin cao nhất 0.458 và 0.861 - cả hai ở ảnh 158, nơi chiếc váy là thật nhưng
+# D0b không thấy (bắt nhầm ở đó chỉ tốn một lần sinh lại). Quần thứ hai bên cạnh cái được
+# xin (657) thì không đo được: detector không cho box "bottom" nào trên các grid đó, kể cả
+# cái quần đúng - bản 8 bước không vẽ ra lỗi đó (server.common.config.d1_steps).
+GRID_UNASKED_MIN_BY_LABEL = {"bottom": 0.4}
 # flag của detect_worn_items -> nhãn detector; "dress" không kiểm vì detector hay gọi áo dài
 # là dress, và "outer" lẫn với "top".
 _GRID_CHECK = (("bottom", ("bottom", "one_piece")), ("shoes", ("footwear",)),
@@ -704,7 +720,8 @@ def unasked_items_on_grid(grid, detected):
         name = cloth_model.config.id2label[label]
         best[name] = max(best.get(name, 0.0), score)
     return {label: round(best[label], 3) for label, flags in _GRID_CHECK
-            if best.get(label, 0.0) >= GRID_UNASKED_MIN and not any(detected.get(f) for f in flags)}
+            if best.get(label, 0.0) >= GRID_UNASKED_MIN_BY_LABEL.get(label, GRID_UNASKED_MIN)
+            and not any(detected.get(f) for f in flags)}
 
 
 def models_loaded():
